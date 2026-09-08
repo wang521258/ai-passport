@@ -6,6 +6,7 @@
  * 支持眨眼、跳跃动画和多种表情切换。
  */
 #include "ui_pixel.h"
+#include "ui_pet.h"
 #include "lvgl.h"
 
 /* 宠物颜色 */
@@ -68,7 +69,7 @@ static void pet_jump_cb(void *obj, int32_t value)
  */
 lv_obj_t *ui_pixel_pet_create(lv_obj_t *parent, int x, int y)
 {
-    pet_obj_t *p = lv_mem_alloc(sizeof(pet_obj_t));
+    pet_obj_t *p = lv_malloc(sizeof(pet_obj_t));
     lv_obj_t *root = lv_obj_create(parent);
     lv_obj_remove_flag(root, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_pos(root, x, y);
@@ -310,11 +311,9 @@ lv_obj_t *ui_pixel_ball_create(lv_obj_t *parent, int x, int y)
     return root;
 }
 
-static void ball_shake_cb(lv_anim_t *a)
+static void ball_shake_cb(void *var, int32_t v)
 {
-    lv_obj_t *ball = a->var;
-    int v = (int)a->current_value;
-    lv_obj_set_x(ball, v);
+    lv_obj_set_x((lv_obj_t *)var, v);
 }
 
 /**
@@ -349,6 +348,17 @@ static void ball_opa_cb(void *var, int32_t v)
     lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)v, 0);
 }
 
+/* 爆开时通过改 transform_scale 做放大效果（LVGL 9 用 style 实现）*/
+static void ball_scale_cb(void *var, int32_t v)
+{
+    lv_obj_t *obj = (lv_obj_t *)var;
+    /* v 是 256..640，对应 scale 256..640（256=1.0x）*/
+    lv_obj_set_style_transform_scale(obj, v, 0);
+    /* 同时把 pivot 移到中心，保证从中心放大 */
+    lv_obj_set_style_transform_pivot_x(obj, 12, 0);
+    lv_obj_set_style_transform_pivot_y(obj, 12, 0);
+}
+
 /**
  * @brief 精灵球爆开（放大淡出并自删）
  */
@@ -358,7 +368,7 @@ void ui_pixel_ball_open(lv_obj_t *ball)
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, ball);
-    lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)lv_obj_set_scale);
+    lv_anim_set_exec_cb(&a, ball_scale_cb);
     lv_anim_set_values(&a, 256, 640);
     lv_anim_set_time(&a, 400);
     lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
