@@ -9,12 +9,8 @@
 #include "esp_timer.h"
 #include <string.h>
 
-/* gif.inl 包含纯 C 解码核心（GIF_openRAM / GIF_playFrame 等） */
-/* ESP-IDF 下没有 memcpy_P 宏，手动定义 */
-#ifndef memcpy_P
-#define memcpy_P memcpy
-#endif
-#include "gif.inl"
+/* gif.inl 的函数由 components/AnimatedGIF/src/gif_impl.c 编译为独立目标文件 */
+/* gif_player.c 只需包含 AnimatedGIF.h 获取函数声明 */
 
 #define MAX_GIF_W 96
 #define MAX_GIF_H 96
