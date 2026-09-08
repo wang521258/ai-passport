@@ -15,6 +15,7 @@
 #include "esp_random.h"
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 /* ---------- 宠物状态 ---------- */
 typedef struct {
