@@ -11,6 +11,7 @@
 #include "lvgl.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_random.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -64,7 +65,7 @@ static void refresh(void)
 /* 进化闪光淡出回调 */
 static void flash_fade_cb(lv_timer_t *tm)
 {
-    lv_obj_t *mask = (lv_obj_t *)tm->user_data;
+    lv_obj_t *mask = (lv_obj_t *)lv_timer_get_user_data(tm);
     if (mask) lv_obj_add_flag(mask, LV_OBJ_FLAG_HIDDEN);
     lv_timer_delete(tm);
 }

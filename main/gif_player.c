@@ -20,7 +20,8 @@
 #define MAX_GIF_H 96
 
 /* canvas 背景色（与屏幕纸色一致，RGB565） */
-#define BG_RGB565  (lv_color_hex(UI_PAPER).full)
+/* UI_PAPER=0xF4F4EA → RGB565: R5=30 G6=61 B5=29 = 0xF7DD */
+#define BG_RGB565  ((uint16_t)0xF7DD)
 
 typedef struct {
     GIFIMAGE gif;
@@ -78,7 +79,7 @@ static void gif_draw_cb(GIFDRAW *pDraw)
 
 static void frame_timer_cb(lv_timer_t *t)
 {
-    gif_player_t *p = t->user_data;
+    gif_player_t *p = lv_timer_get_user_data(t);
     if (!p || !p->playing) return;
     int delay = 0;
     /* 每帧前清空 canvas，避免 disposal method 导致的残影 */
