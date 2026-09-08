@@ -2,7 +2,7 @@
 
 static void start_blink(lv_obj_t *eye);
 
-static lv_obj_t *block(lv_obj_t *parent, int x, int y, int w, int h, uint32_t color)
+lv_obj_t *block(lv_obj_t *parent, int x, int y, int w, int h, uint32_t color)
 {
     lv_obj_t *obj = lv_obj_create(parent);
     lv_obj_remove_flag(obj, LV_OBJ_FLAG_SCROLLABLE);

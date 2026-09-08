@@ -26,6 +26,7 @@ static const demo_entry_t DEMOS[] = {
     { "Wi-Fi",   demo_wifi_enter,    demo_wifi_exit,    demo_wifi_key    },
     { "BLE",     demo_ble_enter,     demo_ble_exit,     demo_ble_key     },
     { "Low Power", demo_low_power_enter, demo_low_power_exit, demo_low_power_key },
+    { "Pet",       demo_pet_enter,       demo_pet_exit,       demo_pet_key       },
 };
 #define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
 
@@ -131,6 +132,7 @@ void app_main(void) {
     s_ok[4] = true;                                    // 页面内按需初始化并显示错误
     s_ok[5] = true;
     s_ok[6] = true;
+    s_ok[7] = true;                                    /* Pet：纯软件 demo */
 
     if (bsp_lvgl_lock(1000)) { enter_menu(); bsp_lvgl_unlock(); }
 
