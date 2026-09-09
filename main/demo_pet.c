@@ -135,9 +135,10 @@ static void build_status_bar(void)
 /* 刷新状态条 + 等级 */
 static void refresh(void)
 {
+    if (!s_active) return;
     uint8_t vals[4] = { s_stat.hunger, s_stat.happy, s_stat.energy, s_stat.clean };
     for (int i = 0; i < 4; i++) {
-        lv_label_set_text_fmt(s_stat_vals[i], "%d", vals[i]);
+        if (s_stat_vals[i]) lv_label_set_text_fmt(s_stat_vals[i], "%d", vals[i]);
     }
     if (s_lvlabel) lv_label_set_text_fmt(s_lvlabel, "Lv%d", s_stat.lv);
 }
@@ -165,6 +166,9 @@ static void try_evolve(void)
     }
     if (next_idx < 0) return;
 
+    /* 训练中不进化（避免创建 canvas 覆盖在训练面板上） */
+    if (s_training) return;
+
     bool can_evolve = false;
     if (cur->evo_stage == 0 && s_stat.lv >= EVO_LV_STAGE1) can_evolve = true;
     if (cur->evo_stage == 1 && s_stat.lv >= EVO_LV_STAGE2) can_evolve = true;
@@ -177,9 +181,18 @@ static void try_evolve(void)
         lv_obj_remove_flag(s_flash, LV_OBJ_FLAG_HIDDEN);
         lv_timer_create(flash_fade_cb, 400, s_flash);
     }
-    if (s_gif) gif_player_stop(s_gif);
-    s_gif = gif_player_create(s_scr, 88, 156, 64, 64);
-    gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data, pokemon_gifs[s_cur_poke_idx].len);
+    /* 单例 gif_player：create 内部会停掉旧动画 + 删旧 canvas + 释放旧 buf，
+     * 然后用新尺寸重建 canvas；GIFIMAGE 复用不重新分配。 */
+    lv_obj_t *new_canvas = gif_player_create(s_scr, 88, 156, 64, 64);
+    if (!new_canvas) {
+        ESP_LOGW("PET", "evolve: gif create failed, free=%d", (int)esp_get_free_heap_size());
+        return;                                 /* 内存不足：跳过本次进化 */
+    }
+    s_gif = new_canvas;
+    if (!gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data,
+                        pokemon_gifs[s_cur_poke_idx].len)) {
+        ESP_LOGW("PET", "evolve: gif play failed, free=%d", (int)esp_get_free_heap_size());
+    }
     if (s_namelabel) lv_label_set_text(s_namelabel, pokemon_gifs[s_cur_poke_idx].name);
 }
 
@@ -216,7 +229,9 @@ static void tick_cb(void *arg)
 /* 破壳：随机选一只基础形态宝可梦，播放 GIF */
 static void do_hatch(void)
 {
-    ESP_LOGI("PET", "hatch: free=%d", (int)esp_get_free_heap_size());
+    ESP_LOGI("PET", "hatch enter free=%d lv_min_free=%d",
+             (int)esp_get_free_heap_size(),
+             (int)esp_get_minimum_free_heap_size());
     if (!s_ball) return;
     ui_pixel_ball_open(s_ball);
     ESP_LOGI("PET", "ball_open ok free=%d", (int)esp_get_free_heap_size());
@@ -229,12 +244,16 @@ static void do_hatch(void)
         tries++;
     } while (pokemon_gifs[s_cur_poke_idx].evo_stage != 0 && tries < 20);
     const pokemon_gif_t *pg = &pokemon_gifs[s_cur_poke_idx];
-    ESP_LOGI("PET", "pick=%s len=%d free=%d", pg->name, pg->len, (int)esp_get_free_heap_size());
+    ESP_LOGI("PET", "pick=%s stage=%d len=%d free=%d",
+             pg->name, pg->evo_stage, pg->len, (int)esp_get_free_heap_size());
 
+    /* 单例播放器；create 内部已处理复用 + 释放旧 canvas/buf */
     s_gif = gif_player_create(s_scr, 88, 156, 64, 64);
     ESP_LOGI("PET", "gif_create=%p free=%d", s_gif, (int)esp_get_free_heap_size());
-    gif_player_play(s_gif, pg->data, pg->len);
-    ESP_LOGI("PET", "gif_play done free=%d", (int)esp_get_free_heap_size());
+    if (s_gif) {
+        int play_ok = gif_player_play(s_gif, pg->data, pg->len);
+        ESP_LOGI("PET", "gif_play=%d free=%d", play_ok, (int)esp_get_free_heap_size());
+    }
     if (s_namelabel) lv_label_set_text(s_namelabel, pg->name);
     ESP_LOGI("PET", "hatch ok free=%d", (int)esp_get_free_heap_size());
 
@@ -270,18 +289,18 @@ static void train_start(void)
     s_train_word = ui_pixel_label(s_train_panel, "", &lv_font_montserrat_20, 0x17202A);
     lv_obj_set_pos(s_train_word, 10, 10);
 
-    /* 4 个中文选项 */
+    /* 4 个中文选项：用 label（之前用 lv_obj_create 是错的, lv_label_set_text
+     * 会破坏 obj 内存。本次彻底改成 label + 内部文字）*/
     for (int i = 0; i < 4; i++) {
-        s_train_opts[i] = lv_obj_create(s_train_panel);
-        lv_obj_remove_flag(s_train_opts[i], LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(s_train_opts[i], 10, 40 + i * 28);
+        s_train_opts[i] = ui_pixel_label(s_train_panel, "", &lv_font_montserrat_14, 0x17202A);
+        if (!s_train_opts[i]) continue;          /* 池满：跳过该项 */
+        lv_obj_set_pos(s_train_opts[i], 16, 44 + i * 28);
         lv_obj_set_size(s_train_opts[i], 170, 24);
         lv_obj_set_style_bg_color(s_train_opts[i], lv_color_hex(0xFFFFFF), 0);
         lv_obj_set_style_bg_opa(s_train_opts[i], LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(s_train_opts[i], 1, 0);
         lv_obj_set_style_border_color(s_train_opts[i], lv_color_hex(0x888888), 0);
-        lv_obj_set_style_pad_all(s_train_opts[i], 2, 0);
-        lv_obj_set_style_radius(s_train_opts[i], 0, 0);
+        lv_obj_set_style_pad_all(s_train_opts[i], 4, 0);
     }
 
     /* 选中指示器（>符号） */
@@ -351,9 +370,14 @@ static void train_exit(void)
 {
     s_training = false;
     if (s_train_panel) {
-        lv_obj_delete(s_train_panel);
+        lv_obj_delete(s_train_panel);   /* 级联删除所有子对象 */
         s_train_panel = NULL;
     }
+    /* 子对象指针必须清零：lv_obj_delete 释放了它们,留着会指向悬空内存,
+     * 下次进训练会污染新对象 */
+    s_train_word = NULL;
+    for (int i = 0; i < 4; i++) s_train_opts[i] = NULL;
+    s_train_cursor = NULL;
     /* 恢复显示 GIF 和名字 */
     if (s_gif) lv_obj_remove_flag(s_gif, LV_OBJ_FLAG_HIDDEN);
     if (s_namelabel) lv_obj_remove_flag(s_namelabel, LV_OBJ_FLAG_HIDDEN);
@@ -366,31 +390,48 @@ static void train_exit(void)
 /* ---------- demo 接口 ---------- */
 void demo_pet_enter(void)
 {
+    ESP_LOGI("PET", "enter begin free=%d min_free=%d",
+             (int)esp_get_free_heap_size(),
+             (int)esp_get_minimum_free_heap_size());
     srand(esp_random());
     s_stat.hunger = 80; s_stat.happy = 80;
     s_stat.energy = 80; s_stat.clean = 80;
     s_stat.lv = 1; s_stat.exp = 0;
     s_hatched = false; s_hatch_clicks = 0;
+    s_sleeping = false;
     s_active = true;
     s_training = false;
+    s_cur_poke_idx = 0;
+    /* 训练相关指针清零（防止上次退出残留） */
+    s_train_panel = NULL; s_train_word = NULL; s_train_cursor = NULL;
+    for (int i = 0; i < 4; i++) s_train_opts[i] = NULL;
+    s_gif = NULL; s_ball = NULL; s_flash = NULL; s_sleepmask = NULL;
+    s_namelabel = NULL; s_stat_bg = NULL; s_lvlabel = NULL;
+    for (int i = 0; i < 4; i++) { s_stat_icons[i] = NULL; s_stat_vals[i] = NULL; }
 
     s_scr = ui_pixel_screen_create("PET");
+    ESP_LOGI("PET", "screen created free=%d", (int)esp_get_free_heap_size());
 
     /* 背景：天空 + 草地 */
     draw_background(s_scr);
+    ESP_LOGI("PET", "background done free=%d", (int)esp_get_free_heap_size());
 
     /* 顶部状态条 */
     build_status_bar();
+    ESP_LOGI("PET", "status bar done free=%d", (int)esp_get_free_heap_size());
 
     /* 精灵球（屏幕居中），点击 3 次破壳 */
     s_ball = ui_pixel_ball_create(s_scr, 108, 148);
+    ESP_LOGI("PET", "ball created free=%d", (int)esp_get_free_heap_size());
 
     /* 宠物名字标签（破壳后显示） */
     s_namelabel = ui_pixel_label(s_scr, "", &lv_font_montserrat_14, UI_INK);
-    lv_obj_set_pos(s_namelabel, 100, 230);
-    lv_obj_set_style_bg_color(s_namelabel, lv_color_hex(0xF4F4EA), 0);
-    lv_obj_set_style_bg_opa(s_namelabel, LV_OPA_80, 0);
-    lv_obj_set_style_pad_all(s_namelabel, 2, 0);
+    if (s_namelabel) {
+        lv_obj_set_pos(s_namelabel, 100, 230);
+        lv_obj_set_style_bg_color(s_namelabel, lv_color_hex(0xF4F4EA), 0);
+        lv_obj_set_style_bg_opa(s_namelabel, LV_OPA_80, 0);
+        lv_obj_set_style_pad_all(s_namelabel, 2, 0);
+    }
 
     /* 进化闪光层（全屏白色矩形，初始隐藏）*/
     s_flash = lv_obj_create(s_scr);
@@ -436,12 +477,22 @@ void demo_pet_enter(void)
 
 void demo_pet_exit(void)
 {
+    ESP_LOGI("PET", "exit free=%d", (int)esp_get_free_heap_size());
     s_active = false;
     s_sleeping = false;
     s_training = false;
+    s_hatched = false;
     if (s_timer) { esp_timer_stop(s_timer); esp_timer_delete(s_timer); s_timer = NULL; }
-    gif_player_destroy();     /* 释放单例解码器（约 24KB），否则退出后一直占着堆 */
-    if (s_scr)  { lv_obj_delete(s_scr); s_scr = NULL; s_gif = NULL; s_ball = NULL; s_flash = NULL; s_sleepmask = NULL; s_train_panel = NULL; }
+    gif_player_destroy();     /* 释放单例解码器（约 17KB），否则退出后一直占着堆 */
+    if (s_scr)  { lv_obj_delete(s_scr); }
+    s_scr = NULL; s_gif = NULL; s_ball = NULL; s_flash = NULL; s_sleepmask = NULL;
+    s_namelabel = NULL; s_stat_bg = NULL; s_lvlabel = NULL;
+    s_train_panel = NULL; s_train_word = NULL; s_train_cursor = NULL;
+    for (int i = 0; i < 4; i++) {
+        s_stat_icons[i] = NULL; s_stat_vals[i] = NULL;
+        s_train_opts[i] = NULL;
+    }
+    ESP_LOGI("PET", "exit done free=%d", (int)esp_get_free_heap_size());
 }
 
 void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)

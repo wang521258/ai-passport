@@ -32,6 +32,7 @@ typedef struct {
     int gw, gh;          /* GIF 画布尺寸 */
     lv_timer_t *timer;
     bool playing;
+    bool opened;         /* GIF_openRAM 是否成功过,GIF_close 前必查 */
 } gif_player_t;
 
 /* 当前播放中的播放器（供 draw callback 访问） */
@@ -159,17 +160,19 @@ void gif_player_destroy(void)
     if (!p) return;
     if (p->timer) { lv_timer_delete(p->timer); p->timer = NULL; }
     p->playing = false;
+    if (p->opened) { GIF_close(&p->gif); p->opened = false; }
     if (p->canvas) { lv_obj_delete(p->canvas); p->canvas = NULL; }
     if (p->buf)    { free(p->buf);             p->buf = NULL; }
     free(p);
     s_player = NULL;
+    GIF_LOG("destroyed free=%d", (int)esp_get_free_heap_size());
 }
 
-void gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
+int gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
 {
-    if (!canvas || !data || len <= 0) return;      /* 播放器未就绪：静默跳过，不崩 */
+    if (!canvas || !data || len <= 0) return 0;     /* 播放器未就绪：静默跳过,不崩 */
     gif_player_t *p = lv_obj_get_user_data(canvas);
-    if (!p || !p->buf) return;
+    if (!p || !p->buf) return 0;
     gif_player_stop(canvas);
 
     uint16_t bg = BG_RGB565;
@@ -181,7 +184,8 @@ void gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
     GIF_LOG("openRAM ok=%d canvas=%dx%d free=%d", ok,
              GIF_getCanvasWidth(&p->gif), GIF_getCanvasHeight(&p->gif),
              (int)esp_get_free_heap_size());
-    if (!ok) return;
+    if (!ok) { p->opened = false; return 0; }
+    p->opened = true;
 
     p->gw = GIF_getCanvasWidth(&p->gif);
     p->gh = GIF_getCanvasHeight(&p->gif);
@@ -196,6 +200,7 @@ void gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
 
     p->timer = lv_timer_create(frame_timer_cb, delay, p);
     GIF_LOG("timer=%p free=%d", p->timer, (int)esp_get_free_heap_size());
+    return 1;
 }
 
 void gif_player_stop(lv_obj_t *canvas)
@@ -205,5 +210,5 @@ void gif_player_stop(lv_obj_t *canvas)
     if (!p) return;
     if (p->timer) { lv_timer_delete(p->timer); p->timer = NULL; }
     p->playing = false;
-    if (p->buf) GIF_close(&p->gif);   /* buf 为 NULL 说明从未成功 open，无需 close */
+    if (p->opened) { GIF_close(&p->gif); p->opened = false; }
 }
