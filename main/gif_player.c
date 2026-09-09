@@ -7,7 +7,12 @@
 #include "ui_pixel.h"
 #include "lvgl.h"
 #include "esp_timer.h"
+#include "esp_system.h"
+#include "esp_log.h"
 #include <string.h>
+
+static const char *GP = "GIFP";
+#define GIF_LOG(fmt, ...) ESP_LOGI(GP, fmt, ##__VA_ARGS__)
 
 /* gif.inl 的函数由 components/AnimatedGIF/src/gif_impl.c 编译为独立目标文件 */
 /* gif_player.c 只需包含 AnimatedGIF.h 获取函数声明 */
@@ -117,6 +122,8 @@ lv_obj_t *gif_player_create(lv_obj_t *parent, int x, int y, int w, int h)
         if (p->buf)    { free(p->buf);             p->buf = NULL; }
     } else {
         p = calloc(1, sizeof(gif_player_t));
+        GIF_LOG("calloc gif_player_t(%uB) -> %p, free=%d",
+                 (unsigned)sizeof(gif_player_t), p, (int)esp_get_free_heap_size());
         if (!p) return NULL;          /* 内存不足：不播动画，但不崩 */
         s_player = p;
     }
@@ -124,6 +131,8 @@ lv_obj_t *gif_player_create(lv_obj_t *parent, int x, int y, int w, int h)
     p->cw = w;
     p->ch = h;
     p->buf = calloc((size_t)w * (size_t)h, sizeof(uint16_t));
+    GIF_LOG("calloc canvas buf(%dB) -> %p, free=%d",
+             (int)((size_t)w * (size_t)h * 2), p->buf, (int)esp_get_free_heap_size());
     if (!p->buf) {
         p->cw = p->ch = 0;
         return NULL;                  /* 内存不足：优雅降级 */
@@ -132,11 +141,13 @@ lv_obj_t *gif_player_create(lv_obj_t *parent, int x, int y, int w, int h)
     for (int i = 0; i < w * h; i++) p->buf[i] = bg;
 
     p->canvas = lv_canvas_create(parent);
+    GIF_LOG("canvas -> %p, free=%d", p->canvas, (int)esp_get_free_heap_size());
     if (!p->canvas) {
         free(p->buf); p->buf = NULL;
         return NULL;
     }
     lv_canvas_set_buffer(p->canvas, p->buf, w, h, LV_COLOR_FORMAT_RGB565);
+    GIF_LOG("set_buffer done, free=%d", (int)esp_get_free_heap_size());
     lv_obj_set_pos(p->canvas, x, y);
     lv_obj_set_user_data(p->canvas, p);
     return p->canvas;
@@ -166,7 +177,11 @@ void gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
     memset(&p->gif, 0, sizeof(GIFIMAGE));
 
     /* GIF_openRAM 返回 1 才表示解析成功；失败时不启动定时器，避免空转崩溃 */
-    if (!GIF_openRAM(&p->gif, (uint8_t *)data, len, gif_draw_cb)) return;
+    int ok = GIF_openRAM(&p->gif, (uint8_t *)data, len, gif_draw_cb);
+    GIF_LOG("openRAM ok=%d canvas=%dx%d free=%d", ok,
+             GIF_getCanvasWidth(&p->gif), GIF_getCanvasHeight(&p->gif),
+             (int)esp_get_free_heap_size());
+    if (!ok) return;
 
     p->gw = GIF_getCanvasWidth(&p->gif);
     p->gh = GIF_getCanvasHeight(&p->gif);
@@ -174,11 +189,13 @@ void gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
 
     int delay = 0;
     s_cur = p;
-    GIF_playFrame(&p->gif, &delay, NULL);
+    int fr = GIF_playFrame(&p->gif, &delay, NULL);
     s_cur = NULL;
+    GIF_LOG("first frame res=%d delay=%d free=%d", fr, delay, (int)esp_get_free_heap_size());
     if (delay < 20) delay = 80;
 
     p->timer = lv_timer_create(frame_timer_cb, delay, p);
+    GIF_LOG("timer=%p free=%d", p->timer, (int)esp_get_free_heap_size());
 }
 
 void gif_player_stop(lv_obj_t *canvas)
