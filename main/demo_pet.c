@@ -39,6 +39,7 @@ static lv_obj_t  *s_stat_vals[4];   /* 状态数字 */
 static lv_obj_t  *s_lvlabel;
 static lv_obj_t  *s_flash;     /* 进化闪光全屏矩形 */
 static lv_obj_t  *s_sleepmask; /* 睡觉半透明遮罩 */
+static lv_obj_t  *s_zzz;       /* 睡觉浮标 Zzz（挂在 s_sleepmask 上）*/
 static esp_timer_handle_t s_timer;
 static bool s_active;
 static bool s_hatched;
@@ -92,7 +93,10 @@ static void draw_background(lv_obj_t *parent)
     }
 }
 
-/* ---------- 顶部状态条（GBA 风格图标 + 数字） ---------- */
+/* ---------- 顶部状态条（GBA 风格图标 + 数字 + 文字标签） ----------
+ * 打磨版：原状态条只有 4 个纯色方块 + 数字，看不出哪个是饭、哪个是心情。
+ * 现改为两行：上行「色块 + 数值」，下行「FOOD/MOOD/NRG/WASH」文字标签，
+ * 条高 24 → 34。整屏仍是 GBA 像素风（方角、描边、纸色），不引入圆角。 */
 static const uint32_t STAT_COLORS[4] = { 0xFF8A3D, 0xFFD928, 0x82BE2D, 0x4FC3F7 };
 static const char *STAT_LABELS[4] = { "FOOD", "MOOD", "NRG", "WASH" };
 
@@ -102,21 +106,21 @@ static void build_status_bar(void)
     s_stat_bg = lv_obj_create(s_scr);
     lv_obj_remove_flag(s_stat_bg, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_pos(s_stat_bg, 0, 0);
-    lv_obj_set_size(s_stat_bg, 240, 24);
+    lv_obj_set_size(s_stat_bg, 240, 34);
     lv_obj_set_style_bg_color(s_stat_bg, lv_color_hex(0x17202A), 0);
     lv_obj_set_style_bg_opa(s_stat_bg, LV_OPA_70, 0);
     lv_obj_set_style_border_width(s_stat_bg, 0, 0);
     lv_obj_set_style_pad_all(s_stat_bg, 0, 0);
     lv_obj_set_style_radius(s_stat_bg, 0, 0);
 
-    /* 4 个状态块：图标 + 数字，水平排列 */
+    /* 4 个状态块：色块 + 数字（上行），文字标签（下行），每项 60px 均分 */
     for (int i = 0; i < 4; i++) {
-        int x = 4 + i * 56;
+        int x = i * 60;
         /* 颜色块（图标占位） */
         s_stat_icons[i] = lv_obj_create(s_stat_bg);
         lv_obj_remove_flag(s_stat_icons[i], LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(s_stat_icons[i], x, 4);
-        lv_obj_set_size(s_stat_icons[i], 16, 16);
+        lv_obj_set_pos(s_stat_icons[i], x + 6, 4);
+        lv_obj_set_size(s_stat_icons[i], 12, 12);
         lv_obj_set_style_bg_color(s_stat_icons[i], lv_color_hex(STAT_COLORS[i]), 0);
         lv_obj_set_style_bg_opa(s_stat_icons[i], LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(s_stat_icons[i], 1, 0);
@@ -125,11 +129,16 @@ static void build_status_bar(void)
         lv_obj_set_style_radius(s_stat_icons[i], 0, 0);
         /* 数字 */
         s_stat_vals[i] = ui_pixel_label(s_stat_bg, "80", &lv_font_montserrat_14, 0xFFFFFF);
-        lv_obj_set_pos(s_stat_vals[i], x + 20, 4);
+        lv_obj_set_pos(s_stat_vals[i], x + 22, 1);
+        /* 文字标签 */
+        lv_obj_t *lb = ui_pixel_label(s_stat_bg, STAT_LABELS[i],
+                                      &lv_font_montserrat_14, 0xB0BEC5);
+        if (lb) {
+            lv_obj_set_pos(lb, x + 6, 19);
+            lv_obj_set_size(lb, 48, 14);
+            lv_obj_set_style_text_align(lb, LV_TEXT_ALIGN_LEFT, 0);
+        }
     }
-    /* 等级标签（右上角） */
-    s_lvlabel = ui_pixel_label(s_stat_bg, "Lv1", &lv_font_montserrat_14, 0xFFD928);
-    lv_obj_set_pos(s_lvlabel, 200, 4);
 }
 
 /* 刷新状态条 + 等级 */
@@ -140,7 +149,16 @@ static void refresh(void)
     for (int i = 0; i < 4; i++) {
         if (s_stat_vals[i]) lv_label_set_text_fmt(s_stat_vals[i], "%d", vals[i]);
     }
-    if (s_lvlabel) lv_label_set_text_fmt(s_lvlabel, "Lv%d", s_stat.lv);
+    /* 名牌：破壳后显示「名字 LvN」（等级已从状态条合并到这里），
+     * 破壳前显示 EGG，避免提前泄漏随机结果 */
+    if (s_namelabel) {
+        if (s_hatched) {
+            lv_label_set_text_fmt(s_namelabel, "%s Lv%d",
+                                  pokemon_gifs[s_cur_poke_idx].name, s_stat.lv);
+        } else {
+            lv_label_set_text(s_namelabel, "EGG");
+        }
+    }
 }
 
 /* 进化闪光淡出回调 */
@@ -183,7 +201,7 @@ static void try_evolve(void)
     }
     /* 单例 gif_player：create 内部会停掉旧动画 + 删旧 canvas + 释放旧 buf，
      * 然后用新尺寸重建 canvas；GIFIMAGE 复用不重新分配。 */
-    lv_obj_t *new_canvas = gif_player_create(s_scr, 88, 156, 64, 64);
+    lv_obj_t *new_canvas = gif_player_create(s_scr, 72, 120, 96, 96);
     if (!new_canvas) {
         ESP_LOGW("PET", "evolve: gif create failed, free=%d", (int)esp_get_free_heap_size());
         return;                                 /* 内存不足：跳过本次进化 */
@@ -193,9 +211,9 @@ static void try_evolve(void)
                         pokemon_gifs[s_cur_poke_idx].len)) {
         ESP_LOGW("PET", "evolve: gif play failed, free=%d", (int)esp_get_free_heap_size());
     }
-    if (s_namelabel) lv_label_set_text(s_namelabel, pokemon_gifs[s_cur_poke_idx].name);
+    /* 名字 + 等级统一由 refresh() 渲染（避免这里只写名字、等级不更新）*/
+    refresh();
 }
-
 /* 经验增加，满则升级 */
 static void add_exp(uint16_t amount)
 {
@@ -248,13 +266,13 @@ static void do_hatch(void)
              pg->name, pg->evo_stage, pg->len, (int)esp_get_free_heap_size());
 
     /* 单例播放器；create 内部已处理复用 + 释放旧 canvas/buf */
-    s_gif = gif_player_create(s_scr, 88, 156, 64, 64);
+    s_gif = gif_player_create(s_scr, 72, 120, 96, 96);
     ESP_LOGI("PET", "gif_create=%p free=%d", s_gif, (int)esp_get_free_heap_size());
     if (s_gif) {
         int play_ok = gif_player_play(s_gif, pg->data, pg->len);
         ESP_LOGI("PET", "gif_play=%d free=%d", play_ok, (int)esp_get_free_heap_size());
     }
-    if (s_namelabel) lv_label_set_text(s_namelabel, pg->name);
+    /* 名牌内容交给下面的 refresh() 统一渲染（名字 + Lv）*/
     ESP_LOGI("PET", "hatch ok free=%d", (int)esp_get_free_heap_size());
 
     refresh();
@@ -405,7 +423,7 @@ void demo_pet_enter(void)
     /* 训练相关指针清零（防止上次退出残留） */
     s_train_panel = NULL; s_train_word = NULL; s_train_cursor = NULL;
     for (int i = 0; i < 4; i++) s_train_opts[i] = NULL;
-    s_gif = NULL; s_ball = NULL; s_flash = NULL; s_sleepmask = NULL;
+    s_gif = NULL; s_ball = NULL; s_flash = NULL; s_sleepmask = NULL; s_zzz = NULL;
     s_namelabel = NULL; s_stat_bg = NULL; s_lvlabel = NULL;
     for (int i = 0; i < 4; i++) { s_stat_icons[i] = NULL; s_stat_vals[i] = NULL; }
 
@@ -420,20 +438,22 @@ void demo_pet_enter(void)
     build_status_bar();
     ESP_LOGI("PET", "status bar done free=%d", (int)esp_get_free_heap_size());
 
-    /* 精灵球（屏幕居中），点击 3 次破壳 */
-    s_ball = ui_pixel_ball_create(s_scr, 108, 148);
+    /* 精灵球（宠物区居中），点击 3 次破壳
+     * 宠物 canvas 现为 96x96 @ (72,120)，中心 (120,168)；球 24x24 → (108,156) */
+    s_ball = ui_pixel_ball_create(s_scr, 108, 156);
     ESP_LOGI("PET", "ball created free=%d", (int)esp_get_free_heap_size());
 
-    /* 宠物名字标签（破壳后显示, MVP 版无 GIF 动画时字号放大显示在 canvas 下方） */
-    s_namelabel = ui_pixel_label(s_scr, "", &lv_font_montserrat_20, 0x17202A);
+    /* 宠物名字 + 等级名牌（破壳后显示，未破壳显示 EGG）
+     * canvas 底部 120+96=216 → 名牌 y=224，宽 152 居中于 240 屏 */
+    s_namelabel = ui_pixel_label(s_scr, "EGG", &lv_font_montserrat_20, 0x17202A);
     if (s_namelabel) {
-        lv_obj_set_pos(s_namelabel, 60, 226);          /* canvas(88,156,64,64) 之下,居中 */
-        lv_obj_set_size(s_namelabel, 120, 28);
+        lv_obj_set_pos(s_namelabel, 40, 224);
+        lv_obj_set_size(s_namelabel, 160, 30);
         lv_obj_set_style_bg_color(s_namelabel, lv_color_hex(0xF4F4EA), 0);
         lv_obj_set_style_bg_opa(s_namelabel, LV_OPA_90, 0);
         lv_obj_set_style_text_align(s_namelabel, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_pad_all(s_namelabel, 2, 0);
-        lv_obj_set_style_border_width(s_namelabel, 1, 0);
+        lv_obj_set_style_pad_all(s_namelabel, 4, 0);
+        lv_obj_set_style_border_width(s_namelabel, 2, 0);
         lv_obj_set_style_border_color(s_namelabel, lv_color_hex(0x17202A), 0);
     }
 
@@ -448,26 +468,55 @@ void demo_pet_enter(void)
     lv_obj_set_style_pad_all(s_flash, 0, 0);
     lv_obj_add_flag(s_flash, LV_OBJ_FLAG_HIDDEN);
 
-    /* 睡觉半透明遮罩（覆盖 GIF 区域，初始隐藏）*/
+    /* 睡觉遮罩（覆盖 GIF 区域，初始隐藏）
+     * 打磨：原来是 40% 纯黑，看着像死机；改成深夜蓝 + "Zzz"，一眼看出在睡觉 */
     s_sleepmask = lv_obj_create(s_scr);
     lv_obj_remove_flag(s_sleepmask, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(s_sleepmask, 88, 156);
-    lv_obj_set_size(s_sleepmask, 64, 64);
-    lv_obj_set_style_bg_color(s_sleepmask, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(s_sleepmask, LV_OPA_40, 0);
+    lv_obj_set_pos(s_sleepmask, 72, 120);
+    lv_obj_set_size(s_sleepmask, 96, 96);
+    lv_obj_set_style_bg_color(s_sleepmask, lv_color_hex(0x1A237E), 0);
+    lv_obj_set_style_bg_opa(s_sleepmask, LV_OPA_50, 0);
     lv_obj_set_style_border_width(s_sleepmask, 0, 0);
     lv_obj_set_style_pad_all(s_sleepmask, 0, 0);
     lv_obj_add_flag(s_sleepmask, LV_OBJ_FLAG_HIDDEN);
 
-    /* 操作提示（底部简化） */
-    lv_obj_t *tip = ui_pixel_label(s_scr,
-        "UP:FEED  DOWN:PLAY  OK:SLEEP",
-        &lv_font_montserrat_14, UI_INK);
-    lv_obj_set_pos(tip, 16, 268);
-    lv_obj_t *tip2 = ui_pixel_label(s_scr,
-        "LONG UP:WASH  LONG DOWN:TRAIN",
-        &lv_font_montserrat_14, UI_INK);
-    lv_obj_set_pos(tip2, 10, 286);
+    /* Zzz 浮标（挂在遮罩上，随遮罩一起显示/隐藏）*/
+    s_zzz = ui_pixel_label(s_sleepmask, "Zzz", &lv_font_montserrat_20, 0xFFFFFF);
+    if (s_zzz) {
+        lv_obj_set_pos(s_zzz, 56, 6);
+        lv_obj_set_style_bg_opa(s_zzz, LV_OPA_TRANSP, 0);
+    }
+
+    /* 底部操作提示：原来是两行裸文字浮在草地上，现在垫一条半透明深色条，
+     * 文字居中，不抢画面主体 */
+    lv_obj_t *tipbar = lv_obj_create(s_scr);
+    lv_obj_remove_flag(tipbar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(tipbar, 0, 282);
+    lv_obj_set_size(tipbar, 240, 38);
+    lv_obj_set_style_bg_color(tipbar, lv_color_hex(0x17202A), 0);
+    lv_obj_set_style_bg_opa(tipbar, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(tipbar, 0, 0);
+    lv_obj_set_style_pad_all(tipbar, 0, 0);
+    lv_obj_set_style_radius(tipbar, 0, 0);
+
+    lv_obj_t *tip = ui_pixel_label(tipbar,
+        "UP:FEED   DOWN:PLAY   OK:SLEEP",
+        &lv_font_montserrat_14, 0xFFFFFF);
+    if (tip) {
+        lv_obj_set_pos(tip, 0, 4);
+        lv_obj_set_size(tip, 240, 16);
+        lv_obj_set_style_text_align(tip, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_bg_opa(tip, LV_OPA_TRANSP, 0);
+    }
+    lv_obj_t *tip2 = ui_pixel_label(tipbar,
+        "HOLD UP:WASH   HOLD DOWN:TRAIN",
+        &lv_font_montserrat_14, 0xB0BEC5);
+    if (tip2) {
+        lv_obj_set_pos(tip2, 0, 21);
+        lv_obj_set_size(tip2, 240, 16);
+        lv_obj_set_style_text_align(tip2, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_bg_opa(tip2, LV_OPA_TRANSP, 0);
+    }
 
     lv_screen_load(s_scr);
 
@@ -489,7 +538,8 @@ void demo_pet_exit(void)
     if (s_timer) { esp_timer_stop(s_timer); esp_timer_delete(s_timer); s_timer = NULL; }
     gif_player_destroy();     /* 释放单例解码器（约 17KB），否则退出后一直占着堆 */
     if (s_scr)  { lv_obj_delete(s_scr); }
-    s_scr = NULL; s_gif = NULL; s_ball = NULL; s_flash = NULL; s_sleepmask = NULL;
+    s_scr = NULL; s_gif = NULL; s_ball = NULL; s_flash = NULL;
+    s_sleepmask = NULL; s_zzz = NULL;
     s_namelabel = NULL; s_stat_bg = NULL; s_lvlabel = NULL;
     s_train_panel = NULL; s_train_word = NULL; s_train_cursor = NULL;
     for (int i = 0; i < 4; i++) {
