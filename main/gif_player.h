@@ -40,6 +40,14 @@ void gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len);
  */
 void gif_player_stop(lv_obj_t *canvas);
 
+/**
+ * @brief 彻底销毁单例播放器并释放 GIFIMAGE / 画布缓冲
+ *
+ * 退出宠物玩法页时调用。播放器是全局单例（GIFIMAGE 约 24KB），
+ * 不释放会一直占着 ESP32-C3 本就紧张的动态堆。
+ */
+void gif_player_destroy(void);
+
 #ifdef __cplusplus
 }
 #endif
