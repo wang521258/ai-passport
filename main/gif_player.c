@@ -8,6 +8,7 @@
 #include "lvgl.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include <string.h>
 
@@ -33,6 +34,12 @@ typedef struct {
     lv_timer_t *timer;
     bool playing;
     bool opened;         /* GIF_openRAM 是否成功过,GIF_close 前必查 */
+    /* 32 字节对齐的 sprite data 副本：原 .rodata 中 const uint8_t[]
+     * 不保证 4 字节对齐,AnimatedGIF 内部某些 memcpy 路径在未对齐时
+     * 直接硬件异常(esp32c3 LoadStoreError) → 段错误 → 重启。
+     * 这里用 heap_caps_aligned_alloc(32,...) 强制对齐。 */
+    uint8_t *sprite_copy;
+    int sprite_len;
 } gif_player_t;
 
 /* 当前播放中的播放器（供 draw callback 访问） */
@@ -163,6 +170,7 @@ void gif_player_destroy(void)
     if (p->opened) { GIF_close(&p->gif); p->opened = false; }
     if (p->canvas) { lv_obj_delete(p->canvas); p->canvas = NULL; }
     if (p->buf)    { free(p->buf);             p->buf = NULL; }
+    if (p->sprite_copy) { free(p->sprite_copy); p->sprite_copy = NULL; }
     free(p);
     s_player = NULL;
     GIF_LOG("destroyed free=%d", (int)esp_get_free_heap_size());
@@ -179,12 +187,28 @@ int gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
     for (int i = 0; i < p->cw * p->ch; i++) p->buf[i] = bg;
     memset(&p->gif, 0, sizeof(GIFIMAGE));
 
-    /* GIF_openRAM 返回 1 才表示解析成功；失败时不启动定时器，避免空转崩溃 */
-    int ok = GIF_openRAM(&p->gif, (uint8_t *)data, len, gif_draw_cb);
+    /* 关键：sprite data 必须 32 字节对齐。原 .rodata const 数据 GCC 不保证
+     * 对齐,AnimatedGIF 库内部读 GIF 流时若地址未对齐会 ESP32C3 LoadStoreError。
+     * 用 heap_caps_aligned_alloc(32) 强制 32 字节对齐。 */
+    if (p->sprite_copy) { free(p->sprite_copy); p->sprite_copy = NULL; }
+    p->sprite_copy = heap_caps_aligned_alloc(32, (size_t)len, MALLOC_CAP_8BIT);
+    if (!p->sprite_copy) {
+        GIF_LOG("aligned_alloc %dB failed, free=%d", len, (int)esp_get_free_heap_size());
+        return 0;
+    }
+    memcpy(p->sprite_copy, data, (size_t)len);
+    p->sprite_len = len;
+    GIF_LOG("aligned_copy done free=%d", (int)esp_get_free_heap_size());
+
+    int ok = GIF_openRAM(&p->gif, p->sprite_copy, len, gif_draw_cb);
     GIF_LOG("openRAM ok=%d canvas=%dx%d free=%d", ok,
              GIF_getCanvasWidth(&p->gif), GIF_getCanvasHeight(&p->gif),
              (int)esp_get_free_heap_size());
-    if (!ok) { p->opened = false; return 0; }
+    if (!ok) {
+        free(p->sprite_copy); p->sprite_copy = NULL; p->sprite_len = 0;
+        p->opened = false;
+        return 0;
+    }
     p->opened = true;
 
     p->gw = GIF_getCanvasWidth(&p->gif);
