@@ -32,7 +32,8 @@ lv_obj_t *gif_player_create(lv_obj_t *parent, int x, int y, int w, int h);
  * @param data GIF 二进制数据（通常位于 Flash，不会占用 RAM）
  * @param len 数据长度
  */
-void gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len);
+/* 0=失败(参数/内存/GIF解析), 1=成功启动 */
+int  gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len);
 
 /**
  * @brief 停止播放并释放解码器
