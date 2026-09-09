@@ -34,12 +34,6 @@ typedef struct {
     lv_timer_t *timer;
     bool playing;
     bool opened;         /* GIF_openRAM 是否成功过,GIF_close 前必查 */
-    /* 32 字节对齐的 sprite data 副本：原 .rodata 中 const uint8_t[]
-     * 不保证 4 字节对齐,AnimatedGIF 内部某些 memcpy 路径在未对齐时
-     * 直接硬件异常(esp32c3 LoadStoreError) → 段错误 → 重启。
-     * 这里用 heap_caps_aligned_alloc(32,...) 强制对齐。 */
-    uint8_t *sprite_copy;
-    int sprite_len;
 } gif_player_t;
 
 /* 当前播放中的播放器（供 draw callback 访问） */
@@ -89,7 +83,7 @@ static void gif_draw_cb(GIFDRAW *pDraw)
 static void frame_timer_cb(lv_timer_t *t)
 {
     gif_player_t *p = lv_timer_get_user_data(t);
-    if (!p || !p->playing || !p->buf) return;
+    if (!p || !p->playing || !p->buf || !p->opened) return;
     int delay = 0;
     /* 每帧前清空 canvas，避免 disposal method 导致的残影 */
     uint16_t bg = BG_RGB565;
@@ -97,10 +91,21 @@ static void frame_timer_cb(lv_timer_t *t)
     s_cur = p;
     int res = GIF_playFrame(&p->gif, &delay, NULL);
     s_cur = NULL;
+    if (res < 0) {
+        /* 解码出错：停掉动画，保留最后一帧画面，别让设备重启 */
+        GIF_LOG("playFrame err=%d, stop anim", GIF_getLastError(&p->gif));
+        p->playing = false;
+        lv_timer_pause(t);
+        return;
+    }
     if (res == 0) {
-        /* 播完一遍，重新循环 */
+        /* 播完一遍，从头循环 */
         GIF_reset(&p->gif);
+        uint16_t bg2 = BG_RGB565;
+        for (int i = 0; i < p->cw * p->ch; i++) p->buf[i] = bg2;
+        s_cur = p;
         GIF_playFrame(&p->gif, &delay, NULL);
+        s_cur = NULL;
     }
     if (delay < 20) delay = 80; /* 有些 GIF 帧延迟为 0，给个默认值 */
     lv_timer_set_period(p->timer, delay);
@@ -170,7 +175,6 @@ void gif_player_destroy(void)
     if (p->opened) { GIF_close(&p->gif); p->opened = false; }
     if (p->canvas) { lv_obj_delete(p->canvas); p->canvas = NULL; }
     if (p->buf)    { free(p->buf);             p->buf = NULL; }
-    if (p->sprite_copy) { free(p->sprite_copy); p->sprite_copy = NULL; }
     free(p);
     s_player = NULL;
     GIF_LOG("destroyed free=%d", (int)esp_get_free_heap_size());
@@ -183,42 +187,62 @@ int gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
     if (!p || !p->buf) return 0;
     gif_player_stop(canvas);
 
-    uint16_t bg = BG_RGB565;
-    for (int i = 0; i < p->cw * p->ch; i++) p->buf[i] = bg;
-    memset(&p->gif, 0, sizeof(GIFIMAGE));
-
-    /* sprite data 32 字节对齐(原 .rodata const 不保证) */
-    if (p->sprite_copy) { free(p->sprite_copy); p->sprite_copy = NULL; }
-    p->sprite_copy = heap_caps_aligned_alloc(32, (size_t)len, MALLOC_CAP_8BIT);
-    if (!p->sprite_copy) {
-        GIF_LOG("aligned_alloc %dB failed, free=%d", len, (int)esp_get_free_heap_size());
-        return 0;
+    /* === 初始化 GIFIMAGE（等价于 C++ 版 begin()，但 C API 没做完）===
+     * GIF_begin 会 memset 整个结构并设定 ucPaletteType。之后必须手动补两件
+     * C API 不会做的事：
+     *   1) ucDrawType = GIF_DRAW_RAW —— 我们要的是 8bit 索引 + RGB565 调色板回调
+     *   2) pLineBufAligned 指向 16 字节对齐的行缓冲
+     * 第 2 条就是之前一调 GIF_playFrame 就重启的根因：C++ 的 begin() 会算
+     * 这个指针，C 路径下永远为 NULL，于是 GIFMakePels() 往 NULL+偏移 写像素
+     * → LoadStoreError → 重启 → 只能跳过 playFrame → 画面全白。 */
+    GIF_begin(&p->gif, GIF_PALETTE_RGB565_LE);
+    p->gif.ucDrawType = GIF_DRAW_RAW;
+    {
+        uint8_t  *lb  = p->gif.ucLineBuf;
+        uintptr_t mis = (uintptr_t)lb & 15u;
+        if (mis) lb += (16u - mis);
+        p->gif.pLineBufAligned = lb;
     }
-    memcpy(p->sprite_copy, data, (size_t)len);
-    p->sprite_len = len;
-    GIF_LOG("aligned_copy done free=%d", (int)esp_get_free_heap_size());
 
-    int ok = GIF_openRAM(&p->gif, p->sprite_copy, len, gif_draw_cb);
-    GIF_LOG("openRAM ok=%d canvas=%ux%u free=%d", ok,
+    /* sprite 数据留在 Flash(.rodata)，不再拷贝到 RAM：
+     * AnimatedGIF 只在 readMem() 里用 memmove 从 pData 取数据，不对其做
+     * 32bit 直接读取，因此没有对齐要求；而最大的 venusaur GIF 有 125KB，
+     * 拷进 RAM 会直接把 ESP32-C3 的堆吃光。 */
+    int ok = GIF_openRAM(&p->gif, (uint8_t *)data, len, gif_draw_cb);
+    GIF_LOG("openRAM ok=%d canvas=%ux%u linebuf=%p free=%d", ok,
              (unsigned)GIF_getCanvasWidth(&p->gif),
              (unsigned)GIF_getCanvasHeight(&p->gif),
+             p->gif.pLineBufAligned,
              (int)esp_get_free_heap_size());
     if (!ok) {
-        free(p->sprite_copy); p->sprite_copy = NULL; p->sprite_len = 0;
         p->opened = false;
+        GIF_LOG("openRAM failed err=%d", GIF_getLastError(&p->gif));
         return 0;
     }
     p->opened = true;
     p->gw = GIF_getCanvasWidth(&p->gif);
     p->gh = GIF_getCanvasHeight(&p->gif);
 
-    /* === MVP: 跳过 GIF_playFrame ===
-     * 崩在 AnimatedGIF LZW 解码栈/越界（QEMU 看不到 panic 栈但 bootCount=1 铁证）,
-     * 改用其他 GIF 库或预解码帧存 Flash 工作量大,先让破壳稳定。
-     * canvas 留为白底+精灵名,让用户看到宝可梦"出来"。动画等库方案敲定再加。 */
-    GIF_LOG("skip playFrame (MVP), sprite ready. free=%d", (int)esp_get_free_heap_size());
-    /* 不启动 timer,playing=false → 不会调 GIF_playFrame 也不会崩 */
-    p->playing = false;
+    /* 解第一帧：能跑到这里就说明解码器可用 */
+    int delay = 0;
+    s_cur = p;
+    int rc = GIF_playFrame(&p->gif, &delay, NULL);
+    s_cur = NULL;
+    GIF_LOG("frame1 rc=%d err=%d delay=%d free=%d", rc,
+            GIF_getLastError(&p->gif), delay, (int)esp_get_free_heap_size());
+    if (rc < 0) {
+        /* 解码失败：保留白底但不启动定时器，至少不崩 */
+        return 0;
+    }
+    if (delay < 20) delay = 80;
+
+    p->playing = true;
+    if (!p->timer) {
+        p->timer = lv_timer_create(frame_timer_cb, (uint32_t)delay, p);
+    } else {
+        lv_timer_set_period(p->timer, (uint32_t)delay);
+        lv_timer_resume(p->timer);
+    }
     lv_obj_invalidate(p->canvas);
     return 1;
 }
