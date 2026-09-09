@@ -434,6 +434,7 @@ void demo_pet_exit(void)
     s_sleeping = false;
     s_training = false;
     if (s_timer) { esp_timer_stop(s_timer); esp_timer_delete(s_timer); s_timer = NULL; }
+    gif_player_destroy();     /* 释放单例解码器（约 24KB），否则退出后一直占着堆 */
     if (s_scr)  { lv_obj_delete(s_scr); s_scr = NULL; s_gif = NULL; s_ball = NULL; s_flash = NULL; s_sleepmask = NULL; s_train_panel = NULL; }
 }
 
