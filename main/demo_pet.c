@@ -215,8 +215,10 @@ static void tick_cb(void *arg)
 /* 破壳：随机选一只基础形态宝可梦，播放 GIF */
 static void do_hatch(void)
 {
+    ESP_LOGI("PET", "hatch: free=%d", (int)esp_get_free_heap_size());
     if (!s_ball) return;
     ui_pixel_ball_open(s_ball);
+    ESP_LOGI("PET", "ball_open ok free=%d", (int)esp_get_free_heap_size());
     s_ball = NULL;
     s_hatched = true;
 
@@ -226,11 +228,14 @@ static void do_hatch(void)
         tries++;
     } while (pokemon_gifs[s_cur_poke_idx].evo_stage != 0 && tries < 20);
     const pokemon_gif_t *pg = &pokemon_gifs[s_cur_poke_idx];
+    ESP_LOGI("PET", "pick=%s len=%d free=%d", pg->name, pg->len, (int)esp_get_free_heap_size());
 
     s_gif = gif_player_create(s_scr, 88, 156, 64, 64);
+    ESP_LOGI("PET", "gif_create=%p free=%d", s_gif, (int)esp_get_free_heap_size());
     gif_player_play(s_gif, pg->data, pg->len);
-
+    ESP_LOGI("PET", "gif_play done free=%d", (int)esp_get_free_heap_size());
     if (s_namelabel) lv_label_set_text(s_namelabel, pg->name);
+    ESP_LOGI("PET", "hatch ok free=%d", (int)esp_get_free_heap_size());
 
     refresh();
 }
