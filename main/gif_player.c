@@ -76,7 +76,7 @@ static void gif_draw_cb(GIFDRAW *pDraw)
 static void frame_timer_cb(lv_timer_t *t)
 {
     gif_player_t *p = lv_timer_get_user_data(t);
-    if (!p || !p->playing) return;
+    if (!p || !p->playing || !p->buf) return;
     int delay = 0;
     /* 每帧前清空 canvas，避免 disposal method 导致的残影 */
     uint16_t bg = BG_RGB565;
@@ -95,33 +95,79 @@ static void frame_timer_cb(lv_timer_t *t)
     lv_obj_invalidate(p->canvas);
 }
 
+/**
+ * 单例播放器。
+ *
+ * GIFIMAGE 内含 LZW 工作区（usGIFTable 8KB + ucGIFPixels 8KB），单个结构体约 24KB；
+ * ESP32-C3 可用动态堆仅 ~81KB，若每次换宠物都新建播放器，破壳一次 + 进化一次
+ * 就会吃掉 60KB+，必然 OOM 重启。因此全局只保留一个播放器实例，
+ * 换宠物/进化时复用同一块内存，只重建 LVGL canvas。
+ */
+static gif_player_t *s_player = NULL;
+
 lv_obj_t *gif_player_create(lv_obj_t *parent, int x, int y, int w, int h)
 {
-    gif_player_t *p = calloc(1, sizeof(gif_player_t));
+    gif_player_t *p;
+
+    if (s_player) {
+        /* 复用：停掉旧动画并释放旧画布，避免再次申请 GIFIMAGE */
+        p = s_player;
+        gif_player_stop(p->canvas);
+        if (p->canvas) { lv_obj_delete(p->canvas); p->canvas = NULL; }
+        if (p->buf)    { free(p->buf);             p->buf = NULL; }
+    } else {
+        p = calloc(1, sizeof(gif_player_t));
+        if (!p) return NULL;          /* 内存不足：不播动画，但不崩 */
+        s_player = p;
+    }
+
     p->cw = w;
     p->ch = h;
-    p->buf = calloc(w * h, sizeof(uint16_t));
+    p->buf = calloc((size_t)w * (size_t)h, sizeof(uint16_t));
+    if (!p->buf) {
+        p->cw = p->ch = 0;
+        return NULL;                  /* 内存不足：优雅降级 */
+    }
     uint16_t bg = BG_RGB565;
     for (int i = 0; i < w * h; i++) p->buf[i] = bg;
 
     p->canvas = lv_canvas_create(parent);
+    if (!p->canvas) {
+        free(p->buf); p->buf = NULL;
+        return NULL;
+    }
     lv_canvas_set_buffer(p->canvas, p->buf, w, h, LV_COLOR_FORMAT_RGB565);
     lv_obj_set_pos(p->canvas, x, y);
     lv_obj_set_user_data(p->canvas, p);
     return p->canvas;
 }
 
+void gif_player_destroy(void)
+{
+    gif_player_t *p = s_player;
+    if (!p) return;
+    if (p->timer) { lv_timer_delete(p->timer); p->timer = NULL; }
+    p->playing = false;
+    if (p->canvas) { lv_obj_delete(p->canvas); p->canvas = NULL; }
+    if (p->buf)    { free(p->buf);             p->buf = NULL; }
+    free(p);
+    s_player = NULL;
+}
+
 void gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
 {
+    if (!canvas || !data || len <= 0) return;      /* 播放器未就绪：静默跳过，不崩 */
     gif_player_t *p = lv_obj_get_user_data(canvas);
-    if (!p) return;
+    if (!p || !p->buf) return;
     gif_player_stop(canvas);
 
-    memset(p->buf, 0, p->cw * p->ch * 2);
     uint16_t bg = BG_RGB565;
     for (int i = 0; i < p->cw * p->ch; i++) p->buf[i] = bg;
     memset(&p->gif, 0, sizeof(GIFIMAGE));
-    GIF_openRAM(&p->gif, (uint8_t *)data, len, gif_draw_cb);
+
+    /* GIF_openRAM 返回 1 才表示解析成功；失败时不启动定时器，避免空转崩溃 */
+    if (!GIF_openRAM(&p->gif, (uint8_t *)data, len, gif_draw_cb)) return;
+
     p->gw = GIF_getCanvasWidth(&p->gif);
     p->gh = GIF_getCanvasHeight(&p->gif);
     p->playing = true;
@@ -137,9 +183,10 @@ void gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
 
 void gif_player_stop(lv_obj_t *canvas)
 {
+    if (!canvas) return;
     gif_player_t *p = lv_obj_get_user_data(canvas);
     if (!p) return;
     if (p->timer) { lv_timer_delete(p->timer); p->timer = NULL; }
     p->playing = false;
-    GIF_close(&p->gif);
+    if (p->buf) GIF_close(&p->gif);   /* buf 为 NULL 说明从未成功 open，无需 close */
 }
