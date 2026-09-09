@@ -424,15 +424,17 @@ void demo_pet_enter(void)
     s_ball = ui_pixel_ball_create(s_scr, 108, 148);
     ESP_LOGI("PET", "ball created free=%d", (int)esp_get_free_heap_size());
 
-    /* 宠物名字标签（破壳后显示, MVP 版无 GIF 动画时字号放大 + 居中显示在 canvas 区） */
+    /* 宠物名字标签（破壳后显示, MVP 版无 GIF 动画时字号放大显示在 canvas 下方） */
     s_namelabel = ui_pixel_label(s_scr, "", &lv_font_montserrat_20, 0x17202A);
     if (s_namelabel) {
-        lv_obj_set_pos(s_namelabel, 88, 184);          /* canvas 中央下方(64x64 内 184=156+28) */
-        lv_obj_set_size(s_namelabel, 64, 28);
+        lv_obj_set_pos(s_namelabel, 60, 226);          /* canvas(88,156,64,64) 之下,居中 */
+        lv_obj_set_size(s_namelabel, 120, 28);
         lv_obj_set_style_bg_color(s_namelabel, lv_color_hex(0xF4F4EA), 0);
-        lv_obj_set_style_bg_opa(s_namelabel, LV_OPA_80, 0);
+        lv_obj_set_style_bg_opa(s_namelabel, LV_OPA_90, 0);
         lv_obj_set_style_text_align(s_namelabel, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_pad_all(s_namelabel, 2, 0);
+        lv_obj_set_style_border_width(s_namelabel, 1, 0);
+        lv_obj_set_style_border_color(s_namelabel, lv_color_hex(0x17202A), 0);
     }
 
     /* 进化闪光层（全屏白色矩形，初始隐藏）*/
