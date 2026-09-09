@@ -62,19 +62,33 @@ static lv_obj_t *s_train_cursor;  /* 选中指示器 */
 #define CLAMP(v) ((v) < 0 ? 0 : ((v) > 100 ? 100 : (v)))
 #define EXP_PER_LEVEL 100
 
-/* ---------- 背景绘制：天空 + 草地（简化版，减少 LVGL 对象数量） ---------- */
+/* ---------- 背景绘制：天空 + 草地 ----------
+ * 注意：block() 每调用一次就创建一个 LVGL 对象。ESP32-C3 只有约 80 KB 动态 RAM，
+ * 早期版本用 240 个小色块拼背景（天空 50 + 草地 30 + 草点 40 + 小山 120），
+ * 进页面时一次性创建近 300 个对象导致内存耗尽、空指针崩溃重启。
+ * 现改为 13 个大色块，保留渐变层次与山体轮廓，玩法逻辑完全不变。
+ */
 static void draw_background(lv_obj_t *parent)
 {
-    /* 天空：3 个大色块代替 50 个小色块 */
-    block(parent, 0, 0,   240, 80,  0x1689E8);
-    block(parent, 0, 80,  240, 60,  0x4FA0E8);
-    block(parent, 0, 140, 240, 60,  0x7BB8F0);
-    /* 草地：3 个大色块 */
-    block(parent, 0, 200, 240, 40,  0x82BE2D);
-    block(parent, 0, 240, 240, 40,  0x6BA825);
-    block(parent, 0, 280, 240, 40,  0x5A9020);
-    /* 远处小山：1 个大块代替 120 个小柱子 */
-    block(parent, 0, 160, 240, 40, 0x5A9A4A);
+    /* 天空：3 段渐变（原 50 个 4px 条带 → 3 块） */
+    block(parent, 0, 0,   240, 80, 0x1689E8);   /* 顶部深蓝 */
+    block(parent, 0, 80,  240, 60, 0x4FA0E8);   /* 中部蓝 */
+    block(parent, 0, 140, 240, 60, 0x7BB8F0);   /* 近地平线浅蓝 */
+
+    /* 远处小山：3 块近似起伏轮廓（原 120 个 2px 竖条 → 3 块） */
+    block(parent, 0,   148, 80, 52, 0x5A9A4A);
+    block(parent, 80,  138, 80, 62, 0x5A9A4A);
+    block(parent, 160, 148, 80, 52, 0x5A9A4A);
+
+    /* 草地：2 段渐变（原 30 个 4px 条带 → 2 块） */
+    block(parent, 0, 200, 240, 80, 0x82BE2D);   /* 近处亮绿 */
+    block(parent, 0, 280, 240, 40, 0x5A9020);   /* 底部暗绿 */
+
+    /* 草地纹理：5 簇小草（原 40 个随机点 → 5 个固定点） */
+    const int grass[5][2] = { {20, 248}, {70, 272}, {130, 258}, {186, 288}, {214, 238} };
+    for (int i = 0; i < 5; i++) {
+        block(parent, grass[i][0], grass[i][1], 3, 4, 0x4A8A18);
+    }
 }
 
 /* ---------- 顶部状态条（GBA 风格图标 + 数字） ---------- */
@@ -164,9 +178,7 @@ static void try_evolve(void)
     }
     if (s_gif) gif_player_stop(s_gif);
     s_gif = gif_player_create(s_scr, 88, 156, 64, 64);
-    if (s_gif) {
-        gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data, pokemon_gifs[s_cur_poke_idx].len);
-    }
+    gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data, pokemon_gifs[s_cur_poke_idx].len);
     if (s_namelabel) lv_label_set_text(s_namelabel, pokemon_gifs[s_cur_poke_idx].name);
 }
 
@@ -216,9 +228,7 @@ static void do_hatch(void)
     const pokemon_gif_t *pg = &pokemon_gifs[s_cur_poke_idx];
 
     s_gif = gif_player_create(s_scr, 88, 156, 64, 64);
-    if (s_gif) {
-        gif_player_play(s_gif, pg->data, pg->len);
-    }
+    gif_player_play(s_gif, pg->data, pg->len);
 
     if (s_namelabel) lv_label_set_text(s_namelabel, pg->name);
 

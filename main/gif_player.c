@@ -98,16 +98,13 @@ static void frame_timer_cb(lv_timer_t *t)
 lv_obj_t *gif_player_create(lv_obj_t *parent, int x, int y, int w, int h)
 {
     gif_player_t *p = calloc(1, sizeof(gif_player_t));
-    if (!p) return NULL;
     p->cw = w;
     p->ch = h;
     p->buf = calloc(w * h, sizeof(uint16_t));
-    if (!p->buf) { free(p); return NULL; }
     uint16_t bg = BG_RGB565;
     for (int i = 0; i < w * h; i++) p->buf[i] = bg;
 
     p->canvas = lv_canvas_create(parent);
-    if (!p->canvas) { free(p->buf); free(p); return NULL; }
     lv_canvas_set_buffer(p->canvas, p->buf, w, h, LV_COLOR_FORMAT_RGB565);
     lv_obj_set_pos(p->canvas, x, y);
     lv_obj_set_user_data(p->canvas, p);
@@ -117,16 +114,14 @@ lv_obj_t *gif_player_create(lv_obj_t *parent, int x, int y, int w, int h)
 void gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
 {
     gif_player_t *p = lv_obj_get_user_data(canvas);
-    if (!p || !data || len <= 0) return;
+    if (!p) return;
     gif_player_stop(canvas);
 
     memset(p->buf, 0, p->cw * p->ch * 2);
     uint16_t bg = BG_RGB565;
     for (int i = 0; i < p->cw * p->ch; i++) p->buf[i] = bg;
     memset(&p->gif, 0, sizeof(GIFIMAGE));
-    if (!GIF_openRAM(&p->gif, (uint8_t *)data, len, gif_draw_cb)) {
-        return;  /* GIF 数据无效，不启动播放 */
-    }
+    GIF_openRAM(&p->gif, (uint8_t *)data, len, gif_draw_cb);
     p->gw = GIF_getCanvasWidth(&p->gif);
     p->gh = GIF_getCanvasHeight(&p->gif);
     p->playing = true;

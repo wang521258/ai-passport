@@ -15,7 +15,10 @@
 
 lv_obj_t *ui_pixel_screen_create(const char *title);
 
-/** 画一个像素方块（无描边、无圆角），供 ui_pet.c 拼像素画使用 */
+/* 基础色块：宠物玩法（demo_pet.c / ui_pet.c）需要用 block() 绘制背景与
+   精灵球，因此这里去掉 static 并对外导出。
+   注意：每个 block 都是一个独立 LVGL 对象，ESP32-C3 只有约 80 KB 动态
+   RAM，请勿用它做逐像素或大循环绘制。 */
 lv_obj_t *block(lv_obj_t *parent, int x, int y, int w, int h, uint32_t color);
 lv_obj_t *ui_pixel_panel_create(lv_obj_t *parent, int x, int y, int w, int h,
                                 uint32_t color);
