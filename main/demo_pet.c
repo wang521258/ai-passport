@@ -62,32 +62,19 @@ static lv_obj_t *s_train_cursor;  /* 选中指示器 */
 #define CLAMP(v) ((v) < 0 ? 0 : ((v) > 100 ? 100 : (v)))
 #define EXP_PER_LEVEL 100
 
-/* ---------- 背景绘制：天空 + 草地 ---------- */
+/* ---------- 背景绘制：天空 + 草地（简化版，减少 LVGL 对象数量） ---------- */
 static void draw_background(lv_obj_t *parent)
 {
-    /* 天空渐变（上部蓝色） */
-    for (int y = 0; y < 200; y += 4) {
-        uint32_t c = (y < 80) ? 0x1689E8 : (y < 140 ? 0x4FA0E8 : 0x7BB8F0);
-        block(parent, 0, y, 240, 4, c);
-    }
-    /* 草地（下部绿色） */
-    for (int y = 200; y < 320; y += 4) {
-        uint32_t c = (y < 240) ? 0x82BE2D : (y < 280 ? 0x6BA825 : 0x5A9020);
-        block(parent, 0, y, 240, 4, c);
-    }
-    /* 草地纹理：随机小草点 */
-    srand(12345);
-    for (int i = 0; i < 40; i++) {
-        int gx = rand() % 240;
-        int gy = 210 + rand() % 100;
-        block(parent, gx, gy, 2, 3, 0x4A8A18);
-    }
-    /* 远处小山 */
-    for (int x = 0; x < 240; x += 2) {
-        int h = 20 + (int)(15 * sin(x * 0.05));
-        if (h < 10) h = 10;
-        block(parent, x, 180 - h, 2, h, 0x5A9A4A);
-    }
+    /* 天空：3 个大色块代替 50 个小色块 */
+    block(parent, 0, 0,   240, 80,  0x1689E8);
+    block(parent, 0, 80,  240, 60,  0x4FA0E8);
+    block(parent, 0, 140, 240, 60,  0x7BB8F0);
+    /* 草地：3 个大色块 */
+    block(parent, 0, 200, 240, 40,  0x82BE2D);
+    block(parent, 0, 240, 240, 40,  0x6BA825);
+    block(parent, 0, 280, 240, 40,  0x5A9020);
+    /* 远处小山：1 个大块代替 120 个小柱子 */
+    block(parent, 0, 160, 240, 40, 0x5A9A4A);
 }
 
 /* ---------- 顶部状态条（GBA 风格图标 + 数字） ---------- */
@@ -177,7 +164,9 @@ static void try_evolve(void)
     }
     if (s_gif) gif_player_stop(s_gif);
     s_gif = gif_player_create(s_scr, 88, 156, 64, 64);
-    gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data, pokemon_gifs[s_cur_poke_idx].len);
+    if (s_gif) {
+        gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data, pokemon_gifs[s_cur_poke_idx].len);
+    }
     if (s_namelabel) lv_label_set_text(s_namelabel, pokemon_gifs[s_cur_poke_idx].name);
 }
 
@@ -227,7 +216,9 @@ static void do_hatch(void)
     const pokemon_gif_t *pg = &pokemon_gifs[s_cur_poke_idx];
 
     s_gif = gif_player_create(s_scr, 88, 156, 64, 64);
-    gif_player_play(s_gif, pg->data, pg->len);
+    if (s_gif) {
+        gif_player_play(s_gif, pg->data, pg->len);
+    }
 
     if (s_namelabel) lv_label_set_text(s_namelabel, pg->name);
 
