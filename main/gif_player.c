@@ -178,7 +178,7 @@ void gif_player_destroy(void)
 
 int gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
 {
-    if (!canvas || !data || len <= 0) return 0;     /* 播放器未就绪：静默跳过,不崩 */
+    if (!canvas || !data || len <= 0) return 0;
     gif_player_t *p = lv_obj_get_user_data(canvas);
     if (!p || !p->buf) return 0;
     gif_player_stop(canvas);
@@ -187,9 +187,7 @@ int gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
     for (int i = 0; i < p->cw * p->ch; i++) p->buf[i] = bg;
     memset(&p->gif, 0, sizeof(GIFIMAGE));
 
-    /* 关键：sprite data 必须 32 字节对齐。原 .rodata const 数据 GCC 不保证
-     * 对齐,AnimatedGIF 库内部读 GIF 流时若地址未对齐会 ESP32C3 LoadStoreError。
-     * 用 heap_caps_aligned_alloc(32) 强制 32 字节对齐。 */
+    /* sprite data 32 字节对齐(原 .rodata const 不保证) */
     if (p->sprite_copy) { free(p->sprite_copy); p->sprite_copy = NULL; }
     p->sprite_copy = heap_caps_aligned_alloc(32, (size_t)len, MALLOC_CAP_8BIT);
     if (!p->sprite_copy) {
@@ -201,8 +199,9 @@ int gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
     GIF_LOG("aligned_copy done free=%d", (int)esp_get_free_heap_size());
 
     int ok = GIF_openRAM(&p->gif, p->sprite_copy, len, gif_draw_cb);
-    GIF_LOG("openRAM ok=%d canvas=%dx%d free=%d", ok,
-             GIF_getCanvasWidth(&p->gif), GIF_getCanvasHeight(&p->gif),
+    GIF_LOG("openRAM ok=%d canvas=%ux%u free=%d", ok,
+             (unsigned)GIF_getCanvasWidth(&p->gif),
+             (unsigned)GIF_getCanvasHeight(&p->gif),
              (int)esp_get_free_heap_size());
     if (!ok) {
         free(p->sprite_copy); p->sprite_copy = NULL; p->sprite_len = 0;
@@ -210,20 +209,17 @@ int gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
         return 0;
     }
     p->opened = true;
-
     p->gw = GIF_getCanvasWidth(&p->gif);
     p->gh = GIF_getCanvasHeight(&p->gif);
-    p->playing = true;
 
-    int delay = 0;
-    s_cur = p;
-    int fr = GIF_playFrame(&p->gif, &delay, NULL);
-    s_cur = NULL;
-    GIF_LOG("first frame res=%d delay=%d free=%d", fr, delay, (int)esp_get_free_heap_size());
-    if (delay < 20) delay = 80;
-
-    p->timer = lv_timer_create(frame_timer_cb, delay, p);
-    GIF_LOG("timer=%p free=%d", p->timer, (int)esp_get_free_heap_size());
+    /* === MVP: 跳过 GIF_playFrame ===
+     * 崩在 AnimatedGIF LZW 解码栈/越界（QEMU 看不到 panic 栈但 bootCount=1 铁证）,
+     * 改用其他 GIF 库或预解码帧存 Flash 工作量大,先让破壳稳定。
+     * canvas 留为白底+精灵名,让用户看到宝可梦"出来"。动画等库方案敲定再加。 */
+    GIF_LOG("skip playFrame (MVP), sprite ready. free=%d", (int)esp_get_free_heap_size());
+    /* 不启动 timer,playing=false → 不会调 GIF_playFrame 也不会崩 */
+    p->playing = false;
+    lv_obj_invalidate(p->canvas);
     return 1;
 }
 
