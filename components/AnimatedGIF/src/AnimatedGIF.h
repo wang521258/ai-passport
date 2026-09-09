@@ -61,7 +61,11 @@
 // by preparing (specially encoding) the GIFs, you can save >10kB RAM, but you will not be able to decode arbitrary
 // images anymore. One application to craft such GIFs can be found here (use option -d) 
 // https://create.stephan-brumme.com/flexigif-lossless-gif-lzw-optimization/
-#define MAX_CODE_SIZE 12
+// ESP32-C3 可用动态堆仅约 81KB，取 12 时 GIFIMAGE 约 24KB（usGIFTable 8KB
+// + ucGIFPixels 8KB + ucFileBuf 4KB），宠物页一次播放就 OOM 重启。
+// 宠物 GIF 均为 64x64 小图，LZW 码长远用不到 12 位，降到 10：
+//   GIFIMAGE 24KB -> 约 8.6KB（省 15KB），足够在 81KB 堆上跑起来。
+#define MAX_CODE_SIZE 10
 
 #define MAX_COLORS 256
 #ifdef __LINUX__
