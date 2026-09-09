@@ -25,16 +25,64 @@ static const char *GP = "GIFP";
 /* UI_PAPER=0xF4F4EA → RGB565: R5=30 G6=61 B5=29 = 0xF7DD */
 #define BG_RGB565  ((uint16_t)0xF7DD)
 
+/* GIF 原始帧延迟(通常 50~100ms)在小屏上看着像抽搐。
+ * 统一放慢到 GIF_SLOWDOWN 倍，并设 GIF_MIN_DELAY 下限，动作更柔和。 */
+#define GIF_SLOWDOWN  3
+#define GIF_MIN_DELAY 120
+
+/* 待机动效：上下浮动 2px，8 帧一个周期（约 1 秒一次呼吸） */
+static const int8_t BOB_TABLE[8] = { 0, -1, -1, -2, -2, -1, -1, 0 };
+
 typedef struct {
     GIFIMAGE gif;
     lv_obj_t *canvas;
     uint16_t *buf;
     int cw, ch;          /* canvas 尺寸 */
     int gw, gh;          /* GIF 画布尺寸 */
+    int ox, oy;          /* canvas 在屏幕上的左上角（背景取色用） */
+    int bob;             /* 当前上下浮动偏移 */
+    int frame_no;        /* 已播帧数（驱动 bob） */
+    bool bob_on;         /* 是否启用浮动 */
     lv_timer_t *timer;
     bool playing;
     bool opened;         /* GIF_openRAM 是否成功过,GIF_close 前必查 */
 } gif_player_t;
+
+/* 场景背景取色回调：由 demo_pet 注册，用于消除 canvas 白底方块 */
+static uint16_t (*s_bg_fn)(int x, int y) = NULL;
+
+void gif_player_set_bg_fn(uint16_t (*fn)(int x, int y)) { s_bg_fn = fn; }
+
+void gif_player_set_bob(lv_obj_t *canvas, bool enable)
+{
+    if (!canvas) return;
+    gif_player_t *p = lv_obj_get_user_data(canvas);
+    if (p) p->bob_on = enable;
+}
+
+void gif_player_set_pos(lv_obj_t *canvas, int x, int y)
+{
+    if (!canvas) return;
+    gif_player_t *p = lv_obj_get_user_data(canvas);
+    if (!p) return;
+    p->ox = x; p->oy = y;
+    lv_obj_set_pos(canvas, x, y);
+}
+
+/* 用场景背景色铺满画布：无 alpha 通道时消除白方块的唯一办法 */
+static void fill_background(gif_player_t *p)
+{
+    if (s_bg_fn) {
+        for (int r = 0; r < p->ch; r++) {
+            uint16_t *row = &p->buf[r * p->cw];
+            int sy = p->oy + r;
+            for (int c = 0; c < p->cw; c++) row[c] = s_bg_fn(p->ox + c, sy);
+        }
+    } else {
+        uint16_t bg = BG_RGB565;
+        for (int i = 0; i < p->cw * p->ch; i++) p->buf[i] = bg;
+    }
+}
 
 /* 当前播放中的播放器（供 draw callback 访问） */
 static gif_player_t *s_cur = NULL;
@@ -63,6 +111,10 @@ static void gif_draw_cb(GIFDRAW *pDraw)
     int cy0 = (gh > 0 && ch > 0) ? (gy * ch / gh) : gy;
     int cy1 = (gh > 0 && ch > 0) ? ((gy + 1) * ch / gh) : (gy + 1);
     if (cy1 <= cy0) cy1 = cy0 + 1;
+    /* 待机上下浮动：只偏移宠物本体，背景已在 fill_background 里画好不动 */
+    cy0 += s_cur->bob;
+    cy1 += s_cur->bob;
+    if (cy1 <= 0 || cy0 >= ch) return;      /* 整行被浮出画布 */
     if (cy0 < 0)  cy0 = 0;
     if (cy1 > ch) cy1 = ch;
 
@@ -106,9 +158,10 @@ static void frame_timer_cb(lv_timer_t *t)
     gif_player_t *p = lv_timer_get_user_data(t);
     if (!p || !p->playing || !p->buf || !p->opened) return;
     int delay = 0;
-    /* 每帧前清空 canvas，避免 disposal method 导致的残影 */
-    uint16_t bg = BG_RGB565;
-    for (int i = 0; i < p->cw * p->ch; i++) p->buf[i] = bg;
+    /* 每帧前按场景背景色重铺画布：既避免 disposal 残影，也让白底方块消失 */
+    fill_background(p);
+    p->bob = p->bob_on ? BOB_TABLE[p->frame_no & 7] : 0;
+    p->frame_no++;
     s_cur = p;
     int res = GIF_playFrame(&p->gif, &delay, NULL);
     s_cur = NULL;
@@ -122,13 +175,14 @@ static void frame_timer_cb(lv_timer_t *t)
     if (res == 0) {
         /* 播完一遍，从头循环 */
         GIF_reset(&p->gif);
-        uint16_t bg2 = BG_RGB565;
-        for (int i = 0; i < p->cw * p->ch; i++) p->buf[i] = bg2;
+        fill_background(p);
         s_cur = p;
         GIF_playFrame(&p->gif, &delay, NULL);
         s_cur = NULL;
     }
-    if (delay < 20) delay = 80; /* 有些 GIF 帧延迟为 0，给个默认值 */
+    /* 放慢播放：原始帧延迟 × GIF_SLOWDOWN，并给下限 */
+    delay *= GIF_SLOWDOWN;
+    if (delay < GIF_MIN_DELAY) delay = GIF_MIN_DELAY;
     lv_timer_set_period(p->timer, delay);
     /* 通知 LVGL 刷新 canvas */
     lv_obj_invalidate(p->canvas);
@@ -164,6 +218,11 @@ lv_obj_t *gif_player_create(lv_obj_t *parent, int x, int y, int w, int h)
 
     p->cw = w;
     p->ch = h;
+    p->ox = x;
+    p->oy = y;
+    p->bob = 0;
+    p->frame_no = 0;
+    p->bob_on = true;
     p->buf = calloc((size_t)w * (size_t)h, sizeof(uint16_t));
     GIF_LOG("calloc canvas buf(%dB) -> %p, free=%d",
              (int)((size_t)w * (size_t)h * 2), p->buf, (int)esp_get_free_heap_size());
@@ -171,8 +230,7 @@ lv_obj_t *gif_player_create(lv_obj_t *parent, int x, int y, int w, int h)
         p->cw = p->ch = 0;
         return NULL;                  /* 内存不足：优雅降级 */
     }
-    uint16_t bg = BG_RGB565;
-    for (int i = 0; i < w * h; i++) p->buf[i] = bg;
+    fill_background(p);
 
     p->canvas = lv_canvas_create(parent);
     GIF_LOG("canvas -> %p, free=%d", p->canvas, (int)esp_get_free_heap_size());
@@ -246,6 +304,9 @@ int gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
 
     /* 解第一帧：能跑到这里就说明解码器可用 */
     int delay = 0;
+    fill_background(p);
+    p->bob = p->bob_on ? BOB_TABLE[p->frame_no & 7] : 0;
+    p->frame_no++;
     s_cur = p;
     int rc = GIF_playFrame(&p->gif, &delay, NULL);
     s_cur = NULL;
@@ -255,7 +316,8 @@ int gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
         /* 解码失败：保留白底但不启动定时器，至少不崩 */
         return 0;
     }
-    if (delay < 20) delay = 80;
+    delay *= GIF_SLOWDOWN;
+    if (delay < GIF_MIN_DELAY) delay = GIF_MIN_DELAY;
 
     p->playing = true;
     if (!p->timer) {
