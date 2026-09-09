@@ -52,10 +52,19 @@ static void gif_draw_cb(GIFDRAW *pDraw)
     int x0 = pDraw->iX;
     int w = pDraw->iWidth;
 
-    /* GIF 原始 y → canvas y（最近邻缩放）*/
+    /* GIF 原始 y → canvas y（最近邻放大，区间填充）
+     *
+     * 注意：GIF 只有 37x38，canvas 是 64x64。若按单点映射（cy = gy*ch/gh），
+     * 64 行里只有 38 行会被写到，剩下 26 行留背景色 → 满屏横向条纹；
+     * 列方向同理会有竖向空隙。所以这里按 [cy0, cy1) / [cx0, cx1) 区间整块
+     * 填充，放大后是干净的色块，不会出现斑马纹。 */
     int gy = pDraw->iY + pDraw->y;
-    int cy = (gh > 0 && ch > 0) ? (gy * ch / gh) : gy;
-    if (cy < 0 || cy >= ch) return;
+    if (gy < 0 || gy >= gh) return;
+    int cy0 = (gh > 0 && ch > 0) ? (gy * ch / gh) : gy;
+    int cy1 = (gh > 0 && ch > 0) ? ((gy + 1) * ch / gh) : (gy + 1);
+    if (cy1 <= cy0) cy1 = cy0 + 1;
+    if (cy0 < 0)  cy0 = 0;
+    if (cy1 > ch) cy1 = ch;
 
     if (pDraw->ucHasTransparency) {
         uint8_t trans = pDraw->ucTransparent;
@@ -63,18 +72,30 @@ static void gif_draw_cb(GIFDRAW *pDraw)
             uint8_t c = s[x];
             if (c != trans) {
                 int gx = x0 + x;
-                int cx = (gw > 0 && cw > 0) ? (gx * cw / gw) : gx;
-                if (cx >= 0 && cx < cw) {
-                    s_cur->buf[cy * cw + cx] = pal[c];
+                int cx0 = (gw > 0 && cw > 0) ? (gx * cw / gw) : gx;
+                int cx1 = (gw > 0 && cw > 0) ? ((gx + 1) * cw / gw) : (gx + 1);
+                if (cx1 <= cx0) cx1 = cx0 + 1;
+                if (cx0 < 0)  cx0 = 0;
+                if (cx1 > cw) cx1 = cw;
+                uint16_t v = pal[c];
+                for (int cy = cy0; cy < cy1; cy++) {
+                    uint16_t *row = &s_cur->buf[cy * cw];
+                    for (int cx = cx0; cx < cx1; cx++) row[cx] = v;
                 }
             }
         }
     } else {
         for (int x = 0; x < w; x++) {
             int gx = x0 + x;
-            int cx = (gw > 0 && cw > 0) ? (gx * cw / gw) : gx;
-            if (cx >= 0 && cx < cw) {
-                s_cur->buf[cy * cw + cx] = pal[s[x]];
+            int cx0 = (gw > 0 && cw > 0) ? (gx * cw / gw) : gx;
+            int cx1 = (gw > 0 && cw > 0) ? ((gx + 1) * cw / gw) : (gx + 1);
+            if (cx1 <= cx0) cx1 = cx0 + 1;
+            if (cx0 < 0)  cx0 = 0;
+            if (cx1 > cw) cx1 = cw;
+            uint16_t v = pal[s[x]];
+            for (int cy = cy0; cy < cy1; cy++) {
+                uint16_t *row = &s_cur->buf[cy * cw];
+                for (int cx = cx0; cx < cx1; cx++) row[cx] = v;
             }
         }
     }
