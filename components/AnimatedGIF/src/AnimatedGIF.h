@@ -297,4 +297,25 @@ class AnimatedGIF
 #define BIGUINT uint32_t
 #endif // 64 vs 32-bit native register size
 
+/* ---------- C API（gif.inl 中的全局函数）----------
+   上方 class AnimatedGIF 内的 GIF_openRAM / GIF_playFrame 等是 C++ 成员函数，
+   C 源文件（如 gif_player.c）看不到。而 gif.inl 中定义的同名全局 C 函数在
+   头文件里原本没有任何 C 可见声明，直接调用会被 GCC 14 判定为隐式声明错误。
+   这里按 gif.inl 的实际签名补齐声明。 */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int GIF_openRAM(GIFIMAGE *pGIF, uint8_t *pData, int iDataSize, GIF_DRAW_CALLBACK *pfnDraw);
+void GIF_close(GIFIMAGE *pGIF);
+void GIF_reset(GIFIMAGE *pGIF);
+int GIF_playFrame(GIFIMAGE *pGIF, int *delayMilliseconds, void *pUser);
+int GIF_getCanvasWidth(GIFIMAGE *pGIF);
+int GIF_getCanvasHeight(GIFIMAGE *pGIF);
+int GIF_getLastError(GIFIMAGE *pGIF);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif // __ANIMATEDGIF__
