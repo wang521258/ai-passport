@@ -1,157 +1,192 @@
 /**
  * @file ui_pet.c
- * @brief 精灵球与像素宠物的实现（ui_pet.h 的接口）
+ * @brief 像素风宠物 UI：粉色宠物（占位）+ 精灵蛋
  *
- * 原工程只有 ui_pet.h，缺少对应的 .c 实现，而 demo_pet.c 会调用
- * ui_pixel_ball_create / ui_pixel_ball_shake / ui_pixel_ball_open，
- * 直接编译会链接失败。本文件补齐这些实现。
+ * 精灵蛋绘制算法（与 HTML 预览同源）：
+ *   上半椭圆 + 下半椭圆拼接，宽度按 sqrt 收缩；
+ *   斑点 6 个（归一化坐标），底部阴影，高光，描边。
+ *   用 2×2 像素块填色（GBA 像素风），共 36×45=1620 次填色，启动瞬间完成。
  *
- * 注意内存：ESP32-C3 仅约 80 KB 动态 RAM，因此这里刻意只用少量
- * block() 色块（每个 block 都是一个 LVGL 对象），不做精细逐像素绘制。
+ * 蛋缓冲区：12.9KB（72×90 RGB565），lv_canvas_set_buffer 把指针写到
+ * obj 的 user_data，销毁时取出并 free。
  */
 #include "ui_pet.h"
-#include "ui_pixel.h"
 #include "lvgl.h"
 #include <stdint.h>
+#include <string.h>
+#include <math.h>
+#include <stdlib.h>
 
-/* ---------- 内部工具 ---------- */
-static void ball_set_x_cb(void *obj, int32_t v)
-{
-    lv_obj_set_x((lv_obj_t *)obj, v);
-}
+/* ====================== 颜色常量（RGB565） ====================== */
+#define C_SHELL    0xFFF7  /* 蛋壳米白 (#FFF8E7) */
+#define C_SHADE    0xDE5A  /* 底部阴影 (#E3D3AE) */
+#define C_SPOT_L   0x9E69  /* 浅绿斑 (#7CB342) */
+#define C_SPOT_D   0x7385  /* 深绿斑 (#5A9A2E) */
+#define C_LINE     0x4A48  /* 描边深棕 (#3E2723) */
+#define C_HILITE   0xFFFF  /* 高光白 */
 
-static void ball_fade_cb(void *obj, int32_t v)
-{
-    lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
-}
-
-static void ball_open_done_cb(lv_anim_t *a)
-{
-    if (a && a->var) lv_obj_delete((lv_obj_t *)a->var);
-}
-
-/* ---------- 精灵球 ---------- */
-lv_obj_t *ui_pixel_ball_create(lv_obj_t *parent, int x, int y)
-{
-    lv_obj_t *ball = lv_obj_create(parent);
-    lv_obj_remove_flag(ball, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(ball, x, y);
-    lv_obj_set_size(ball, 24, 24);
-    lv_obj_set_style_bg_opa(ball, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(ball, 0, 0);
-    lv_obj_set_style_pad_all(ball, 0, 0);
-
-    /* 记住基准 X，供 shake 反复调用时复位 */
-    lv_obj_set_user_data(ball, (void *)(intptr_t)x);
-
-    /* 上半球：红 */
-    block(ball, 4, 2, 16, 7, 0xE03A2F);
-    block(ball, 2, 4, 20, 5, 0xE03A2F);
-    /* 下半球：白 */
-    block(ball, 2, 13, 20, 5, 0xF4F4EA);
-    block(ball, 4, 16, 16, 4, 0xF4F4EA);
-    /* 中间黑带 */
-    block(ball, 2, 10, 20, 3, UI_INK);
-    /* 中心按钮：白圈 + 黑心 */
-    block(ball, 8, 7, 8, 8, 0xF4F4EA);
-    block(ball, 10, 9, 4, 4, UI_INK);
-    /* 高光 */
-    block(ball, 6, 4, 3, 2, 0xFFFFFF);
-
-    return ball;
-}
-
-void ui_pixel_ball_shake(lv_obj_t *ball, int level)
-{
-    if (!ball) return;
-    if (level < 1) level = 1;
-    if (level > 3) level = 3;
-
-    int base_x = (int)(intptr_t)lv_obj_get_user_data(ball);
-    int amp = 2 + level * 2;   /* level 1~3 → 4/6/8 px */
-
-    lv_anim_delete(ball, ball_set_x_cb);
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, ball);
-    lv_anim_set_exec_cb(&a, ball_set_x_cb);
-    lv_anim_set_values(&a, base_x - amp, base_x + amp);
-    lv_anim_set_duration(&a, 60);
-    lv_anim_set_playback_duration(&a, 60);
-    lv_anim_set_repeat_count(&a, level);
-    lv_anim_set_path_cb(&a, lv_anim_path_step);
-    lv_anim_start(&a);
-}
-
-void ui_pixel_ball_open(lv_obj_t *ball)
-{
-    if (!ball) return;
-
-    /* 爆开：淡出后自删（不额外创建动画对象以外的资源） */
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, ball);
-    lv_anim_set_exec_cb(&a, ball_fade_cb);
-    lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
-    lv_anim_set_duration(&a, 220);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-    lv_anim_set_completed_cb(&a, ball_open_done_cb);
-    lv_anim_start(&a);
-}
-
-/* ---------- 像素宠物（圆滚滚粉色）----------
- * demo_pet.c 当前版本用 GIF 呈现宝可梦，未调用下面这组接口；
- * 这里保留实现，避免其他页面引用时出现链接错误。
- */
+/* ====================== 像素宠物（粉色，占位） ====================== */
 lv_obj_t *ui_pixel_pet_create(lv_obj_t *parent, int x, int y)
 {
-    lv_obj_t *pet = lv_obj_create(parent);
-    lv_obj_remove_flag(pet, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(pet, x, y);
-    lv_obj_set_size(pet, 40, 40);
-    lv_obj_set_style_bg_opa(pet, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(pet, 0, 0);
-    lv_obj_set_style_pad_all(pet, 0, 0);
-
-    /* 身体 */
-    block(pet, 4, 6, 32, 28, 0xFFB6C1);
-    /* 头顶 */
-    block(pet, 8, 2, 24, 6, 0xFFB6C1);
-    /* 眼睛 */
-    block(pet, 12, 14, 5, 6, UI_INK);
-    block(pet, 24, 14, 5, 6, UI_INK);
-    /* 腮红 */
-    block(pet, 8, 22, 5, 3, 0xFF8FA3);
-    block(pet, 28, 22, 5, 3, 0xFF8FA3);
-    /* 脚 */
-    block(pet, 10, 34, 8, 4, 0xFF8FA3);
-    block(pet, 24, 34, 8, 4, 0xFF8FA3);
-
-    return pet;
+    lv_obj_t *o = lv_obj_create(parent);
+    if (!o) return NULL;
+    lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(o, x, y);
+    lv_obj_set_size(o, 60, 60);
+    lv_obj_set_style_radius(o, 30, 0);
+    lv_obj_set_style_bg_color(o, lv_color_hex(0xFFB6C1), 0);
+    lv_obj_set_style_border_color(o, lv_color_hex(0x17202A), 0);
+    lv_obj_set_style_border_width(o, 3, 0);
+    return o;
 }
 
-void ui_pixel_pet_jump(lv_obj_t *pet)
+void ui_pixel_pet_jump(lv_obj_t *pet) { (void)pet; }
+void ui_pixel_pet_set_face(lv_obj_t *pet, pet_face_t face) { (void)pet; (void)face; }
+
+/* ====================== 精灵蛋 ====================== */
+
+typedef struct { float sx, sy, rx, ry; } egg_spot_t;
+static const egg_spot_t EGG_SPOTS[] = {
+    { -0.30f, -0.08f, 0.13f, 0.075f },
+    {  0.26f,  0.06f, 0.11f, 0.065f },
+    { -0.08f,  0.28f, 0.095f, 0.055f },
+    {  0.32f,  0.40f, 0.08f,  0.05f  },
+    { -0.36f,  0.44f, 0.07f,  0.045f },
+    {  0.04f, -0.34f, 0.085f, 0.05f  },
+};
+#define EGG_SPOT_N (sizeof(EGG_SPOTS)/sizeof(EGG_SPOTS[0]))
+
+/** v12：场景统一纯色绿豆 #C8DFA0 → RGB565 0xC6F4（蛋"长在场景里"） */
+#define PET_BG565 0xC6F4
+static uint16_t bg_rgb565_at(int x, int y)
 {
-    if (!pet) return;
-    int y = lv_obj_get_y(pet);
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, pet);
-    lv_anim_set_exec_cb(&a, (lv_anim_exec_xcb_t)lv_obj_set_y);
-    lv_anim_set_values(&a, y, y - 8);
-    lv_anim_set_duration(&a, 120);
-    lv_anim_set_playback_duration(&a, 150);
-    lv_anim_set_path_cb(&a, lv_anim_path_step);
-    lv_anim_start(&a);
+    (void)x; (void)y;
+    return PET_BG565;
 }
 
-void ui_pixel_pet_set_face(lv_obj_t *pet, pet_face_t face)
+static void egg_paint(uint16_t *buf)
 {
-    if (!pet) return;
-    /* 简化实现：通过整体透明度区分睡觉状态，其余表情保持默认笑脸 */
-    if (face == PET_FACE_SLEEP) {
-        lv_obj_set_style_opa(pet, LV_OPA_60, 0);
-    } else {
-        lv_obj_set_style_opa(pet, LV_OPA_COVER, 0);
+    const int W = EGG_W, H = EGG_H;
+    const int cx = W / 2, cy = H / 2;
+    const float A = (float)W * 0.47f;
+    const float splitY = (float)H * 0.42f;
+    const int PX = 2;
+
+    /* 1. 底色：场景取色（无白块） */
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            buf[y * W + x] = bg_rgb565_at(x, y);
+        }
     }
+
+    /* 2. 行宽表 */
+    int rows_y[H / PX + 1];
+    int rows_w[H / PX + 1];
+    int rc = 0;
+    for (int y = 0; y < H; y += PX) {
+        float rw;
+        if (y < (int)splitY) {
+            float t = (splitY - y) / splitY;
+            rw = A * (1.0f - 0.30f * t * t) * sqrtf(fmaxf(0.0f, 1.0f - t * t));
+        } else {
+            float t = ((float)y - splitY) / ((float)H - splitY);
+            rw = A * (1.0f - 0.10f * t * t) * sqrtf(fmaxf(0.0f, 1.0f - t * t));
+        }
+        /* v12 封口：椭圆顶端/底端 t→1 时 rw→0 会开口，加最小宽度下限 */
+        rw = fmaxf(rw, (float)PX * 0.7f);
+        rows_y[rc] = y; rows_w[rc] = (int)rw; rc++;
+    }
+
+    /* 3. 逐块填色 */
+    for (int ri = 0; ri < rc; ri++) {
+        int y = rows_y[ri], rw = rows_w[ri];
+        for (int x = 0; x < W; x += PX) {
+            float d = fabsf((float)(x + PX / 2) - (float)cx);
+            if (d > rw) continue;
+            uint16_t col = C_SHELL;
+            if (d > rw - PX * 1.1f) col = C_LINE;          /* 描边 */
+            else if (y > (int)(H * 0.72f) && d > rw * 0.55f) col = C_SHADE;
+            for (int s = 0; s < (int)EGG_SPOT_N; s++) {
+                const egg_spot_t *sp = &EGG_SPOTS[s];
+                float px = (float)cx + sp->sx * (float)W;
+                float py = (float)cy + sp->sy * (float)H;
+                float dx = ((float)(x + PX / 2) - px) / (sp->rx * (float)W);
+                float dy = ((float)(y + PX / 2) - py) / (sp->ry * (float)H);
+                if (dx * dx + dy * dy < 1.0f) {
+                    col = (y > (int)(H * 0.60f)) ? C_SPOT_D : C_SPOT_L;
+                }
+            }
+            if ((x + PX / 2) < cx - 8 && y < (int)(H * 0.30f) && d < rw - PX * 2.5f) col = C_HILITE;
+            buf[y * W + x] = col;
+            if (x + 1 < W) buf[y * W + x + 1] = col;
+            if (y + 1 < H) buf[(y + 1) * W + x] = col;
+            if (x + 1 < W && y + 1 < H) buf[(y + 1) * W + x + 1] = col;
+        }
+    }
+}
+
+lv_obj_t *ui_pixel_egg_create(lv_obj_t *parent, int x, int y)
+{
+    lv_obj_t *canvas = lv_canvas_create(parent);
+    if (!canvas) return NULL;
+    lv_obj_remove_flag(canvas, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(canvas, x, y);
+    lv_obj_set_size(canvas, EGG_W, EGG_H);
+
+    uint16_t *buf = (uint16_t *)malloc(EGG_W * EGG_H * sizeof(uint16_t));
+    if (!buf) {
+        lv_obj_delete(canvas);
+        return NULL;
+    }
+    lv_canvas_set_buffer(canvas, buf, EGG_W, EGG_H, LV_COLOR_FORMAT_RGB565);
+    lv_obj_set_user_data(canvas, buf);   /* 销毁时取出并 free */
+    egg_paint(buf);
+    return canvas;
+}
+
+typedef struct {
+    lv_obj_t *obj;
+    int base_x;
+    int level;
+    int frame;
+} shake_ctx_t;
+
+static const int SHAKE_PAT[8] = { -5, -7, 5, 7, -3, 3, -1, 0 };
+
+static void shake_timer_cb(lv_timer_t *t)
+{
+    shake_ctx_t *ctx = (shake_ctx_t *)lv_timer_get_user_data(t);
+    if (!ctx || !ctx->obj) {
+        lv_timer_delete(t);
+        return;
+    }
+    int off = SHAKE_PAT[ctx->frame] * ctx->level;
+    lv_obj_set_x(ctx->obj, ctx->base_x + off);
+    ctx->frame++;
+    if (ctx->frame >= 8) {
+        lv_obj_set_x(ctx->obj, ctx->base_x);
+        lv_timer_delete(t);
+        free(ctx);
+    }
+}
+
+void ui_pixel_egg_shake(lv_obj_t *egg, int level)
+{
+    if (!egg || level < 1) return;
+    if (level > 3) level = 3;
+    shake_ctx_t *ctx = (shake_ctx_t *)malloc(sizeof(shake_ctx_t));
+    if (!ctx) return;
+    ctx->obj = egg;
+    ctx->base_x = lv_obj_get_x(egg);
+    ctx->level = level;
+    ctx->frame = 0;
+    lv_timer_create(shake_timer_cb, 40, ctx);
+}
+
+void ui_pixel_egg_destroy(lv_obj_t *egg)
+{
+    if (!egg) return;
+    void *p = lv_obj_get_user_data(egg);
+    if (p) free(p);
+    lv_obj_delete(egg);
 }
