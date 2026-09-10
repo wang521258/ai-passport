@@ -40,6 +40,10 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
+# cn_16 子集字库由 lv_font_conv 生成，glyph 位图是 RLE 压缩格式(bitmap_format=1)。
+# 此开关必须打开，否则 lv_font_get_bitmap_fmt_txt 对压缩字形返回空 → 中文全部不显示
+#（2026-09-10 模拟器实测：顶栏按钮/攻字/中文选项全空白，即此根因）。
+CONFIG_LV_USE_FONT_COMPRESSED=y
 # 中文不依赖 LVGL 内置字库：LVGL 9.5 已移除 SIMSUN，内置思源黑体子集又只含 1187 个
 # CJK 字符（本项目要 1142 汉字，缺 722 个）。改用 main/lv_font_cn_16.c（自生成子集，
 # 100% 覆盖，约 88KB），由 tools/gen_font.py 生成。
