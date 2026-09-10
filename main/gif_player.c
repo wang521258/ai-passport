@@ -158,9 +158,9 @@ static void frame_timer_cb(lv_timer_t *t)
     gif_player_t *p = lv_timer_get_user_data(t);
     if (!p || !p->playing || !p->buf || !p->opened) return;
     int delay = 0;
-    /* 每帧前按场景背景色重铺画布：既避免 disposal 残影，也让白底方块消失 */
-    fill_background(p);
-    p->bob = p->bob_on ? BOB_TABLE[p->frame_no & 7] : 0;
+    /* 注意：不要每帧重铺背景！宝可梦 GIF 大量帧是增量帧（只编码变化区域），
+     * 铺底会把上一帧该保留的内容擦掉 → 画面残缺、整块闪烁。
+     * 背景只在首次播放和循环回绕时铺一次，透明像素自然透出历史帧。 */
     p->frame_no++;
     s_cur = p;
     int res = GIF_playFrame(&p->gif, &delay, NULL);
