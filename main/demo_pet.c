@@ -5,9 +5,10 @@
 //   y=28..320   主舞台：蛋 / 宠物 / 全屏训练面板（绿豆色）
 //
 // v12 定版特性（与 HTML 预览 pet_preview.html 一致）：
-//   - 词库：PEP 3-6 年级 8 册 817 词（原译不动），按学习进度加权滑动出题
+//   - 词库：入门档 335 词（GitHub 小学高频+PEP1-2）+ PEP 3-6 年级 8 册 817 词 = 1152 词
+//     按学习进度加权滑动出题，新词在最前面（简单词先学）
 //   - 题型：英选汉 / 汉选英 各 50% 随机
-//   - 等级 = 学会的词数（右上角 攻+数字），进化阈值 150 / 650 词
+//   - 等级 = 学会的词数（右上角 攻+数字），进化阈值 210 / 915 词
 //   - 进化：严格同家族逐档升级，绝不跨种越级
 //   - 遗忘：记忆度每小时 -1（约 4 天忘光），归 0 掉进错题本，攻数值跟着掉并闪红
 //   - 破壳：只从"有进化链的基础形态"随机（15 只）
@@ -31,6 +32,11 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* 中文字库：由 tools/gen_font.py 从系统字体子集化生成（1142 汉字 + ASCII，约 88KB）。
+   LVGL 9.5 已移除 lv_font_simsun_16_cjk，内置的思源黑体子集又只含 1187 个 CJK 字符
+   （本项目要 1142 汉字，实测缺 722 个），所以自己生成一份 100% 覆盖的。 */
+extern lv_font_t cn_16;
+
 #define TAG "PET"
 #define LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
 
@@ -45,8 +51,8 @@
 #define MAX_WRONG    120                /* 错题本容量（遗忘会灌入，比 v4 大） */
 #define MEM_FULL     100                /* 学会时记忆度满分 */
 #define FORGET_SEC   3600               /* 每 3600 秒记忆度 -1 → 约 4 天忘光 */
-#define EVO_KNOWN_1  150                /* stage0→1：学会 150 词 */
-#define EVO_KNOWN_2  650                /* stage1→2：学会 650 词 */
+#define EVO_KNOWN_1  210                /* stage0→1：学会 210 词（1152 词库等比自 150）*/
+#define EVO_KNOWN_2  915                /* stage1→2：学会 915 词（1152 词库等比自 650）*/
 
 #define C_BG       0xC8DFA0             /* 绿豆色（场景 + 面板） */
 #define C_BG565    0xC6F4               /* 同色的 RGB565 */
@@ -97,7 +103,6 @@ static lv_obj_t *s_egg;
 static lv_obj_t *s_gif;
 static lv_obj_t *s_topbar_bg;
 static lv_obj_t *s_menu_btns[4];
-static lv_obj_t *s_review_badge;          /* 温习按钮上的数量角标 */
 static lv_obj_t *s_atkbox;
 static lv_obj_t *s_atk_num;
 static lv_obj_t *s_night;                 /* 睡觉黑幕 */
@@ -170,23 +175,13 @@ static void build_topbar(void)
 
         lv_obj_t *lb = lv_label_create(b);
         lv_label_set_text(lb, LBL[i]);
-        lv_obj_set_style_text_font(lb, &lv_font_simsun_16_cjk, 0);
+        lv_obj_set_style_text_font(lb, &cn_16, 0);
         lv_obj_set_style_text_color(lb, lv_color_hex(0xECEFF1), 0);
         lv_obj_center(lb);
         s_menu_btns[i] = b;
     }
 
-    /* 温习角标：红色小方块，带待温习数量（错题本空时隐藏）
-       挂在顶栏上（非按钮子对象），避免负坐标裁剪 */
-    s_review_badge = lv_label_create(s_topbar_bg);
-    lv_label_set_text(s_review_badge, "0");
-    lv_obj_set_style_text_font(s_review_badge, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_review_badge, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_bg_color(s_review_badge, lv_color_hex(0xE53935), 0);
-    lv_obj_set_style_bg_opa(s_review_badge, LV_OPA_COVER, 0);
-    lv_obj_set_style_pad_all(s_review_badge, 1, 0);
-    lv_obj_set_pos(s_review_badge, 128, 0);   /* 温习按钮右上角（按钮 x=95 w=46） */
-    lv_obj_add_flag(s_review_badge, LV_OBJ_FLAG_HIDDEN);
+    /* 温习按钮只显示"温习"，不挂数量角标（角标会把按钮撑变形） */
 
     /* 攻框：攻 图标 + 学会词数（右半部分） */
     s_atkbox = lv_obj_create(s_topbar_bg);
@@ -202,7 +197,7 @@ static void build_topbar(void)
 
     lv_obj_t *ic = lv_label_create(s_atkbox);
     lv_label_set_text(ic, "攻");
-    lv_obj_set_style_text_font(ic, &lv_font_simsun_16_cjk, 0);
+    lv_obj_set_style_text_font(ic, &cn_16, 0);
     lv_obj_set_style_text_color(ic, lv_color_hex(C_ATK), 0);
     lv_obj_set_pos(ic, 2, 4);
 
@@ -254,15 +249,7 @@ static void blink_timer_cb(lv_timer_t *t)
         }
     }
 
-    /* 温习角标 */
-    if (s_review_badge) {
-        if (s_wrong_n > 0) {
-            lv_label_set_text_fmt(s_review_badge, "%d", s_wrong_n);
-            lv_obj_remove_flag(s_review_badge, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            lv_obj_add_flag(s_review_badge, LV_OBJ_FLAG_HIDDEN);
-        }
-    }
+    /* 有词待温习时由 blink 定时器把"温习"按钮整体闪红，不再显示数量 */
 
     /* 攻数值 + 掉词告警闪红 */
     if (s_atk_num) lv_label_set_text_fmt(s_atk_num, "%d", known_count());
@@ -286,17 +273,20 @@ static void render_panel(void)
     /* 题干：e2c 显英文 / c2e 显中文；音标不显示（Montserrat 无 IPA 字形会出方块） */
     lv_label_set_text(s_p_word, s_qDir ? word_pool[s_qWord].cn : word_pool[s_qWord].en);
     lv_obj_set_style_text_font(s_p_word,
-        s_qDir ? &lv_font_simsun_16_cjk : &lv_font_montserrat_20, 0);
+        s_qDir ? &cn_16 : &lv_font_montserrat_20, 0);
+    /* 中文题干最长 11 字（"舞者，舞蹈演员，舞蹈家"），16px CJK 在 240 宽内可一行放下 */
+    lv_label_set_long_mode(s_p_word, LV_LABEL_LONG_WRAP);  /* 极端情况下允许换行 */
+    lv_obj_set_height(s_p_word, 32);                       /* 压缩题区给选项让位 */
 
     for (int i = 0; i < 5; i++) {
         const char *text;
         if (i < 4) {
             text = s_qDir ? word_pool[s_qOpts[i]].en : word_pool[s_qOpts[i]].cn;
             lv_obj_set_style_text_font(s_p_txt[i],
-                s_qDir ? &lv_font_montserrat_20 : &lv_font_simsun_16_cjk, 0);
+                s_qDir ? &lv_font_montserrat_20 : &cn_16, 0);
         } else {
             text = (s_mode == MODE_REVIEW) ? "结束温习，返回" : "结束训练，返回";
-            lv_obj_set_style_text_font(s_p_txt[i], &lv_font_simsun_16_cjk, 0);
+            lv_obj_set_style_text_font(s_p_txt[i], &cn_16, 0);
         }
         lv_label_set_text(s_p_txt[i], text);
 
@@ -319,7 +309,7 @@ static void render_panel(void)
  * ============================================================ */
 static float focus_book(void)
 {
-    return (float)known_count() / (float)WORD_POOL_SIZE * 7.0f;
+    return (float)known_count() / (float)WORD_POOL_SIZE * 8.0f;   /* 0~8：入门档→六下 */
 }
 static float book_weight(int book, float focus)
 {
@@ -338,11 +328,11 @@ static float mem_weight(int idx)
 static int pick_train_word(void)
 {
     float focus = focus_book();
-    float bw[8], tot = 0;
-    for (int b = 0; b < 8; b++) { bw[b] = book_weight(b, focus); tot += bw[b]; }
+    float bw[9], tot = 0;
+    for (int b = 0; b < 9; b++) { bw[b] = book_weight(b, focus); tot += bw[b]; }
     float r = (float)(rand() % 10000) / 10000.0f * tot;
-    int book = 7;
-    for (int b = 0; b < 8; b++) { r -= bw[b]; if (r <= 0) { book = b; break; } }
+    int book = 8;
+    for (int b = 0; b < 9; b++) { r -= bw[b]; if (r <= 0) { book = b; break; } }
 
     /* 在该册内按记忆度权重抽词（先数该册词数） */
     float wtot = 0;
@@ -356,6 +346,40 @@ static int pick_train_word(void)
         if (r2 <= 0) return i;
     }
     return rand() % WORD_POOL_SIZE;
+}
+
+/* 义项分隔符：ASCII 逗号/分号 + 全角"，；、"（UTF-8 各占 3 字节） */
+static int sep_len(const char *p)
+{
+    unsigned char c = (unsigned char)p[0];
+    if (c == ',' || c == ';') return 1;
+    if (c == 0xEF && (unsigned char)p[1] == 0xBC) {
+        if ((unsigned char)p[2] == 0x8C) return 3;   /* ， */
+        if ((unsigned char)p[2] == 0x9B) return 3;   /* ； */
+    }
+    if (c == 0xE3 && (unsigned char)p[1] == 0x80 && (unsigned char)p[2] == 0x81) return 3; /* 、 */
+    return 0;
+}
+
+/* 中文释义是否有交集：earth="地球，世界" 与 world="世界" 在孩子眼里是一个意思，
+   只做 strcmp 全等比较会漏掉，必须用义项级判断 */
+static int cn_overlap(const char *a, const char *b)
+{
+    char buf[32];
+    const char *p = a;
+    while (*p) {
+        const char *q = p;
+        while (*q && !sep_len(q)) q++;
+        size_t len = (size_t)(q - p);
+        if (len > 0 && len < sizeof(buf)) {
+            memcpy(buf, p, len);
+            buf[len] = 0;
+            if (strstr(b, buf)) return 1;
+        }
+        if (!*q) break;
+        p = q + sep_len(q);
+    }
+    return 0;
 }
 
 static void build_question(void)
@@ -378,12 +402,10 @@ static void build_question(void)
         float dd = (float)word_pool[idx].book - focus;
         if (dd < 0) dd = -dd;
         if (dd > 3.0f) continue;
-        /* 干扰项显示文本不能与正确答案相同（按当前题型的答案语言判重） */
-        if (s_qDir) {
-            if (strcmp(word_pool[idx].en, word_pool[s_qWord].en) == 0) continue;
-        } else {
-            if (strcmp(word_pool[idx].cn, word_pool[s_qWord].cn) == 0) continue;
-        }
+        /* 干扰项不能与正确答案同义：两种题型都要判 en 和 cn 义项，
+           否则题干"帽子"、选项 cap/hat 两个都对 */
+        if (strcmp(word_pool[idx].en, word_pool[s_qWord].en) == 0) continue;
+        if (cn_overlap(word_pool[idx].cn, word_pool[s_qWord].cn)) continue;
         s_qOpts[filled++] = idx;
     }
     while (filled < 4) {          /* 极端兜底：顺序补不重复的 */
@@ -692,7 +714,7 @@ void demo_pet_enter(void)
 
     /* 对象清零（防止上次退出残留） */
     s_scr = NULL; s_egg = NULL; s_gif = NULL;
-    s_topbar_bg = NULL; s_review_badge = NULL; s_atkbox = NULL; s_atk_num = NULL;
+    s_topbar_bg = NULL; s_atkbox = NULL; s_atk_num = NULL;
     s_night = NULL; s_zzz = NULL; s_flash = NULL;
     s_panel = NULL; s_p_word = NULL;
     for (int i = 0; i < 4; i++) s_menu_btns[i] = NULL;
@@ -774,7 +796,7 @@ void demo_pet_enter(void)
         int w = (i < 4) ? 220 : 154;      /* 返回行变窄 */
         lv_obj_t *row = lv_obj_create(s_panel);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(row, (240 - w) / 2, 64 + i * 48);
+        lv_obj_set_pos(row, (240 - w) / 2, 58 + i * 48);
         lv_obj_set_size(row, w, 42);
         lv_obj_set_style_bg_color(row, lv_color_hex(C_ROW), 0);
         lv_obj_set_style_border_width(row, 2, 0);
@@ -824,7 +846,7 @@ void demo_pet_exit(void)
     if (s_scr) lv_obj_delete(s_scr);
     s_scr = NULL;
     s_egg = NULL; s_gif = NULL;
-    s_topbar_bg = NULL; s_review_badge = NULL; s_atkbox = NULL; s_atk_num = NULL;
+    s_topbar_bg = NULL; s_atkbox = NULL; s_atk_num = NULL;
     s_night = NULL; s_zzz = NULL; s_flash = NULL;
     s_panel = NULL; s_p_word = NULL;
     for (int i = 0; i < 4; i++) s_menu_btns[i] = NULL;
