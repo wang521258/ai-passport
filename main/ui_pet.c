@@ -92,19 +92,25 @@ static void egg_paint(uint16_t *buf)
             float t = ((float)y - splitY) / ((float)H - splitY);
             rw = A * (1.0f - 0.10f * t * t) * sqrtf(fmaxf(0.0f, 1.0f - t * t));
         }
-        /* v12 封口：椭圆顶端/底端 t→1 时 rw→0 会开口，加最小宽度下限 */
-        rw = fmaxf(rw, (float)PX * 0.7f);
+        /* v14 封口：0.4 更细（0.7 时蛋尖像掉渣） */
+        rw = fmaxf(rw, (float)PX * 0.4f);
         rows_y[rc] = y; rows_w[rc] = (int)rw; rc++;
     }
 
     /* 3. 逐块填色 */
     for (int ri = 0; ri < rc; ri++) {
         int y = rows_y[ri], rw = rows_w[ri];
+        /* 先找本行蛋内首列/末列：黑边只描这两格，保证细（1格）且连续 */
+        int x0 = -1, x1 = -1;
         for (int x = 0; x < W; x += PX) {
+            float dd = fabsf((float)(x + PX / 2) - (float)cx);
+            if (dd <= (float)rw) { if (x0 < 0) x0 = x; x1 = x; }
+        }
+        if (x0 < 0) continue;
+        for (int x = x0; x <= x1; x += PX) {
             float d = fabsf((float)(x + PX / 2) - (float)cx);
-            if (d > rw) continue;
             uint16_t col = C_SHELL;
-            if (d > rw - PX * 1.1f) col = C_LINE;          /* 描边 */
+            if (x == x0 || x == x1) col = C_LINE;          /* 细边：只描最外一格 */
             else if (y > (int)(H * 0.72f) && d > rw * 0.55f) col = C_SHADE;
             for (int s = 0; s < (int)EGG_SPOT_N; s++) {
                 const egg_spot_t *sp = &EGG_SPOTS[s];
@@ -116,7 +122,7 @@ static void egg_paint(uint16_t *buf)
                     col = (y > (int)(H * 0.60f)) ? C_SPOT_D : C_SPOT_L;
                 }
             }
-            if ((x + PX / 2) < cx - 8 && y < (int)(H * 0.30f) && d < rw - PX * 2.5f) col = C_HILITE;
+            /* v14 A 方案：去掉左上斜高光（看起来像裂纹） */
             buf[y * W + x] = col;
             if (x + 1 < W) buf[y * W + x + 1] = col;
             if (y + 1 < H) buf[(y + 1) * W + x] = col;
@@ -153,11 +159,25 @@ typedef struct {
 
 static const int SHAKE_PAT[8] = { -5, -7, 5, 7, -3, 3, -1, 0 };
 
+/* 摇晃定时器句柄全局持有：蛋被销毁/重新摇晃时必须先停掉旧定时器，
+ * 否则回调里访问已删除的蛋对象 → use-after-free（重修后快速连点破壳
+ * 的偶发崩溃根因）。同一时刻只保留一个摇晃动画。 */
+static lv_timer_t *s_shake_t = NULL;
+static shake_ctx_t *s_shake_ctx = NULL;
+
+static void shake_stop(void)
+{
+    if (s_shake_t) { lv_timer_delete(s_shake_t); s_shake_t = NULL; }
+    if (s_shake_ctx) { free(s_shake_ctx); s_shake_ctx = NULL; }
+}
+
 static void shake_timer_cb(lv_timer_t *t)
 {
     shake_ctx_t *ctx = (shake_ctx_t *)lv_timer_get_user_data(t);
     if (!ctx || !ctx->obj) {
+        if (ctx) free(ctx);
         lv_timer_delete(t);
+        if (s_shake_t == t) s_shake_t = NULL;
         return;
     }
     int off = SHAKE_PAT[ctx->frame] * ctx->level;
@@ -167,6 +187,8 @@ static void shake_timer_cb(lv_timer_t *t)
         lv_obj_set_x(ctx->obj, ctx->base_x);
         lv_timer_delete(t);
         free(ctx);
+        if (s_shake_t == t) s_shake_t = NULL;
+        s_shake_ctx = NULL;
     }
 }
 
@@ -174,18 +196,21 @@ void ui_pixel_egg_shake(lv_obj_t *egg, int level)
 {
     if (!egg || level < 1) return;
     if (level > 3) level = 3;
+    shake_stop();                       /* 上一次摇晃没跑完也直接作废，绝不叠加 */
     shake_ctx_t *ctx = (shake_ctx_t *)malloc(sizeof(shake_ctx_t));
     if (!ctx) return;
     ctx->obj = egg;
     ctx->base_x = lv_obj_get_x(egg);
     ctx->level = level;
     ctx->frame = 0;
-    lv_timer_create(shake_timer_cb, 40, ctx);
+    s_shake_ctx = ctx;
+    s_shake_t = lv_timer_create(shake_timer_cb, 40, ctx);
 }
 
 void ui_pixel_egg_destroy(lv_obj_t *egg)
 {
     if (!egg) return;
+    shake_stop();                       /* 关键：先停摇晃定时器，防悬空指针回调 */
     void *p = lv_obj_get_user_data(egg);
     if (p) free(p);
     lv_obj_delete(egg);
