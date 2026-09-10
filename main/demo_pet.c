@@ -55,7 +55,9 @@ extern lv_font_t cn_16;
 #define EVO_KNOWN_2  915                /* stage1→2：学会 915 词（1152 词库等比自 650）*/
 
 #define C_BG       0xC8DFA0             /* 绿豆色（场景 + 面板） */
-#define C_BG565    0xC6F4               /* 同色的 RGB565 */
+/* 0xC8DFA0 的 RGB565 精确换算：R200>>3=25 G223>>2=55 B160>>3=20 → 0xCEF4。
+ * 之前误写 0xC6F4(R=24) 偏暗，宠物 canvas 背景块与场景绿豆色出现肉眼可见色差。 */
+#define C_BG565    0xCEF4               /* 同色的 RGB565 */
 #define C_ROW      0xEDF5DC             /* 选项行底 */
 #define C_ROWBRD   0xA5C97A             /* 选项行描边 */
 #define C_SELBRD   0x33691E             /* 选中描边 */
@@ -444,11 +446,20 @@ static void remove_wrong(int idx)
     }
 }
 
+static void pet_gif_hide(bool hide)
+{
+    if (s_gif) {
+        if (hide) lv_obj_add_flag(s_gif, LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_remove_flag(s_gif, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void start_train(void)
 {
     s_mode = MODE_TRAIN;
     s_opt = 0;
     build_question();
+    pet_gif_hide(true);                    /* 题板全屏，宠物别叠在选项上 */
     if (s_panel) lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     render_panel();
 }
@@ -458,6 +469,7 @@ static void start_review(void)
     s_mode = MODE_REVIEW;
     s_opt = 0;
     build_question();
+    pet_gif_hide(true);
     if (s_panel) lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     render_panel();
 }
@@ -465,6 +477,7 @@ static void exit_qa(void)
 {
     s_mode = MODE_HOME;
     if (s_panel) lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
+    pet_gif_hide(false);                   /* 回主页恢复宠物 */
     s_stat.energy = CLAMP((int)s_stat.energy - 4);
 }
 
@@ -536,6 +549,8 @@ static void try_evolve(void)
         gif_player_set_bob(s_gif, true);
         gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data,
                         pokemon_gifs[s_cur_poke_idx].len);
+        /* 训练/温习答题中触发的进化：题板全屏，新宠物画布保持隐藏 */
+        if (s_mode == MODE_TRAIN || s_mode == MODE_REVIEW) pet_gif_hide(true);
     }
 }
 
