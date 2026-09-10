@@ -40,8 +40,9 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
-# 训练面板中文选项/按钮：LVGL 内置 16px CJK 字库
-CONFIG_LV_FONT_SIMSUN_16_CJK=y
+# 中文不依赖 LVGL 内置字库：LVGL 9.5 已移除 SIMSUN，内置思源黑体子集又只含 1187 个
+# CJK 字符（本项目要 1142 汉字，缺 722 个）。改用 main/lv_font_cn_16.c（自生成子集，
+# 100% 覆盖，约 88KB），由 tools/gen_font.py 生成。
 # LVGL 内置 malloc 池大小(KB)。它是独立静态区、不与系统堆共享,配大了会白白占用 RAM。
 # 宠物页 65+ LVGL 对象 + canvas + 状态条 + 训练面板,24KB 装不下(s_namelabel 等返回 NULL
 # 导致后续 lv_label_set_text 写入 0x0 段错误)。提到 48KB 后动态堆从 81KB 降到约 57KB,
