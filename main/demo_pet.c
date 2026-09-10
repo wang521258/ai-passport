@@ -58,8 +58,9 @@ extern lv_font_t cn_16;
 /* 0xC8DFA0 的 RGB565 精确换算：R200>>3=25 G223>>2=55 B160>>3=20 → 0xCEF4。
  * 之前误写 0xC6F4(R=24) 偏暗，宠物 canvas 背景块与场景绿豆色出现肉眼可见色差。 */
 #define C_BG565    0xCEF4               /* 同色的 RGB565 */
-#define C_ROW      0xEDF5DC             /* 选项行底 */
-#define C_ROWBRD   0xA5C97A             /* 选项行描边 */
+#define C_ROW      0x3A5A2C             /* 选项行底：深绿（深底亮字，字显实） */
+#define C_ROWTXT   0xEDF5DC             /* 选项行文字：亮米绿 */
+#define C_ROWBRD   0x6B8E4E             /* 选项行描边 */
 #define C_SELBRD   0x33691E             /* 选中描边 */
 /* 面板文字：浅绿行底(#EDF5DC)上原来用 #1B3A0F 偏灰绿，对比仅约 4.5:1，
  * 16px 小字的笔画被亮底吃掉、看着发虚。改纯黑后对比拉满，字更实。 */
@@ -212,25 +213,25 @@ static void build_topbar(void)
     lv_obj_set_pos(s_atk_num, 20, 6);
 }
 
-/* 闪烁定时器：按钮配色 / 告警 / 角标 / 攻数值 集中刷新 */
+/* 顶栏刷新定时器：当前菜单黄高亮 + 告警**常红不闪**（闪太快反而看不清）。
+ * 告警规则（2026-09-10 王总定的）：温习（有错题）优先红；
+ * 饥饿<30 才提示训练；睡觉永不告警——睡不睡玩家自己按。 */
 static void blink_timer_cb(lv_timer_t *t)
 {
     (void)t;
-    static bool on = false;
-    on = !on;
 
     if (s_mode != MODE_HOME) {
         for (int i = 0; i < 4; i++) {
             lv_obj_set_style_bg_color(s_menu_btns[i], lv_color_hex(0x37474F), 0);
             lv_obj_set_style_border_color(s_menu_btns[i], lv_color_hex(0x546E7A), 0);
+            lv_obj_set_style_text_color(s_menu_btns[i], lv_color_hex(0xECEFF1), 0);
         }
         return;
     }
 
     int warn_idx = -1;
-    if      (s_stat.hunger < 30)  warn_idx = MENU_TRAIN;
-    else if (s_stat.energy < 30)  warn_idx = MENU_SLEEP;
-    else if (s_wrong_n > 0)       warn_idx = MENU_REVIEW;
+    if      (s_wrong_n > 0)       warn_idx = MENU_REVIEW;   /* 温习优先 */
+    else if (s_stat.hunger < 30)  warn_idx = MENU_TRAIN;
 
     for (int i = 0; i < 4; i++) {
         lv_obj_set_style_bg_color(s_menu_btns[i], lv_color_hex(0x37474F), 0);
@@ -242,30 +243,21 @@ static void blink_timer_cb(lv_timer_t *t)
     lv_obj_set_style_text_color(s_menu_btns[s_menu], lv_color_hex(0x17202A), 0);
 
     if (warn_idx >= 0 && warn_idx != (int)s_menu) {
-        if (on) {
-            lv_obj_set_style_bg_color(s_menu_btns[warn_idx], lv_color_hex(0xE53935), 0);
-            lv_obj_set_style_border_color(s_menu_btns[warn_idx], lv_color_hex(0xB71C1C), 0);
-            lv_obj_set_style_text_color(s_menu_btns[warn_idx], lv_color_hex(0xFFFFFF), 0);
-        } else {
-            lv_obj_set_style_bg_color(s_menu_btns[warn_idx], lv_color_hex(0x8E0000), 0);
-            lv_obj_set_style_border_color(s_menu_btns[warn_idx], lv_color_hex(0x8E0000), 0);
-            lv_obj_set_style_text_color(s_menu_btns[warn_idx], lv_color_hex(0xFFB0B0), 0);
-        }
+        lv_obj_set_style_bg_color(s_menu_btns[warn_idx], lv_color_hex(0xE53935), 0);
+        lv_obj_set_style_border_color(s_menu_btns[warn_idx], lv_color_hex(0xB71C1C), 0);
+        lv_obj_set_style_text_color(s_menu_btns[warn_idx], lv_color_hex(0xFFFFFF), 0);
     }
 
-    /* 有词待温习时由 blink 定时器把"温习"按钮整体闪红，不再显示数量 */
-
-    /* 攻数值 + 掉词告警闪红 */
+    /* 攻数值；掉词时攻框**常红**数秒（不闪烁） */
     if (s_atk_num) lv_label_set_text_fmt(s_atk_num, "%d", known_count());
     if (s_atkbox) {
         if (s_atk_alert_blinks > 0) {
             s_atk_alert_blinks--;
-            lv_obj_set_style_bg_color(s_atkbox, lv_color_hex(on ? 0xB71C1C : 0x17202A), 0);
-            lv_obj_set_style_bg_opa(s_atkbox, LV_OPA_90, 0);
+            lv_obj_set_style_bg_color(s_atkbox, lv_color_hex(0xB71C1C), 0);
         } else {
             lv_obj_set_style_bg_color(s_atkbox, lv_color_hex(0x17202A), 0);
-            lv_obj_set_style_bg_opa(s_atkbox, LV_OPA_90, 0);
         }
+        lv_obj_set_style_bg_opa(s_atkbox, LV_OPA_90, 0);
     }
 }
 
@@ -295,14 +287,18 @@ static void render_panel(void)
         lv_label_set_text(s_p_txt[i], text);
 
         if (i == (int)s_opt) {
+            /* 选中：黄底深字，最醒目 */
             lv_obj_set_style_border_color(s_p_opts[i], lv_color_hex(C_SELBRD), 0);
             lv_obj_set_style_border_width(s_p_opts[i], 3, 0);
-            lv_obj_set_style_bg_color(s_p_opts[i], lv_color_hex(0xFFFFFF), 0);
+            lv_obj_set_style_bg_color(s_p_opts[i], lv_color_hex(0xFFD928), 0);
+            lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(0x1B3A0F), 0);
             lv_obj_set_style_opa(s_p_cursor[i], LV_OPA_COVER, 0);
         } else {
+            /* 未选中：深绿底 + 亮字（学顶栏"攻"的深底亮字，笔画显实不发虚） */
             lv_obj_set_style_border_color(s_p_opts[i], lv_color_hex(C_ROWBRD), 0);
             lv_obj_set_style_border_width(s_p_opts[i], 2, 0);
             lv_obj_set_style_bg_color(s_p_opts[i], lv_color_hex(C_ROW), 0);
+            lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(C_ROWTXT), 0);
             lv_obj_set_style_opa(s_p_cursor[i], LV_OPA_TRANSP, 0);
         }
     }
@@ -543,7 +539,11 @@ static void try_evolve(void)
 
     if (s_gif) {
         gif_player_stop(s_gif);
-        lv_obj_delete(s_gif);
+        /* 千万别在这里 lv_obj_delete(s_gif)！播放器是全局单例，内部 p->canvas
+         * 仍指着这个对象；下次 gif_player_create 复用单例时会对已删对象再删一次
+         * → use-after-free（重修后再孵蛋必崩的根因）。只隐藏，旧画布由
+         * gif_player_create 复用路径安全删除。 */
+        lv_obj_add_flag(s_gif, LV_OBJ_FLAG_HIDDEN);
         s_gif = NULL;
     }
     s_gif = gif_player_create(s_scr, PET_X, PET_Y, PET_SIZE, PET_SIZE);
@@ -580,7 +580,9 @@ static void reset_egg(void)
 {
     if (s_gif) {
         gif_player_stop(s_gif);
-        lv_obj_delete(s_gif);
+        /* 只隐藏不删除，原因同 try_evolve：单例 p->canvas 悬空会导致
+         * 重修后再孵蛋时 use-after-free 崩溃 */
+        lv_obj_add_flag(s_gif, LV_OBJ_FLAG_HIDDEN);
         s_gif = NULL;
     }
     if (s_egg) {
@@ -596,7 +598,9 @@ static void reset_egg(void)
     s_opt = 0;
     s_tick_div = 0;
     if (s_night) lv_obj_add_flag(s_night, LV_OBJ_FLAG_HIDDEN);
+    if (s_panel) lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     if (s_topbar_bg) lv_obj_add_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
+    pet_gif_hide(false);
     s_egg = ui_pixel_egg_create(s_scr, EGG_X, EGG_Y);
 }
 
