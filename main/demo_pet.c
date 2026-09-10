@@ -61,7 +61,9 @@ extern lv_font_t cn_16;
 #define C_ROW      0xEDF5DC             /* 选项行底 */
 #define C_ROWBRD   0xA5C97A             /* 选项行描边 */
 #define C_SELBRD   0x33691E             /* 选中描边 */
-#define C_INK      0x1B3A0F             /* 面板文字 */
+/* 面板文字：浅绿行底(#EDF5DC)上原来用 #1B3A0F 偏灰绿，对比仅约 4.5:1，
+ * 16px 小字的笔画被亮底吃掉、看着发虚。改纯黑后对比拉满，字更实。 */
+#define C_INK      0x000000             /* 面板文字 */
 #define C_ATK      0xFFB74D             /* 攻图标色 */
 #define C_ATKNUM   0xFFCC80             /* 攻数字色 */
 
