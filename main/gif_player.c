@@ -11,15 +11,13 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include <string.h>
+#include <limits.h>
 
 static const char *GP = "GIFP";
 #define GIF_LOG(fmt, ...) ESP_LOGI(GP, fmt, ##__VA_ARGS__)
 
 /* gif.inl 的函数由 components/AnimatedGIF/src/gif_impl.c 编译为独立目标文件 */
 /* gif_player.c 只需包含 AnimatedGIF.h 获取函数声明 */
-
-#define MAX_GIF_W 96
-#define MAX_GIF_H 96
 
 /* canvas 背景色（与屏幕纸色一致，RGB565） */
 /* UI_PAPER=0xF4F4EA → RGB565: R5=30 G6=61 B5=29 = 0xF7DD */
@@ -46,6 +44,22 @@ typedef struct {
     lv_timer_t *timer;
     bool playing;
     bool opened;         /* GIF_openRAM 是否成功过,GIF_close 前必查 */
+
+    /* --- 等比缩放参数(居中对齐,防止非正方形 GIF 被拉成正方形) --- */
+    int sc_w, sc_h;      /* GIF 等比缩放后的像素尺寸 */
+    int off_x, off_y;    /* 在 canvas 内的居中偏移 */
+
+    /* --- 帧处置(disposal)跟踪 ---
+     * 库在 RAW(GIF_DRAW_RAW) 模式下不替我们做处置,必须自己做。
+     * 实测 42 只宠物共 1212 帧里 1110 帧(91.6%) 处置方法=2
+     * (dispose to background),即画下一帧前必须把本帧矩形擦回背景。 */
+    bool    prev_valid;  /* 上一帧是否留下了有效矩形 */
+    uint8_t prev_disp;   /* 上一帧的处置方法 */
+    int     prev_x0, prev_y0, prev_x1, prev_y1;  /* 上一帧矩形(canvas 坐标) */
+    int     cur_x0,  cur_y0,  cur_x1,  cur_y1;   /* 本帧矩形(canvas 坐标) */
+    uint8_t cur_disp;    /* 本帧的处置方法 */
+    bool    cur_dirty;   /* 本帧回调是否真的输出过像素 */
+    bool    wrap_pending;/* 末帧已展示满一个周期,下一 tick 才回绕 */
 } gif_player_t;
 
 /* 场景背景取色回调：由 demo_pet 注册，用于消除 canvas 白底方块 */
@@ -84,69 +98,109 @@ static void fill_background(gif_player_t *p)
     }
 }
 
+/* 把 canvas 上的一块矩形擦回场景背景色（= 场景背景取色，无回调时用纸色）。
+ * 用途：GIF 处置方法 2（dispose to background）—— 上一帧的墨迹必须在画新帧前清掉。 */
+static void clear_rect(gif_player_t *p, int x0, int y0, int x1, int y1)
+{
+    if (x0 < 0)      x0 = 0;
+    if (y0 < 0)      y0 = 0;
+    if (x1 > p->cw)  x1 = p->cw;
+    if (y1 > p->ch)  y1 = p->ch;
+    if (x1 <= x0 || y1 <= y0) return;
+    for (int r = y0; r < y1; r++) {
+        uint16_t *row = &p->buf[r * p->cw];
+        int sy = p->oy + r;
+        if (s_bg_fn) {
+            for (int c = x0; c < x1; c++) row[c] = s_bg_fn(p->ox + c, sy);
+        } else {
+            for (int c = x0; c < x1; c++) row[c] = BG_RGB565;
+        }
+    }
+}
+
+/* 记录本帧矩形作为"上一帧"，供下一次解码前处置 */
+static void commit_frame(gif_player_t *p)
+{
+    if (!p->cur_dirty) return;
+    p->prev_x0 = p->cur_x0; p->prev_y0 = p->cur_y0;
+    p->prev_x1 = p->cur_x1; p->prev_y1 = p->cur_y1;
+    p->prev_disp = p->cur_disp;
+    p->prev_valid = true;
+}
+
 /* 当前播放中的播放器（供 draw callback 访问） */
 static gif_player_t *s_cur = NULL;
 
-/* GIF draw callback：把解码行写入 canvas buffer */
+/* GIF draw callback：把解码行按等比缩放写入 canvas buffer */
 static void gif_draw_cb(GIFDRAW *pDraw)
 {
-    if (!s_cur || !s_cur->buf) return;
-    int cw = s_cur->cw;
-    int ch = s_cur->ch;
-    int gw = s_cur->gw;
-    int gh = s_cur->gh;
+    gif_player_t *p = s_cur;
+    if (!p || !p->buf) return;
+    int cw = p->cw, ch = p->ch;
+    int gw = p->gw, gh = p->gh;
+    if (gw <= 0 || gh <= 0) return;
     uint16_t *pal = pDraw->pPalette;
-    uint8_t *s = pDraw->pPixels;
-    int x0 = pDraw->iX;
+    uint8_t  *src = pDraw->pPixels;
     int w = pDraw->iWidth;
 
-    /* GIF 原始 y → canvas y（最近邻放大，区间填充）
+    /* --- 记录本帧矩形(canvas 坐标)：disposal=2 要按此区域清背景。
+     *     用帧矩形 iX/iY/iWidth/iHeight —— 这是 GIF 规范里处置的作用域。 --- */
+    {
+        int oyf = p->off_y + p->bob;
+        int fx0 = p->off_x + pDraw->iX * p->sc_w / gw;
+        int fx1 = p->off_x + (pDraw->iX + pDraw->iWidth)  * p->sc_w / gw;
+        int fy0 = oyf      + pDraw->iY * p->sc_h / gh;
+        int fy1 = oyf      + (pDraw->iY + pDraw->iHeight) * p->sc_h / gh;
+        if (fx1 <= fx0) fx1 = fx0 + 1;
+        if (fy1 <= fy0) fy1 = fy0 + 1;
+        p->cur_x0 = fx0; p->cur_y0 = fy0;
+        p->cur_x1 = fx1; p->cur_y1 = fy1;
+        p->cur_disp = pDraw->ucDisposalMethod;
+        p->cur_dirty = true;
+    }
+
+    /* GIF 原始 y → canvas y（等比缩放 + 居中 + 最近邻放大，区间整块填充）
      *
-     * 注意：GIF 只有 37x38，canvas 是 64x64。若按单点映射（cy = gy*ch/gh），
-     * 64 行里只有 38 行会被写到，剩下 26 行留背景色 → 满屏横向条纹；
-     * 列方向同理会有竖向空隙。所以这里按 [cy0, cy1) / [cx0, cx1) 区间整块
-     * 填充，放大后是干净的色块，不会出现斑马纹。 */
+     * 注意：若按单点映射（cy = gy*sc_h/gh），放大后会有空行 → 满屏横向条纹；
+     * 列方向同理。所以按 [cy0, cy1) / [cx0, cx1) 区间填充，放大后是干净色块。 */
     int gy = pDraw->iY + pDraw->y;
-    if (gy < 0 || gy >= gh) return;
-    int cy0 = (gh > 0 && ch > 0) ? (gy * ch / gh) : gy;
-    int cy1 = (gh > 0 && ch > 0) ? ((gy + 1) * ch / gh) : (gy + 1);
+    int oy = p->off_y + p->bob;         /* 待机上下浮动：只偏移宠物本体 */
+    int cy0 = oy + gy * p->sc_h / gh;
+    int cy1 = oy + (gy + 1) * p->sc_h / gh;
     if (cy1 <= cy0) cy1 = cy0 + 1;
-    /* 待机上下浮动：只偏移宠物本体，背景已在 fill_background 里画好不动 */
-    cy0 += s_cur->bob;
-    cy1 += s_cur->bob;
-    if (cy1 <= 0 || cy0 >= ch) return;      /* 整行被浮出画布 */
+    if (cy1 <= 0 || cy0 >= ch) return;  /* 整行被浮出画布 */
     if (cy0 < 0)  cy0 = 0;
     if (cy1 > ch) cy1 = ch;
 
+    int x0 = pDraw->iX;
     if (pDraw->ucHasTransparency) {
         uint8_t trans = pDraw->ucTransparent;
         for (int x = 0; x < w; x++) {
-            uint8_t c = s[x];
-            if (c != trans) {
-                int gx = x0 + x;
-                int cx0 = (gw > 0 && cw > 0) ? (gx * cw / gw) : gx;
-                int cx1 = (gw > 0 && cw > 0) ? ((gx + 1) * cw / gw) : (gx + 1);
-                if (cx1 <= cx0) cx1 = cx0 + 1;
-                if (cx0 < 0)  cx0 = 0;
-                if (cx1 > cw) cx1 = cw;
-                uint16_t v = pal[c];
-                for (int cy = cy0; cy < cy1; cy++) {
-                    uint16_t *row = &s_cur->buf[cy * cw];
-                    for (int cx = cx0; cx < cx1; cx++) row[cx] = v;
-                }
+            uint8_t c = src[x];
+            if (c == trans) continue;           /* 透明像素：保留背景/历史帧 */
+            int gx = x0 + x;
+            int cx0 = p->off_x + gx * p->sc_w / gw;
+            int cx1 = p->off_x + (gx + 1) * p->sc_w / gw;
+            if (cx1 <= cx0) cx1 = cx0 + 1;
+            if (cx0 < 0)  cx0 = 0;
+            if (cx1 > cw) cx1 = cw;
+            uint16_t v = pal[c];
+            for (int cy = cy0; cy < cy1; cy++) {
+                uint16_t *row = &p->buf[cy * cw];
+                for (int cx = cx0; cx < cx1; cx++) row[cx] = v;
             }
         }
     } else {
         for (int x = 0; x < w; x++) {
             int gx = x0 + x;
-            int cx0 = (gw > 0 && cw > 0) ? (gx * cw / gw) : gx;
-            int cx1 = (gw > 0 && cw > 0) ? ((gx + 1) * cw / gw) : (gx + 1);
+            int cx0 = p->off_x + gx * p->sc_w / gw;
+            int cx1 = p->off_x + (gx + 1) * p->sc_w / gw;
             if (cx1 <= cx0) cx1 = cx0 + 1;
             if (cx0 < 0)  cx0 = 0;
             if (cx1 > cw) cx1 = cw;
-            uint16_t v = pal[s[x]];
+            uint16_t v = pal[src[x]];
             for (int cy = cy0; cy < cy1; cy++) {
-                uint16_t *row = &s_cur->buf[cy * cw];
+                uint16_t *row = &p->buf[cy * cw];
                 for (int cx = cx0; cx < cx1; cx++) row[cx] = v;
             }
         }
@@ -158,28 +212,47 @@ static void frame_timer_cb(lv_timer_t *t)
     gif_player_t *p = lv_timer_get_user_data(t);
     if (!p || !p->playing || !p->buf || !p->opened) return;
     int delay = 0;
-    /* 注意：不要每帧重铺背景！宝可梦 GIF 大量帧是增量帧（只编码变化区域），
-     * 铺底会把上一帧该保留的内容擦掉 → 画面残缺、整块闪烁。
-     * 背景只在首次播放和循环回绕时铺一次，透明像素自然透出历史帧。 */
+
+    if (p->wrap_pending) {
+        /* 上一 tick 画的是**末帧** —— 现在才回绕，保证末帧也展示满一个周期。
+         * (库把"最后一帧"也返回 0，若见 0 就立刻 reset，末帧会被瞬间跳过) */
+        p->wrap_pending = false;
+        GIF_reset(&p->gif);
+        p->prev_valid = false;
+        fill_background(p);
+    } else if (p->prev_valid && p->prev_disp == 2) {
+        /* 处置方法 2(dispose to background)：画新帧前把上一帧矩形擦回场景背景。
+         * 宝可梦 GIF 里 91.6% 的帧都是这种 —— 不擦就是重影。 */
+        clear_rect(p, p->prev_x0, p->prev_y0, p->prev_x1, p->prev_y1);
+    }
+    p->prev_valid = false;
+    p->cur_dirty  = false;
+
     p->frame_no++;
+    p->bob = p->bob_on ? BOB_TABLE[p->frame_no & 7] : 0;
+
     s_cur = p;
     int res = GIF_playFrame(&p->gif, &delay, NULL);
     s_cur = NULL;
-    if (res < 0) {
-        /* 解码出错：停掉动画，保留最后一帧画面，别让设备重启 */
-        GIF_LOG("playFrame err=%d, stop anim", GIF_getLastError(&p->gif));
-        p->playing = false;
-        lv_timer_pause(t);
-        return;
+
+    if (!p->cur_dirty) {
+        /* 本帧没有任何像素输出：多半是解码/解析出错，停掉动画保留最后一帧 */
+        int e = GIF_getLastError(&p->gif);
+        if (e != GIF_SUCCESS) {
+            GIF_LOG("playFrame err=%d, stop anim", e);
+            p->playing = false;
+            lv_timer_pause(t);
+            return;
+        }
+    } else {
+        commit_frame(p);
     }
+
     if (res == 0) {
-        /* 播完一遍，从头循环 */
-        GIF_reset(&p->gif);
-        fill_background(p);
-        s_cur = p;
-        GIF_playFrame(&p->gif, &delay, NULL);
-        s_cur = NULL;
+        /* 末帧：本 tick 只登记"待回绕"，下一 tick 才 reset */
+        p->wrap_pending = true;
     }
+
     /* 放慢播放：原始帧延迟 × GIF_SLOWDOWN，并给下限 */
     delay *= GIF_SLOWDOWN;
     if (delay < GIF_MIN_DELAY) delay = GIF_MIN_DELAY;
@@ -223,6 +296,10 @@ lv_obj_t *gif_player_create(lv_obj_t *parent, int x, int y, int w, int h)
     p->bob = 0;
     p->frame_no = 0;
     p->bob_on = true;
+    p->prev_valid = false;
+    p->cur_dirty  = false;
+    p->cur_disp   = 0;
+    p->wrap_pending = false;
     p->buf = calloc((size_t)w * (size_t)h, sizeof(uint16_t));
     GIF_LOG("calloc canvas buf(%dB) -> %p, free=%d",
              (int)((size_t)w * (size_t)h * 2), p->buf, (int)esp_get_free_heap_size());
@@ -302,11 +379,41 @@ int gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
     p->gw = GIF_getCanvasWidth(&p->gif);
     p->gh = GIF_getCanvasHeight(&p->gif);
 
+    /* 等比缩放：防止非正方形 GIF 被拉成正方形（动作会明显失真）。
+     * 取宽/高比例中较小者，整数化后居中放置，多余区域露出场景背景。 */
+    {
+        int gw = p->gw, gh = p->gh;
+        int s = 1000;
+        if (gw > 0 && gh > 0) {
+            int sx = p->cw * 1000 / gw;
+            int sy = p->ch * 1000 / gh;
+            s = (sx < sy) ? sx : sy;
+        }
+        if (s <= 0) s = 1000;
+        p->sc_w = gw * s / 1000;
+        p->sc_h = gh * s / 1000;
+        if (p->sc_w < 1) p->sc_w = 1;
+        if (p->sc_h < 1) p->sc_h = 1;
+        if (p->sc_w > p->cw) p->sc_w = p->cw;
+        if (p->sc_h > p->ch) p->sc_h = p->ch;
+        p->off_x = (p->cw - p->sc_w) / 2;
+        p->off_y = (p->ch - p->sc_h) / 2;
+        GIF_LOG("fit %dx%d -> %dx%d @(%d,%d) in %dx%d",
+                gw, gh, p->sc_w, p->sc_h, p->off_x, p->off_y, p->cw, p->ch);
+    }
+
+    /* 处置跟踪复位 */
+    p->prev_valid   = false;
+    p->cur_dirty    = false;
+    p->cur_disp     = 0;
+    p->wrap_pending = false;
+
     /* 解第一帧：能跑到这里就说明解码器可用 */
     int delay = 0;
     fill_background(p);
     p->bob = p->bob_on ? BOB_TABLE[p->frame_no & 7] : 0;
     p->frame_no++;
+    p->cur_dirty = false;
     s_cur = p;
     int rc = GIF_playFrame(&p->gif, &delay, NULL);
     s_cur = NULL;
@@ -316,6 +423,8 @@ int gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
         /* 解码失败：保留白底但不启动定时器，至少不崩 */
         return 0;
     }
+    commit_frame(p);            /* 首帧登记为"上一帧"，第二帧前才会被处置 */
+    if (rc == 0) p->wrap_pending = true;
     delay *= GIF_SLOWDOWN;
     if (delay < GIF_MIN_DELAY) delay = GIF_MIN_DELAY;
 
