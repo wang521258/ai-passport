@@ -9,7 +9,6 @@
 #include "bsp_pins.h"
 #include "bsp_xio.h"
 #include "driver/gpio.h"
-#include "esp_timer.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -40,7 +39,7 @@ static bool read_boot(void) { return (bool)gpio_get_level(BSP_BTN_BOOT_GPIO); }
 static bool read_k1(void)   { return bsp_xio_get_key(BSP_BTN_K1_XIO); }
 static bool read_k2(void)   { return bsp_xio_get_key(BSP_BTN_K2_XIO); }
 
-static inline uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000ULL); }
+static inline uint32_t now_ms(void) { return (uint32_t)xTaskGetTickCount() * portTICK_PERIOD_MS; }
 
 static void btn_tick(btn_state_t *b) {
     bool level = b->read();

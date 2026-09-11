@@ -7,6 +7,7 @@
 #include "bsp_i2c.h"
 #include "bsp_display.h"
 #include "bsp_button.h"
+#include "bsp_xio.h"       // AW9523 背光/电源/按键扩展 IO
 #include "bsp_audio.h"
 #include "bsp_battery.h"
 #include "bsp_pins.h"      // 错误日志里要打印 BSP_LCD_* 引脚号
