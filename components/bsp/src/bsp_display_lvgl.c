@@ -33,8 +33,11 @@ lv_display_t *bsp_lvgl_init(void) {
         // 所以这里 rotation 全关、分辨率直接给竖屏值,两层不要重复旋转。
         .hres = BSP_LCD_W, .vres = BSP_LCD_H,
         .rotation = { .swap_xy = false, .mirror_x = false, .mirror_y = false },
-        // 8080 并口按 16bit 走,不需要 SPI 那种高低字节交换(官方 swap_color_bytes=0)。
-        .flags = { .buff_spiram = true, .swap_bytes = false },
+        // 【必开 swap_bytes】LVGL 按小端 RGB565 出图,而 ST7789 在 8080 并口下
+        // 期望"高字节在前"。小智官方对【同一块板、同一个 i80 接口】就是
+        // swap_bytes=1(其 io 层 swap_color_bytes=0)。
+        // v8 误设为 0 → 红绿字节错位 → 画面颜色整体错乱(表现为"画面很差")。
+        .flags = { .buff_spiram = true, .swap_bytes = true },
     };
     s_disp = lvgl_port_add_disp(&dc);
     if (!s_disp) { ESP_LOGE(TAG, "lvgl_port_add_disp 失败"); return NULL; }

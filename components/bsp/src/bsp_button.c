@@ -143,7 +143,7 @@ esp_err_t bsp_button_init(bsp_btn_cb_t cb, void *user) {
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "按键就绪:BOOT(OK) + XL9555 P1_7(UP) + P1_6(DOWN)");
+    ESP_LOGI(TAG, "按键就绪:BOOT(GPIO0)→OK + XL9555 P0_4→UP + P0_3→DOWN");
     return ESP_OK;
 }
 
