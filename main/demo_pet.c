@@ -22,6 +22,7 @@
 #include "ui_pixel.h"
 #include "ui_pet.h"
 #include "gif_player.h"
+#include "ui_sound.h"
 #include "pokemon_sprites.h"
 #include "word_pool.h"
 #include "lvgl.h"
@@ -32,10 +33,11 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* 中文字库：由 tools/gen_font.py 从系统字体子集化生成（1142 汉字 + ASCII，约 88KB）。
-   LVGL 9.5 已移除 lv_font_simsun_16_cjk，内置的思源黑体子集又只含 1187 个 CJK 字符
-   （本项目要 1142 汉字，实测缺 722 个），所以自己生成一份 100% 覆盖的。 */
-extern lv_font_t cn_16;
+/* 中文字库：由 gen_cn_font.py 生成（微软雅黑粗体 18px 子集，1334 字，约 1.1MB）。
+   选它是因为实测笔画覆盖率 44.6%，明显粗于黑体(29.0%)/等线粗体(33.7%)。
+   改字号/换字体只需重跑 gen_cn_font.py，并同步这里的符号名。 */
+extern lv_font_t cn_18;
+#define CN_FONT (&cn_18)
 
 #define TAG "PET"
 #define LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
@@ -180,7 +182,7 @@ static void build_topbar(void)
 
         lv_obj_t *lb = lv_label_create(b);
         lv_label_set_text(lb, LBL[i]);
-        lv_obj_set_style_text_font(lb, &cn_16, 0);
+        lv_obj_set_style_text_font(lb, CN_FONT, 0);
         lv_obj_set_style_text_color(lb, lv_color_hex(0xECEFF1), 0);
         lv_obj_center(lb);
         s_menu_btns[i] = b;
@@ -202,9 +204,10 @@ static void build_topbar(void)
 
     lv_obj_t *ic = lv_label_create(s_atkbox);
     lv_label_set_text(ic, "攻");
-    lv_obj_set_style_text_font(ic, &cn_16, 0);
+    lv_obj_set_style_text_font(ic, CN_FONT, 0);
     lv_obj_set_style_text_color(ic, lv_color_hex(C_ATK), 0);
-    lv_obj_set_pos(ic, 2, 4);
+    /* 18px 字行高约 22~24px,框高 26 → y 取 1 才不会把底部笔画切掉 */
+    lv_obj_set_pos(ic, 2, 1);
 
     s_atk_num = lv_label_create(s_atkbox);
     lv_label_set_text(s_atk_num, "0");
@@ -269,7 +272,7 @@ static void render_panel(void)
     /* 题干：e2c 显英文 / c2e 显中文；音标不显示（Montserrat 无 IPA 字形会出方块） */
     lv_label_set_text(s_p_word, s_qDir ? word_pool[s_qWord].cn : word_pool[s_qWord].en);
     lv_obj_set_style_text_font(s_p_word,
-        s_qDir ? &cn_16 : &lv_font_montserrat_20, 0);
+        s_qDir ? CN_FONT : &lv_font_montserrat_20, 0);
     /* 中文题干最长 11 字（"舞者，舞蹈演员，舞蹈家"），16px CJK 在 240 宽内可一行放下 */
     lv_label_set_long_mode(s_p_word, LV_LABEL_LONG_WRAP);  /* 极端情况下允许换行 */
     lv_obj_set_height(s_p_word, 32);                       /* 压缩题区给选项让位 */
@@ -279,10 +282,10 @@ static void render_panel(void)
         if (i < 4) {
             text = s_qDir ? word_pool[s_qOpts[i]].en : word_pool[s_qOpts[i]].cn;
             lv_obj_set_style_text_font(s_p_txt[i],
-                s_qDir ? &lv_font_montserrat_20 : &cn_16, 0);
+                s_qDir ? &lv_font_montserrat_20 : CN_FONT, 0);
         } else {
             text = (s_mode == MODE_REVIEW) ? "结束温习，返回" : "结束训练，返回";
-            lv_obj_set_style_text_font(s_p_txt[i], &cn_16, 0);
+            lv_obj_set_style_text_font(s_p_txt[i], CN_FONT, 0);
         }
         lv_label_set_text(s_p_txt[i], text);
 
@@ -482,6 +485,7 @@ static void exit_qa(void)
 static void answer(int option)
 {
     bool right = (option == s_qCorrect);
+    ui_sound_play(right ? UI_SND_CORRECT : UI_SND_WRONG);   /* 答对/答错提示音 */
     if (right) {
         s_mem[s_qWord] = MEM_FULL;            /* 学会 / 记忆刷新到满分 */
         if (s_mode == MODE_REVIEW) remove_wrong(s_qWord);
@@ -880,6 +884,7 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
     /* 睡觉锁键：只有 OK 能唤醒，其余键全吞（黑幕动画中也吞） */
     if (s_sleeping) {
         if (ev == BSP_BTN_CLICK && btn == BSP_BTN_OK && s_curtain_t == NULL) {
+            ui_sound_play(UI_SND_SWITCH);
             start_wake();
         }
         return;
@@ -890,13 +895,15 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
         if (ev == BSP_BTN_CLICK) {
             if (btn == BSP_BTN_UP) {
                 s_opt = (s_opt + 4) % 5;
+                ui_sound_play(UI_SND_SWITCH);
                 render_panel();
             } else if (btn == BSP_BTN_DOWN) {
                 s_opt = (s_opt + 1) % 5;
+                ui_sound_play(UI_SND_SWITCH);
                 render_panel();
             } else if (btn == BSP_BTN_OK) {
-                if (s_opt == 4) exit_qa();
-                else            answer(s_opt);
+                if (s_opt == 4) { ui_sound_play(UI_SND_SWITCH); exit_qa(); }
+                else            answer(s_opt);          /* 判题音在 answer() 里出 */
             }
         }
         return;
@@ -905,6 +912,7 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
     /* 蛋状态：只响应 OK */
     if (s_mode == MODE_EGG) {
         if (ev == BSP_BTN_CLICK && btn == BSP_BTN_OK) {
+            ui_sound_play(UI_SND_SWITCH);
             s_hatch_clicks++;
             if (s_egg) ui_pixel_egg_shake(s_egg, s_hatch_clicks <= 3 ? s_hatch_clicks : 3);
             if (s_hatch_clicks >= 3) {
@@ -919,11 +927,14 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
     if (ev == BSP_BTN_CLICK) {
         if (btn == BSP_BTN_UP) {
             s_menu = (s_menu + 3) % 4;
+            ui_sound_play(UI_SND_SWITCH);
             blink_timer_cb(NULL);
         } else if (btn == BSP_BTN_DOWN) {
             s_menu = (s_menu + 1) % 4;
+            ui_sound_play(UI_SND_SWITCH);
             blink_timer_cb(NULL);
         } else if (btn == BSP_BTN_OK) {
+            ui_sound_play(UI_SND_SWITCH);
             switch ((int)s_menu) {
                 case MENU_TRAIN:  start_train(); break;
                 case MENU_SLEEP:  start_sleep(); break;

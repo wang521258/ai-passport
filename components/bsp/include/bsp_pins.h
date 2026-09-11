@@ -76,11 +76,13 @@
 #define BSP_I2C_CW2017_ADDR  0x63           // 本板无独立电量计,init 失败无害
 
 // ============================================================================
-// 音频:I2S → NS4168(纯 I2S DAC,无 I2C 控制口)。本版【暂未适配】,
-//   bsp_audio_init() 直接返回 NOT_SUPPORTED,避免误占引脚。
-//   (引脚按官方 config.h 预留:MCLK 不用 / BCLK21 / WS13 / DOUT14 / DIN47)
+// 音频:I2S → NS4168(纯 I2S DAC + 功放,无 I2C 控制口)。
+//   引脚与格式取自官方板级:BCLK21 / WS13 / DOUT14 / DIN47、16bit、双声道槽。
+//   NS4168 无寄存器可配 —— 只要 I2S 帧格式对就有声;功放使能走 XL9555 P0_5。
+//   ⚠ 本板无录音通路(DIN 侧无 ADC) → bsp_audio_read() 返回 NOT_SUPPORTED。
 // ============================================================================
 #define BSP_AUDIO_ES8311     0              // 1=按 ES8311 全双工驱动(需板上有该 codec)
+#define BSP_AUDIO_SAMPLE_RATE 16000         // 提示音采样率(与 ui_sound_pcm.h 的 SND_PCM_RATE 一致)
 #define BSP_I2S_PORT         I2S_NUM_0
 #define BSP_I2S_MCLK         (-1)           // 本板 codec 不需 MCLK
 #define BSP_I2S_BCLK         21

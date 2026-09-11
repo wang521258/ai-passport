@@ -7,12 +7,13 @@
 #include "bsp_i2c.h"
 #include "bsp_display.h"
 #include "bsp_button.h"
-#include "bsp_xio.h"       // AW9523 背光/电源/按键扩展 IO
+#include "bsp_xio.h"       // XL9555 背光/电源/按键扩展 IO
 #include "bsp_audio.h"
 #include "bsp_battery.h"
 #include "bsp_pins.h"      // 错误日志里要打印 BSP_LCD_* 引脚号
 #include "demo.h"
 #include "ui_pixel.h"
+#include "ui_sound.h"      // UI 提示音（切换/答对/答错）
 #include "lvgl.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
@@ -150,6 +151,7 @@ void app_main(void) {
     s_ok[0] = true;                                   // Display 已确认可用
     s_ok[1] = (bsp_button_init(on_key, NULL) == ESP_OK);
     s_ok[2] = (bsp_audio_init() == ESP_OK);
+    if (s_ok[2]) ui_sound_init();                      // 提示音（音频不可用时自动静默降级）
     s_ok[3] = (bsp_battery_init() == ESP_OK);
     s_ok[4] = true;                                    // 页面内按需初始化并显示错误
     s_ok[5] = true;

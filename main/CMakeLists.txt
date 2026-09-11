@@ -13,7 +13,8 @@ idf_component_register(
          "demo_pet.c"
          "gif_player.c"
          "ui_pet.c"
-         "lv_font_cn_16.c"
+         "ui_sound.c"
+         "lv_font_cn_18.c"
     INCLUDE_DIRS "."
     REQUIRES bsp bt esp_event esp_hw_support esp_netif esp_timer esp_wifi nvs_flash AnimatedGIF
 )

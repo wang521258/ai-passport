@@ -47,7 +47,7 @@ static void play_tone(void) {
             buf[i] = (phase < period / 2) ? 6000 : -6000;
             if (++phase >= period) phase = 0;
         }
-        bsp_audio_write(buf, (size_t)n * sizeof(int16_t));
+        bsp_audio_write_mono(buf, (size_t)n);
         total -= n;
     }
     free(buf);
@@ -60,8 +60,7 @@ static void record_and_play(void) {
     size_t total = (size_t)SAMPLE_RATE * RECORD_SEC;
     int16_t *rec = malloc(total * sizeof(int16_t));   // 3s @16k 16bit = 96KB
     if (!rec) {
-        // C3 无 PSRAM,96KB 可能分配不到 —— 明确告知而不是静默失败
-        ESP_LOGE(TAG, "录音缓冲 %u 字节分配失败(C3 内存紧张,可缩短 RECORD_SEC)",
+        ESP_LOGE(TAG, "录音缓冲 %u 字节分配失败",
                  (unsigned)(total * sizeof(int16_t)));
         set_status("record buffer alloc failed");
         return;
@@ -75,11 +74,18 @@ static void record_and_play(void) {
         got += n;
     }
 
+    // 本板(NS4168 纯 I2S 功放)没有录音通路 → 读不回来,直接如实告知
+    if (got == 0) {
+        free(rec);
+        set_status("NO MIC on this board\n(NS4168 = output only)");
+        return;
+    }
+
     set_status("playing back...");
     bsp_audio_set_volume(80);
     for (size_t off = 0; off < got; off += CHUNK_SAMPLES) {
         size_t n = (got - off) < CHUNK_SAMPLES ? (got - off) : CHUNK_SAMPLES;
-        bsp_audio_write(rec + off, n * sizeof(int16_t));
+        bsp_audio_write_mono(rec + off, n);
     }
     free(rec);
     set_status("done. OK: tone  UP: record");
