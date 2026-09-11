@@ -388,7 +388,14 @@ static int cn_overlap(const char *a, const char *b)
 static void build_question(void)
 {
     if (s_mode == MODE_REVIEW && s_wrong_n > 0) {
-        s_qWord = s_wrong_book[rand() % s_wrong_n];
+        /* 温习只从错题本出题（仅"答错"和"答对后遗忘"两条来源会进错题本）。
+           错题本只有 1~2 个词时纯随机会连着出同一个，这里避开上一题。 */
+        int idx = s_wrong_book[rand() % s_wrong_n];
+        if (s_wrong_n > 1) {
+            for (int t = 0; t < 8 && idx == s_qWord; t++)
+                idx = s_wrong_book[rand() % s_wrong_n];
+        }
+        s_qWord = idx;
     } else {
         s_qWord = pick_train_word();
     }
@@ -467,6 +474,7 @@ static void start_train(void)
 static void start_review(void)
 {
     if (s_wrong_n == 0) return;
+    LOGI("review start: 错题 %d 个", s_wrong_n);
     s_mode = MODE_REVIEW;
     s_opt = 0;
     build_question();
@@ -488,7 +496,10 @@ static void answer(int option)
     ui_sound_play(right ? UI_SND_CORRECT : UI_SND_WRONG);   /* 答对/答错提示音 */
     if (right) {
         s_mem[s_qWord] = MEM_FULL;            /* 学会 / 记忆刷新到满分 */
-        if (s_mode == MODE_REVIEW) remove_wrong(s_qWord);
+        /* 答对即出温习 —— 不分训练还是温习（王总 0911 反馈）。
+           原来只在 MODE_REVIEW 里移除，导致训练中"先答错、后答对"的词
+           永远留在错题本里，温习时又冒出来，被当成"平白无故的新词"。 */
+        remove_wrong(s_qWord);
         s_stat.hunger = CLAMP(s_stat.hunger + 25);
         s_stat.happy  = CLAMP(s_stat.happy  + 10);
         try_evolve();                          /* 词数变了，检查进化 */
@@ -817,8 +828,14 @@ void demo_pet_enter(void)
     lv_obj_set_style_text_color(s_p_word, lv_color_hex(C_INK), 0);
     lv_obj_set_style_text_align(s_p_word, LV_TEXT_ALIGN_CENTER, 0);
 
+    /* 行宽按"最长内容"定，别拍脑袋：
+     *   中文选项最长 126px（"帕帕韦斯特雷岛" 7 字 × 18px）
+     *   返回行最长   126px（"结束训练，返回" 7 字 × 18px）
+     * 文字区可用宽度 = 行宽 - 26（左边距 20 + 右边距 6）。
+     * v11 时返回行行宽 154 → 文字区仅 120px < 126px，"回"字换到第二行、
+     * 被 24px 的行高切掉，王总看到的就是"只有一个返字"（0911）。 */
     for (int i = 0; i < 5; i++) {
-        int w = (i < 4) ? 220 : 154;      /* 返回行变窄 */
+        int w = (i < 4) ? 226 : 190;      /* 返回行仍略窄，保留视觉区分 */
         lv_obj_t *row = lv_obj_create(s_panel);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_pos(row, (240 - w) / 2, 58 + i * 48);
@@ -834,13 +851,15 @@ void demo_pet_enter(void)
         lv_label_set_text(s_p_cursor[i], ">");
         lv_obj_set_style_text_font(s_p_cursor[i], &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(s_p_cursor[i], lv_color_hex(0xE53935), 0);
-        lv_obj_set_pos(s_p_cursor[i], 8, 12);
+        lv_obj_set_pos(s_p_cursor[i], 6, 12);
         lv_obj_set_style_bg_opa(s_p_cursor[i], LV_OPA_TRANSP, 0);
 
         s_p_txt[i] = lv_label_create(row);
         lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(C_INK), 0);
-        lv_obj_set_pos(s_p_txt[i], 26, 10);
-        lv_obj_set_size(s_p_txt[i], w - 34, 24);
+        lv_obj_set_pos(s_p_txt[i], 20, 10);
+        lv_obj_set_size(s_p_txt[i], w - 26, 24);
+        /* 锁死单行：行高 42 只放得下一行，换行必然把第二个字切掉 */
+        lv_label_set_long_mode(s_p_txt[i], LV_LABEL_LONG_CLIP);
     }
 
     lv_screen_load(s_scr);
