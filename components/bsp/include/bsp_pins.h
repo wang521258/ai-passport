@@ -1,74 +1,103 @@
 // components/bsp/include/bsp_pins.h
-// FoloToy AI Passport → 正点原子 DN-ESP32-S3-BOX3 硬件引脚【单一事实来源】。
-// 板子:ESP32-S3 (octal PSRAM 8MB) / ST7789 320x240 SPI 屏 / AW9523 扩展 IO /
-//       ES8311 音频 / 三键(BOOT 直连 + K1/K2 经 AW9523)。
-// 引脚全部取自正点原子小智固件 board 定义(atk-dnesp32s3-box3),实测一致。
+// FoloToy AI Passport → 正点原子 ATK-DNESP32S3-BOX 硬件引脚【单一事实来源】。
+//
+// 板型认定依据(不靠猜):板子原厂小智固件启动日志打印
+//     I (233) Board: UUID=... SKU=atk-dnesp32s3-box
+// 引脚全部取自小智官方板级定义 main/boards/alientek/atk-dnesp32s3-box/。
+//   ⚠ 注意:是 atk-dnesp32s3-box,【不是】atk-dnesp32s3-box3。
+//     两者屏接口完全不同:box=8080 并口 8bit / box3=SPI。抄错板型必然黑屏。
+//
+// 硬件:ESP32-S3 (octal PSRAM 8MB@80MHz, Flash 8MB QIO)
+//       屏 ST7789 320x240,8bit 8080 并口(i80)
+//       XL9555 扩展 IO(I2C 0x20):背光/功放使能/按键
+//       音频 NS4168(无 I2C codec;另有 ES8311 版本,靠 XL9555 P0_5 电平区分)
 #pragma once
 
-#include "driver/spi_master.h"
+#include "driver/gpio.h"
 #include "driver/i2c_types.h"
-#include "hal/adc_types.h"
 
 // ============================================================================
-// 显示:ST7789 320x240,4-line SPI(玻璃为横屏;LVGL 用 swap_xy 转竖屏 240x320)
+// 显示:ST7789 320x240,8bit 8080 并口(LCD_CAM/i80)。
+//   面板原生 320x240 横屏;开 swap_xy(寄存器 0x36 的 MV 位)后,
+//   软件坐标空间变成 240x320 竖屏 —— LVGL 画布即用后者。
 // ============================================================================
-#define BSP_LCD_W            240
-#define BSP_LCD_H            320
-#define BSP_LCD_SPI_HOST     SPI2_HOST
-#define BSP_LCD_MOSI         16
-#define BSP_LCD_SCLK         15
-#define BSP_LCD_MISO         17
-#define BSP_LCD_CS           47
-#define BSP_LCD_DC           48
-#define BSP_LCD_RST          (-1)   // 复位走 SWRESET 软复位
-// 背光经 AW9523 扩展 IO(P0_8,低有效),非直连 LEDC。-1 仅作占位供日志打印。
+#define BSP_LCD_PANEL_W      320            // 面板原生宽(横屏)
+#define BSP_LCD_PANEL_H      240            // 面板原生高
+#define BSP_LCD_W            240            // LVGL 画布宽(竖屏,= PANEL_H)
+#define BSP_LCD_H            320            // LVGL 画布高(竖屏,= PANEL_W)
+
+#define BSP_LCD_CS           1
+#define BSP_LCD_DC           2
+#define BSP_LCD_RD           41             // 读选通(本驱动只写,配成输出常高)
+#define BSP_LCD_WR           42             // 写选通
+#define BSP_LCD_RST          (-1)           // 复位走 SWRESET 软复位
+
+// 8 位数据总线 D0..D7(顺序即 bus_width=8 的低位到高位,不可乱序)
+#define BSP_LCD_D0           40
+#define BSP_LCD_D1           39
+#define BSP_LCD_D2           38
+#define BSP_LCD_D3           12
+#define BSP_LCD_D4           11
+#define BSP_LCD_D5           10
+#define BSP_LCD_D6           9
+#define BSP_LCD_D7           46
+
+#define BSP_LCD_PCLK_HZ      (10 * 1000 * 1000)
+#define BSP_LCD_SWAP_XY      1
+#define BSP_LCD_MIRROR_X     1
+#define BSP_LCD_MIRROR_Y     0
+#define BSP_LCD_INVERT_COLOR 1              // 本屏需反色(0x21 INVON)
+// 背光经 XL9555(P1_0,高有效),不由 MCU 直接驱动。此处仅作日志/占位。
 #define BSP_LCD_BL           (-1)
-#define BSP_LCD_PCLK_HZ      (60 * 1000 * 1000)
-#define BSP_LCD_SPI_MODE     0
-#define BSP_LCD_INVERT_COLOR 1      // 本屏出厂需反色(0x21 INVON)
 
 // ============================================================================
-// 按键:三键。BOOT 直连 GPIO0;K1/K2 经 AW9523 扩展 IO(P0_0 / P0_1)。
+// 按键:三键。BOOT 直连 GPIO0(官方唯一定义的实体键);K1/K2 经 XL9555 输入。
 //   映射:BOOT→OK,K1→UP,K2→DOWN(宠物/菜单逻辑零改动)。
+//   XL9555 输入位:KEY0=P1_7(线性 pin15) KEY1=P1_6(14) KEY2=P1_5(13) KEY3=P1_4(12)。
+//   ⚠ 这三支是否真有物理键、对应关系如何,以实机为准 —— bsp_button 会把
+//     任何输入位跳变打到串口日志,按一下键即可核对/改映射。
 // ============================================================================
 #define BSP_BTN_COUNT        3
-#define BSP_BTN_BOOT_GPIO    0      // BOOT 键,低有效(按下=0)
-#define BSP_BTN_K1_XIO       0      // AW9523 P0_0,低有效(按下=0)
-#define BSP_BTN_K2_XIO       1      // AW9523 P0_1,低有效(按下=0)
+#define BSP_BTN_BOOT_GPIO    0              // BOOT 键,低有效
+#define BSP_BTN_K1_XIO       15             // UP
+#define BSP_BTN_K2_XIO       14             // DOWN
 
 // ============================================================================
-// I2C:ES8311(音频)与 AW9523(扩展 IO)共用一条总线
+// I2C:XL9555(扩展 IO);本板 NS4168 无 I2C codec(ES8311 版本才有)
 // ============================================================================
 #define BSP_I2C_PORT         I2C_NUM_0
-#define BSP_I2C_SDA          3
-#define BSP_I2C_SCL          2
-#define BSP_I2C_ES8311_ADDR  0x18    // 7 位地址
-#define BSP_I2C_CW2017_ADDR  0x63    // box3 无独立电量计,init 失败无害
+#define BSP_I2C_SDA          48
+#define BSP_I2C_SCL          45
+#define BSP_I2C_ES8311_ADDR  0x18           // 7 位地址(本板若无 ES8311 则无应答)
+#define BSP_I2C_CW2017_ADDR  0x63           // 本板无独立电量计,init 失败无害
 
 // ============================================================================
-// 音频:ES8311,I2S 全双工(同端口一 tx 一 rx,共用 MCLK/BCLK/WS)
+// 音频:I2S → NS4168(纯 I2S DAC,无 I2C 控制口)。本版【暂未适配】,
+//   bsp_audio_init() 直接返回 NOT_SUPPORTED,避免误占引脚。
+//   (引脚按官方 config.h 预留:MCLK 不用 / BCLK21 / WS13 / DOUT14 / DIN47)
 // ============================================================================
+#define BSP_AUDIO_ES8311     0              // 1=按 ES8311 全双工驱动(需板上有该 codec)
 #define BSP_I2S_PORT         I2S_NUM_0
-#define BSP_I2S_MCLK         21
-#define BSP_I2S_BCLK         38
-#define BSP_I2S_WS           39
-#define BSP_I2S_DOUT         40      // 播放:MCU → codec
-#define BSP_I2S_DIN          41      // 录音:codec → MCU
-// 功放使能经 AW9523 P0_5,由 bsp_xio 控制;codec 自身不控 PA。
-#define BSP_I2S_PA_CTRL      (-1)
+#define BSP_I2S_MCLK         (-1)           // 本板 codec 不需 MCLK
+#define BSP_I2S_BCLK         21
+#define BSP_I2S_WS           13
+#define BSP_I2S_DOUT         14             // 播放:MCU → 功放
+#define BSP_I2S_DIN          47             // 录音
+#define BSP_I2S_PA_CTRL      (-1)           // 功放使能走 XL9555 P0_5
 
 // ============================================================================
-// AW9523 扩展 IO(I2C 地址 0x59):管背光 / 功放 / K1-K2 键 / 板上多路电源使能
-// pin 编号按 16 位扩展器的线性编号(0..7 = P0,8..15 = P1),与官方
-// IO_EXPANDER_PIN_NUM_x 一一对应。
+// XL9555 扩展 IO(I2C 地址 0x20)
+//   pin 编号用 16 位线性编号:0..7 = P0_0..P0_7,8..15 = P1_0..P1_7
+//   寄存器(TCA9535/XL9555 布局):输入 0x00/0x01 输出 0x02/0x03 方向 0x06/0x07(1=输入)
+//   位定义取自正点原子官方 xl9555.h(openedv/ATK-DNESP32S3-Board)。
 // ============================================================================
-#define BSP_XIO_ADDR         0x59
-#define BSP_XIO_K1_PIN       0       // pin0  K1        (输入)
-#define BSP_XIO_K2_PIN       1       // pin1  K2        (输入)
-#define BSP_XIO_ADC_SEL_PIN  4       // pin4  ESP_ADC_SEL
-#define BSP_XIO_PA_PIN       5       // pin5  音频功放 PA_CTRL
-#define BSP_XIO_BL_PIN       8       // pin8  LCD 背光(低有效)
-#define BSP_XIO_VDD_3V3_PIN  11      // pin11 VDD_3V3_EN
-#define BSP_XIO_VBAT_PIN     12      // pin12 VBAT_EN
-#define BSP_XIO_VDDA_3V3_PIN 13      // pin13 VDDA_3V3_EN(音频模拟电源)
-#define BSP_XIO_VDD_2V8_PIN  14      // pin14 VDD_2V8_EN
+#define BSP_XIO_ADDR           0x20
+#define BSP_XIO_BL_PIN         8    // P1_0 LCD_BL     背光(高有效)
+#define BSP_XIO_SPK_PIN        5    // P0_5 SPK_CTRL   功放使能/ES8311 探测
+#define BSP_XIO_KEY0_PIN       15   // P1_7 KEY0
+#define BSP_XIO_KEY1_PIN       14   // P1_6 KEY1
+#define BSP_XIO_KEY2_PIN       13   // P1_5 KEY2
+#define BSP_XIO_KEY3_PIN       12   // P1_4 KEY3
+// 方向:P0=0x1B(P0_0/1/3/4 输入,其余输出) P1=0xFE(P1_0 输出,其余输入)
+#define BSP_XIO_DIR_P0         0x1B
+#define BSP_XIO_DIR_P1         0xFE

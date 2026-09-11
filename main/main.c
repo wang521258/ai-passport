@@ -127,10 +127,10 @@ void app_main(void) {
     //   外设是否存在,由各自 init 的返回值体现,不再单独扫描。
     // bsp_i2c_scan();
 
-    // AW9523 扩展 IO:拉高板上多路电源使能(VDD_3V3/VDDA_3V3/VDD_2V8/VBAT/ADC_SEL/PA)
-    // 并点亮背光。必须在显示/音频初始化之前完成,否则板子没电或黑屏。
+    // XL9555 扩展 IO:配方向 + 拉高输出 + 点亮背光(P1_0)。
+    // 必须在显示初始化之前完成,否则背光不亮 = 黑屏。
     if (bsp_xio_init() != ESP_OK) {
-        ESP_LOGE(TAG, "AW9523 初始化失败 —— 屏将黑屏。检查 I2C(SDA=GPIO%d SCL=GPIO%d, addr 0x%02X)与供电",
+        ESP_LOGE(TAG, "XL9555 初始化失败 —— 屏将黑屏。检查 I2C(SDA=GPIO%d SCL=GPIO%d, addr 0x%02X)与供电",
                  BSP_I2C_SDA, BSP_I2C_SCL, BSP_XIO_ADDR);
     }
 
@@ -138,8 +138,10 @@ void app_main(void) {
     // 不做"串口菜单"降级(那会让本文件复杂一倍,违背参考示例的初衷)。
     if (bsp_display_init() != ESP_OK || !bsp_lvgl_init()) {
         ESP_LOGE(TAG, "显示/LVGL 初始化失败,demo 无法继续。"
-                      "检查 SPI 接线(MOSI=%d SCLK=%d CS=%d DC=%d BL=%d)",
-                 BSP_LCD_MOSI, BSP_LCD_SCLK, BSP_LCD_CS, BSP_LCD_DC, BSP_LCD_BL);
+                      "检查 8080 并口接线(DC=%d WR=%d CS=%d RD=%d D0..D7=%d,%d,%d,%d,%d,%d,%d,%d)",
+                 BSP_LCD_DC, BSP_LCD_WR, BSP_LCD_CS, BSP_LCD_RD,
+                 BSP_LCD_D0, BSP_LCD_D1, BSP_LCD_D2, BSP_LCD_D3,
+                 BSP_LCD_D4, BSP_LCD_D5, BSP_LCD_D6, BSP_LCD_D7);
         return;
     }
     bsp_display_backlight(100);

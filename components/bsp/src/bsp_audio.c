@@ -18,6 +18,7 @@ static uint32_t s_hz;
 static uint8_t  s_bits, s_ch;
 static bool     s_opened;
 
+#if BSP_AUDIO_ES8311
 static esp_err_t i2s_full_duplex_init(void) {
     i2s_chan_config_t chan = {
         .id = BSP_I2S_PORT,
@@ -70,8 +71,16 @@ static esp_err_t i2s_full_duplex_init(void) {
     i2s_channel_enable(s_rx);
     return ESP_OK;
 }
+#endif  // BSP_AUDIO_ES8311
 
 esp_err_t bsp_audio_init(void) {
+#if !BSP_AUDIO_ES8311
+    // 本板(atk-dnesp32s3-box)是 NS4168 纯 I2S 功放,没有 I2C 控制口,
+    // 与下面这套 ES8311(esp_codec_dev)驱动不兼容 → 明确禁用,
+    // 避免误占 I2S 引脚并让调用方拿到清晰结果(菜单里显示 [FAIL])。
+    ESP_LOGW(TAG, "本板音频为 NS4168(无 I2C codec),当前固件暂未适配 → 音频项禁用");
+    return ESP_ERR_NOT_SUPPORTED;
+#else
     if (s_dev) return ESP_OK;
 
     esp_err_t e = bsp_i2c_init();
@@ -120,6 +129,7 @@ esp_err_t bsp_audio_init(void) {
 
     ESP_LOGI(TAG, "ES8311 就绪");
     return ESP_OK;
+#endif
 }
 
 esp_err_t bsp_audio_set_format(uint32_t hz, uint8_t bits, uint8_t ch) {

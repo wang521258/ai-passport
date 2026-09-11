@@ -1,5 +1,5 @@
 // components/bsp/include/bsp_xio.h
-// AW9523 I/O 扩展器(TCA95xx 兼容寄存器)封装:板上多路电源使能 + 背光 + 功放 + K1/K2 键。
+// XL9555 I/O 扩展器封装:背光 + 功放使能 + 按键输入。
 // 直接走 bsp_i2c 已建好的 I2C 总线,不引入 esp_io_expander 组件依赖。
 #pragma once
 
@@ -7,15 +7,18 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// 初始化 AW9523:配置 GPIO 模式、方向,并拉高所有电源使能、点亮背光。
-// 必须在 bsp_i2c_init() 之后调用。幂等。
+// 初始化 XL9555:配方向、拉高输出、点亮背光。须在 bsp_i2c_init() 之后调用。幂等。
 esp_err_t bsp_xio_init(void);
 
-// 背光:on=1 点亮(低有效,内部写 P0_8 = 0)
+// 背光:P1_0,高有效。on=1 点亮。
 void bsp_xio_set_bl(uint8_t on);
 
-// 读扩展 IO 输入 pin(0..15)电平,1 = 高电平。用于 K1/K2 按键检测。
+// 读扩展 IO 输入 pin(0..15)电平,1 = 高电平。
+// 线性编号:0..7 = P0_0..P0_7,8..15 = P1_0..P1_7。
 bool bsp_xio_get_key(uint8_t xio_pin);
 
-// 功放使能:on=1 打开(拉高 P0_5)
+// 一次读回 16 位输入寄存器(按键诊断用)。成功返回 true。
+bool bsp_xio_read_all(uint16_t *in);
+
+// 功放使能:P0_5,高有效。
 void bsp_xio_set_pa(uint8_t on);

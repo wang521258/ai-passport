@@ -28,14 +28,13 @@ lv_display_t *bsp_lvgl_init(void) {
         // S3 有 8MB octal PSRAM:用 40 行双缓冲放 PSRAM,刷新快且稳。
         .buffer_size   = (uint32_t)BSP_LCD_W * 40,
         .double_buffer = true,
+        // 画布 = 240x320 竖屏。旋转已经在 bsp_display.c 里用面板级
+        // esp_lcd_panel_swap_xy()/mirror() 做掉了(软件坐标空间随之变成 240x320),
+        // 所以这里 rotation 全关、分辨率直接给竖屏值,两层不要重复旋转。
         .hres = BSP_LCD_W, .vres = BSP_LCD_H,
-        // 旋转/镜像必须在这里配:esp_lvgl_port 注册显示时会重新下发 MADCTL,
-        // 覆盖 bsp_display.c 里 esp_lcd_panel_mirror() 的设置。
-        // box3 物理玻璃是 240x320 竖屏,宠物 UI 也是 240x320 竖屏设计 → 不旋转不镜像。
-        // (若真机上画面上下颠倒/左右镜像,改这里 mirror_x/mirror_y 即可,一行的事。)
         .rotation = { .swap_xy = false, .mirror_x = false, .mirror_y = false },
-        // swap_bytes:LVGL 输出小端 RGB565,ST7789 走 SPI 要大端 → 需交换高低字节。
-        .flags = { .buff_spiram = true, .swap_bytes = true },
+        // 8080 并口按 16bit 走,不需要 SPI 那种高低字节交换(官方 swap_color_bytes=0)。
+        .flags = { .buff_spiram = true, .swap_bytes = false },
     };
     s_disp = lvgl_port_add_disp(&dc);
     if (!s_disp) { ESP_LOGE(TAG, "lvgl_port_add_disp 失败"); return NULL; }

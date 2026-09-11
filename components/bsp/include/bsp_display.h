@@ -1,5 +1,5 @@
 // components/bsp/include/bsp_display.h
-// ST7789P3 240x320 显示:SPI 面板初始化 + 厂商专属寄存器 + LEDC 背光调光。
+// ST7789 320x240 显示(8bit 8080 并口/i80):面板初始化 + 背光(XL9555 P1_0)。
 #pragma once
 
 #include "esp_err.h"
@@ -7,7 +7,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// 初始化 SPI 总线、面板、厂商寄存器、背光 LEDC。成功后屏幕已上电但内容未定。
+// 初始化 i80 总线、面板、背光。成功后屏幕已上电但内容未定。
 esp_err_t bsp_display_init(void);
 
 // 取底层面板句柄。想直接 esp_lcd_panel_draw_bitmap 画,或接 LVGL 以外的 GUI 时用。
@@ -17,7 +17,7 @@ esp_lcd_panel_handle_t bsp_display_panel(void);
 // 取底层 panel io 句柄(LVGL 接入需要)。未初始化返回 NULL。
 esp_lcd_panel_io_handle_t bsp_display_io(void);
 
-// 背光亮度 0..100(%)。LEDC PWM,0=全灭。
+// 背光亮度 0..100(%)。无亮度调节,0=灭 / >0=亮(XL9555 P1_0)。
 void bsp_display_backlight(uint8_t percent);
 
 // ---------------------------------------------------------------------------

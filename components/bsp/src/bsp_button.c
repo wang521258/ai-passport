@@ -1,10 +1,13 @@
 // components/bsp/src/bsp_button.c
-// 正点原子 DN-ESP32-S3-BOX3 三键:BOOT(GPIO0 直连) + K1/K2(经 AW9523 扩展 IO)。
+// ATK-DNESP32S3-BOX 按键:BOOT(GPIO0 直连) + K1/K2(经 XL9555 输入)。
 // 映射 BOOT→OK、K1→UP、K2→DOWN,宠物/菜单逻辑零改动。
 //
 // 不依赖 esp-button 组件(其 API 在 v4 大改,易编译不过);自行用 FreeRTOS 任务
-// 轮询三键电平,做去抖 + 事件派发(PRESS/CLICK/LONG)。应用只需 BSP_BTN_CLICK
-// 与 BSP_BTN_LONG,其余事件发出无害。
+// 轮询电平,做去抖 + 事件派发(PRESS/CLICK/LONG)。
+//
+// 【键位自检】XL9555 的 16 位输入寄存器任何一位跳变都会打日志:
+//     bsp_btn: XIO IN 0x%04X -> 0x%04X | 变化位 bit N(高/低)
+//   按一下实体键看日志里哪个 bit 动,即可确认/修正下面的映射。
 #include "bsp_button.h"
 #include "bsp_pins.h"
 #include "bsp_xio.h"
@@ -34,6 +37,8 @@ typedef struct {
 } btn_state_t;
 
 static btn_state_t s_btn[BSP_BTN_COUNT];
+static uint16_t    s_xio_last;
+static bool        s_xio_have_last;
 
 static bool read_boot(void) { return (bool)gpio_get_level(BSP_BTN_BOOT_GPIO); }
 static bool read_k1(void)   { return bsp_xio_get_key(BSP_BTN_K1_XIO); }
@@ -45,28 +50,23 @@ static void btn_tick(btn_state_t *b) {
     bool level = b->read();
     bool down  = b->active_low ? !level : level;
 
-    // 去抖:向下计正、向上计负,稳态窗口内才算确认
     if (down) { if (b->deb < BTN_DEBOUNCE) b->deb++; }
     else      { if (b->deb > 0)            b->deb--; }
     bool pressed = (b->deb >= BTN_DEBOUNCE);
 
     if (pressed && !b->was_down) {
-        // 下降沿:按下
         b->was_down   = true;
         b->t_down_ms  = now_ms();
         b->long_fired = false;
         if (s_cb) s_cb(b->id, BSP_BTN_PRESS, s_user);
     } else if (!pressed && b->was_down) {
-        // 上升沿:抬起
         b->was_down = false;
         uint32_t dur = now_ms() - b->t_down_ms;
         if (!b->long_fired && dur < BTN_LONG_MS) {
             if (s_cb) s_cb(b->id, BSP_BTN_CLICK, s_user);
         }
-        // long_fired 为真时代表已发过 LONG,这里不再发 CLICK,避免重复触发
     }
 
-    // 长按:按住达到阈值立即发一次
     if (pressed && !b->long_fired) {
         uint32_t dur = now_ms() - b->t_down_ms;
         if (dur >= BTN_LONG_MS) {
@@ -76,10 +76,32 @@ static void btn_tick(btn_state_t *b) {
     }
 }
 
+// XL9555 输入位跳变日志(键位核对用)
+static void xio_watch(void) {
+    uint16_t v;
+    if (!bsp_xio_read_all(&v)) return;
+    if (!s_xio_have_last) {
+        s_xio_have_last = true;
+        s_xio_last = v;
+        ESP_LOGI(TAG, "XL9555 输入初值 0x%04X(空闲态;按键按下应看到某位变 0)", v);
+        return;
+    }
+    if (v == s_xio_last) return;
+    uint16_t ch = (uint16_t)(v ^ s_xio_last);
+    for (int i = 0; i < 16; i++) {
+        if (ch & (1u << i)) {
+            ESP_LOGI(TAG, "XIO IN 0x%04X -> 0x%04X | 变化位 bit %d(%s)",
+                     s_xio_last, v, i, (v & (1u << i)) ? "高/松开" : "低/按下");
+        }
+    }
+    s_xio_last = v;
+}
+
 static void btn_task(void *arg) {
     (void)arg;
     for (;;) {
         for (int i = 0; i < BSP_BTN_COUNT; i++) btn_tick(&s_btn[i]);
+        xio_watch();
         vTaskDelay(pdMS_TO_TICKS(BTN_TICK_MS));
     }
 }
@@ -92,10 +114,10 @@ esp_err_t bsp_button_init(bsp_btn_cb_t cb, void *user) {
     gpio_set_direction(BSP_BTN_BOOT_GPIO, GPIO_MODE_INPUT);
     gpio_pullup_en(BSP_BTN_BOOT_GPIO);
 
-    // AW9523 上的 K1/K2 由 bsp_xio_init 配为输入,这里确保已初始化
+    // XL9555 上的 K1/K2 由 bsp_xio_init 配为输入,这里确保已初始化
     esp_err_t e = bsp_xio_init();
     if (e != ESP_OK) {
-        ESP_LOGE(TAG, "AW9523 未就绪,K1/K2 不可用 (%s)", esp_err_to_name(e));
+        ESP_LOGE(TAG, "XL9555 未就绪,K1/K2 不可用 (%s)", esp_err_to_name(e));
         // 仍允许 BOOT 工作,不致命返回
     }
 
@@ -116,14 +138,14 @@ esp_err_t bsp_button_init(bsp_btn_cb_t cb, void *user) {
         s_btn[i].t_down_ms = 0; s_btn[i].long_fired = false;
     }
 
-    if (xTaskCreate(btn_task, "btn_task", 2048, NULL, 10, NULL) != pdPASS) {
+    if (xTaskCreate(btn_task, "btn_task", 3072, NULL, 10, NULL) != pdPASS) {
         ESP_LOGE(TAG, "按键轮询任务创建失败");
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "按键就绪:BOOT(OK) + K1(UP) + K2(DOWN)");
+    ESP_LOGI(TAG, "按键就绪:BOOT(OK) + XL9555 P1_7(UP) + P1_6(DOWN)");
     return ESP_OK;
 }
 
-// box3 无 ADC 分压键,保留接口返回 -1(demo 的电压显示页会用,宠物页不用)。
+// 本板无 ADC 分压键,保留接口返回 -1(demo 的电压显示页会用,宠物页不用)。
 int bsp_button_read_mv(void) { return -1; }

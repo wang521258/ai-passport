@@ -1,6 +1,10 @@
+# 构建产物与临时文件
 build/
-sdkconfig
-sdkconfig.old
 managed_components/
-.vscode/
-.idea/
+*.bin
+*.zip
+*.json.tmp
+runs.json
+arts.json
+jobs.json
+cs.json
