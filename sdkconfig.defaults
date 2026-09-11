@@ -49,6 +49,11 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
+# 16/18 是"英文长词自动缩字号"的中间档：放不下就从 20 逐级往下挑
+# （doing morning exercises 这类 20+ 字符的词，20px 要 229px > 可用 196px）。
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_18=y
+CONFIG_LV_FONT_MONTSERRAT_22=n
 # cn_16 子集字库由 lv_font_conv 生成,glyph 位图是 RLE 压缩格式(bitmap_format=1)。
 # 此开关必须打开,否则中文全部不显示。
 CONFIG_LV_USE_FONT_COMPRESSED=y
