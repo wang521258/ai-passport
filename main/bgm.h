@@ -19,6 +19,13 @@ void bgm_init(void);
 void bgm_set_on(bool on);
 bool bgm_is_on(void);
 
+// 临时静音，与 set_on 的区别是【保留播放进度】：
+// 解除后从暂停的那一拍继续，而不是重头播。
+// 用于"进题板安静、返回接着放"这类高频往返（HEAD 重播会腻）。
+// 注意：suspend 只是不出声，set_on(false) 才是真的关掉。
+void bgm_set_suspend(bool sus);
+bool bgm_is_suspended(void);
+
 // 渲染 n 个【单声道 16bit】样本到 out；关闭时填 0（静音）。
 // 由音频任务按固定块长调用，请勿在其他地方调用。
 void bgm_render(int16_t *out, int n);

@@ -64,6 +64,7 @@ static int  s_step;             /* 当前 16 分音符序号 0..BGM_STEPS-1 */
 static int  s_left;             /* 当前步还剩多少样本 */
 
 static volatile bool s_on;
+static volatile bool s_suspend;  /* 临时静音但保留进度（进题板时用） */
 
 /* ---------------------------------------------------------------- 实现 */
 static const uint8_t DUTY[3] = { DUTY_LEAD, DUTY_BASS, DUTY_ARP };
@@ -124,20 +125,30 @@ void bgm_set_on(bool on)
 {
     if (s_on == on) return;
     s_on = on;
+    s_suspend = false;                     /* 显式开/关都以"该响/该停"为准 */
     if (on) {                              /* 从头开始，别接着上次的半拍子 */
         s_step = 0; s_left = 0;
         memset(s_v, 0, sizeof(s_v));
         memset(s_env, 0, sizeof(s_env));
         s_nenv = 0;
     }
-    ESP_LOGI(TAG, "背景乐%s", on ? "开始" : "暂停");
+    ESP_LOGI(TAG, "背景乐%s", on ? "开始" : "停止");
 }
 
 bool bgm_is_on(void) { return s_on; }
 
+void bgm_set_suspend(bool sus)
+{
+    if (s_suspend == sus) return;
+    s_suspend = sus;
+    if (s_on) ESP_LOGI(TAG, "背景乐%s", sus ? "静音(保留进度)" : "续播");
+}
+
+bool bgm_is_suspended(void) { return s_suspend; }
+
 void bgm_render(int16_t *out, int n)
 {
-    if (!s_on) { memset(out, 0, (size_t)n * sizeof(int16_t)); return; }
+    if (!s_on || s_suspend) { memset(out, 0, (size_t)n * sizeof(int16_t)); return; }
 
     for (int k = 0; k < n; k++) {
         if (s_left <= 0) step_load();

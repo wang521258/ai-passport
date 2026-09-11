@@ -30,3 +30,6 @@ void ui_sound_play(ui_sound_t id);
 // 不重设的话背景乐会以错误时钟送出（变调/变速）。
 // 静默期（无背景乐、无提示音）音频任务会完全停下来，把 I2S 让给别的页。
 void ui_sound_bgm(bool on);
+// 临时静音但【保留播放进度】（解除后接着放，非重头）。
+// 用于进题板/温习时安静、返回宠物页立刻续播。
+void ui_sound_bgm_suspend(bool sus);

@@ -525,6 +525,9 @@ static void start_train(void)
     s_opt = 0;
     build_question();
     pet_gif_hide(true);                    /* 题板全屏，宠物别叠在选项上 */
+    ui_sound_bgm_suspend(true);            /* 进题板就静音（王总 0911）：
+                                              做题要留耳朵给答对/答错提示音；
+                                              suspend 保留进度，出来接着放不重头 */
     if (s_panel) lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     render_panel();
 }
@@ -536,6 +539,7 @@ static void start_review(void)
     s_opt = 0;
     build_question();
     pet_gif_hide(true);
+    ui_sound_bgm_suspend(true);            /* 温习同训练：题板期静音 */
     if (s_panel) lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     render_panel();
 }
@@ -544,6 +548,7 @@ static void exit_qa(void)
     s_mode = MODE_HOME;
     if (s_panel) lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     pet_gif_hide(false);                   /* 回主页恢复宠物 */
+    ui_sound_bgm_suspend(false);           /* 回到宠物页，音乐从暂停处续播 */
     s_stat.energy = CLAMP((int)s_stat.energy - 4);
 }
 

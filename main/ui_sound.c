@@ -135,6 +135,12 @@ void ui_sound_play(ui_sound_t id)
     xQueueSend(s_q, &v, 0);
 }
 
+void ui_sound_bgm_suspend(bool sus)
+{
+    if (!s_ready) return;
+    bgm_set_suspend(sus);
+}
+
 void ui_sound_bgm(bool on)
 {
     if (!s_ready) return;
