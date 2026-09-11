@@ -31,6 +31,11 @@ static const demo_entry_t DEMOS[] = {
 };
 #define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
 
+// 开机直接进宠物页(Wang 的要求:刷完就能玩),长按 OK 返回菜单。
+// 改成 0 就停在 BSP 外设菜单,便于逐项自测。
+#define BOOT_INTO_PET 1
+#define PET_IDX       (DEMO_COUNT - 1)
+
 // 各外设初始化结果:失败的项在菜单里标 [FAIL] 且不允许进入。
 static bool s_ok[DEMO_COUNT];
 
@@ -76,6 +81,14 @@ static void enter_menu(void) {
     menu_build();
 }
 
+// 从菜单进入某个演示页(调用方需持有 LVGL 锁)
+static void enter_demo(int idx) {
+    s_active = idx;
+    if (s_menu_scr) { lv_obj_delete(s_menu_scr); s_menu_scr = NULL; }
+    s_mascot = NULL;
+    DEMOS[idx].enter();
+}
+
 // 按键回调运行在 button 组件的任务里,操作 LVGL 必须加锁。
 static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
     (void)user;
@@ -92,12 +105,8 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
         if (btn == BSP_BTN_UP)   { s_sel = (s_sel + DEMO_COUNT - 1) % DEMO_COUNT; menu_refresh(); }
         if (btn == BSP_BTN_DOWN) { s_sel = (s_sel + 1) % DEMO_COUNT;              menu_refresh(); }
         if (btn == BSP_BTN_OK && s_ok[s_sel]) {
-            s_active = s_sel;
             ui_pixel_mascot_jump(s_mascot);
-            lv_obj_delete(s_menu_scr);
-            s_menu_scr = NULL;
-            s_mascot = NULL;
-            DEMOS[s_active].enter();
+            enter_demo(s_sel);
         } else if (btn == BSP_BTN_UP || btn == BSP_BTN_DOWN) {
             ui_pixel_mascot_jump(s_mascot);
         }
@@ -145,7 +154,13 @@ void app_main(void) {
     s_ok[6] = true;
     s_ok[7] = true;                                    /* Pet：纯软件 demo */
 
-    if (bsp_lvgl_lock(1000)) { enter_menu(); bsp_lvgl_unlock(); }
+    if (bsp_lvgl_lock(1000)) {
+        enter_menu();                       // 先把菜单建好:长按 OK 退出宠物后能直接回来
+#if BOOT_INTO_PET
+        enter_demo(PET_IDX);                // 开机直进宠物页
+#endif
+        bsp_lvgl_unlock();
+    }
 
     ESP_LOGI(TAG, "就绪:Display=%d Button=%d Audio=%d Battery=%d",
              s_ok[0], s_ok[1], s_ok[2], s_ok[3]);
