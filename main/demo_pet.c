@@ -36,17 +36,21 @@
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include <string.h>
 #include <stdlib.h>
 
-/* 中文字库：由 gen_cn_font.py 生成（微软雅黑粗体 18px 子集，1334 字，约 1.1MB）。
+/* 中文字库：由 gen_cn_font.py 生成（微软雅黑粗体 18px 子集，1363 字，约 1.15MB）。
    选它是因为实测笔画覆盖率 44.6%，明显粗于黑体(29.0%)/等线粗体(33.7%)。
-   改字号/换字体只需重跑 gen_cn_font.py，并同步这里的符号名。 */
+   改字号/换字体只需重跑 gen_cn_font.py，并同步这里的符号名。
+   ⚠ 词库/界面加了新汉字后，务必重跑 gen_cn_font.py —— 否则新字是空白（v15 教训）。 */
 extern lv_font_t cn_18;
 #define CN_FONT (&cn_18)
 
 #define TAG "PET"
 #define LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#define LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
 
 #define CLAMP(v) ((v) < 0 ? 0 : ((v) > 100 ? 100 : (v)))
 
@@ -142,6 +146,140 @@ static esp_timer_handle_t s_tick_timer;
 static uint32_t s_forget_cnt;
 
 static void try_evolve(void);             /* 前向声明（answer 先于定义调用） */
+
+/* ============================================================
+ *  掉电保存（NVS）
+ *
+ *  王总 0911：机器按电源键关机再开机，练的全都清零了。
+ *  根因 —— 学习记录（s_mem / 错题本）与宠物状态只活在内存里，
+ *  demo_pet_enter() 每次进来都无条件清零，断电自然全丢。
+ *
+ *  做法：分 3 个 blob 写进 nvs 分区（partitions.csv 里 24KB）：
+ *    hdr   24B  —— 版本/词库大小/已破壳标记/宠物状态
+ *    mem   1148B —— 每词记忆度
+ *    wrong 480B  —— 错题本
+ *  词库大小变了（pool_size 不匹配）就作废旧档，避免新旧错位读到脏数据。
+ * ============================================================ */
+#define PS_NS        "petsave"
+#define PS_MAGIC     0x50455432u           /* 'PET2' */
+#define PS_VER       2
+#define PS_KEY_HDR   "hdr"
+#define PS_KEY_MEM   "mem"
+#define PS_KEY_WRONG "wrong"
+#define PS_SAVE_GAP_US  (20LL * 1000 * 1000)   /* 最快 20 秒写一次 flash */
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t ver;
+    uint16_t pool_size;                    /* 词库大小，不匹配就作废 */
+    uint8_t  hatched;                      /* 1 = 已破壳（下次开机直接回宠物） */
+    uint8_t  hatch_clicks;
+    uint8_t  cur_poke;                     /* 当前宠物下标 */
+    uint8_t  hunger, happy, energy;
+    uint16_t wrong_n;
+    uint16_t reserved;
+} ps_hdr_t;
+
+static bool    s_nvs_ok;
+static bool    s_save_dirty;
+static int64_t s_last_save_us;
+static bool    s_restored;                 /* 本次进入是否恢复了存档 */
+
+static bool pet_storage_ready(void)
+{
+    static bool tried;
+    if (tried) return s_nvs_ok;
+    tried = true;
+    esp_err_t e = nvs_flash_init();
+    if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        e = nvs_flash_init();
+    }
+    s_nvs_ok = (e == ESP_OK);
+    if (!s_nvs_ok) LOGW("NVS 不可用(%s)：学习进度无法掉电保存", esp_err_to_name(e));
+    return s_nvs_ok;
+}
+
+static void pet_save(void)
+{
+    if (!pet_storage_ready()) return;
+    nvs_handle_t h;
+    if (nvs_open(PS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+
+    ps_hdr_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic        = PS_MAGIC;
+    hdr.ver          = PS_VER;
+    hdr.pool_size    = (uint16_t)WORD_POOL_SIZE;
+    hdr.hatched      = (s_mode == MODE_EGG) ? 0 : 1;
+    hdr.hatch_clicks = s_hatch_clicks;
+    hdr.cur_poke     = s_cur_poke_idx;
+    hdr.hunger       = s_stat.hunger;
+    hdr.happy        = s_stat.happy;
+    hdr.energy       = s_stat.energy;
+    hdr.wrong_n      = (uint16_t)s_wrong_n;
+
+    esp_err_t e = nvs_set_blob(h, PS_KEY_HDR, &hdr, sizeof(hdr));
+    if (e == ESP_OK) e = nvs_set_blob(h, PS_KEY_MEM, s_mem, sizeof(s_mem));
+    if (e == ESP_OK) e = nvs_set_blob(h, PS_KEY_WRONG, s_wrong_book, sizeof(s_wrong_book));
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+    if (e != ESP_OK) LOGW("存档失败: %s", esp_err_to_name(e));
+}
+
+/* 节流保存：答题很密，不能每次都写 flash。标记脏，20 秒内最多落一次盘。 */
+static void pet_save_soon(void)
+{
+    s_save_dirty = true;
+    int64_t now = esp_timer_get_time();
+    if (now - s_last_save_us < PS_SAVE_GAP_US) return;
+    s_last_save_us = now;
+    s_save_dirty = false;
+    pet_save();
+}
+
+/* 立即落盘（破壳/重修/离开页面这种关键节点用） */
+static void pet_save_now(void)
+{
+    s_last_save_us = esp_timer_get_time();
+    s_save_dirty = false;
+    pet_save();
+}
+
+/* 读档。返回 true = 已破壳过（下次开机直接进宠物，不回蛋）。 */
+static bool pet_load(void)
+{
+    if (!pet_storage_ready()) return false;
+    nvs_handle_t h;
+    if (nvs_open(PS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+
+    ps_hdr_t hdr;
+    size_t sz = sizeof(hdr);
+    bool hatched = false;
+    if (nvs_get_blob(h, PS_KEY_HDR, &hdr, &sz) == ESP_OK &&
+        hdr.magic == PS_MAGIC && hdr.ver == PS_VER &&
+        hdr.pool_size == (uint16_t)WORD_POOL_SIZE) {
+
+        size_t msz = sizeof(s_mem);
+        size_t wsz = sizeof(s_wrong_book);
+        if (nvs_get_blob(h, PS_KEY_MEM, s_mem, &msz) == ESP_OK &&
+            nvs_get_blob(h, PS_KEY_WRONG, s_wrong_book, &wsz) == ESP_OK) {
+
+            s_hatch_clicks = hdr.hatch_clicks;
+            if (hdr.cur_poke < pokemon_gif_count) s_cur_poke_idx = hdr.cur_poke;
+            s_stat.hunger = hdr.hunger;      /* 读回来再夹一次，防旧档越界 */
+            s_stat.happy  = hdr.happy;
+            s_stat.energy = hdr.energy;
+            s_stat.hunger = CLAMP(s_stat.hunger);
+            s_stat.happy  = CLAMP(s_stat.happy);
+            s_stat.energy = CLAMP(s_stat.energy);
+            s_wrong_n = (hdr.wrong_n <= MAX_WRONG) ? (int)hdr.wrong_n : 0;
+            hatched = (hdr.hatched != 0);
+        }
+    }
+    nvs_close(h);
+    return hatched;
+}
 
 /* ============================================================
  *  工具
@@ -576,6 +714,7 @@ static void answer(int option)
     s_stat.energy = CLAMP((int)s_stat.energy - 2);
     build_question();
     render_panel();
+    pet_save_soon();                       /* 掉电保存：答完一题就记一笔（节流 20s） */
 }
 
 /* 闪光淡出回调（一次性，手动 delete） */
@@ -651,6 +790,7 @@ static void do_hatch(void)
         gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data,
                         pokemon_gifs[s_cur_poke_idx].len);
     }
+    pet_save_now();                        /* 破壳是关键节点，立刻落盘 */
 }
 
 static void reset_egg(void)
@@ -680,6 +820,7 @@ static void reset_egg(void)
     if (s_topbar_bg) lv_obj_add_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
     pet_gif_hide(false);
     s_egg = ui_pixel_egg_create(s_scr, EGG_X, EGG_Y);
+    pet_save_now();                        /* 重修=回蛋：学习记录保留，只是宠物重来 */
 }
 
 /* ============================================================
@@ -741,6 +882,7 @@ static void start_sleep(void)
     lv_obj_remove_flag(s_night, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_night);        /* 黑幕压宠物 */
     curtain_start(false);
+    pet_save_soon();                        /* 睡一觉能量 +30，记一下 */
 }
 
 static void start_wake(void)
@@ -789,6 +931,13 @@ static void tick_cb(void *arg)
     if (++s_forget_cnt >= FORGET_SEC) {    /* 遗忘时钟 */
         s_forget_cnt = 0;
         forget_tick();
+        pet_save_soon();                   /* 掉词了，错题本变了，标脏 */
+    }
+
+    /* 兜底落盘：脏数据攒够了就写一次。注意【状态自然衰减不标脏】——
+       每 3 秒掉 1 点体力也要写 flash 的话，一天几千次，flash 会被写穿。 */
+    if (s_save_dirty && (esp_timer_get_time() - s_last_save_us) >= PS_SAVE_GAP_US) {
+        pet_save_soon();
     }
 }
 
@@ -799,19 +948,28 @@ void demo_pet_enter(void)
 {
     LOGI("enter free=%d", (int)esp_get_free_heap_size());
     srand(esp_random());
+    /* 先按"新档"铺默认值，再用 NVS 存档覆盖 —— 有档就接着上次练 */
     s_stat.hunger = 80; s_stat.happy = 80; s_stat.energy = 80;
     s_hatch_clicks = 0;
     s_sleeping = false;
     s_tick_div = 0;
     s_forget_cnt = 0;
-    s_mode = MODE_EGG;
     s_menu = MENU_TRAIN;
     s_opt = 0;
     s_cur_poke_idx = 0;
     s_wrong_n = 0;
     s_atk_alert_blinks = 0;
     s_active = true;
+    s_save_dirty = false;
+    s_last_save_us = esp_timer_get_time();
     memset(s_mem, 0, sizeof(s_mem));
+    memset(s_wrong_book, 0, sizeof(s_wrong_book));
+
+    s_restored = pet_load();               /* 掉电保存：读回学习进度与宠物状态 */
+    s_mode = s_restored ? MODE_HOME : MODE_EGG;
+    LOGI("存档 %s：已学会 %d 词 / 错题 %d 个 / 宠物#%d / 饱%d 乐%d 力%d",
+         s_restored ? "已恢复" : "无(新档)", known_count(), s_wrong_n,
+         s_cur_poke_idx, s_stat.hunger, s_stat.happy, s_stat.energy);
 
     /* 对象清零（防止上次退出残留） */
     s_scr = NULL; s_egg = NULL; s_gif = NULL;
@@ -845,8 +1003,19 @@ void demo_pet_enter(void)
     build_topbar();
     lv_obj_add_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
 
-    s_egg = ui_pixel_egg_create(s_scr, EGG_X, EGG_Y);
-
+    if (s_restored) {
+        /* 有存档：直接回到宠物身边，跳过一次破壳（王总 0911 关机不丢进度） */
+        s_hatch_clicks = 3;
+        s_gif = gif_player_create(s_scr, PET_X, PET_Y, PET_SIZE, PET_SIZE);
+        if (s_gif) {
+            gif_player_set_bob(s_gif, true);
+            gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data,
+                            pokemon_gifs[s_cur_poke_idx].len);
+        }
+        lv_obj_remove_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        s_egg = ui_pixel_egg_create(s_scr, EGG_X, EGG_Y);
+    }
     /* 睡觉黑幕（初始隐藏；Zzz 为子对象，拉幕到位才显示） */
     s_night = lv_obj_create(s_scr);
     lv_obj_remove_flag(s_night, LV_OBJ_FLAG_SCROLLABLE);
@@ -943,6 +1112,7 @@ void demo_pet_enter(void)
 void demo_pet_exit(void)
 {
     LOGI("exit free=%d", (int)esp_get_free_heap_size());
+    pet_save_now();                           /* 离开前把进度落盘（掉电保存） */
     s_active = false;
     s_sleeping = false;
     ui_sound_bgm(false);                      /* 离开宠物页就停背景乐 */
