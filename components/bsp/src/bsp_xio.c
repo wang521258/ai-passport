@@ -1,8 +1,15 @@
 // components/bsp/src/bsp_xio.c
-// AW9523 I/O 扩展器(TCA95xx 兼容寄存器)封装。
+// AW9523 扩展 IO 封装(寄存器映射与 TCA9535 一致,见下方说明)。
 // 负责:板上多路电源使能(VDD_3V3 / VDDA_3V3 / VDD_2V8 / VBAT / ESP_ADC_SEL / PA)
-//       + LCD 背光(P0_8,低有效) + K1/K2 按键输入(P0_0 / P0_1)。
+//       + LCD 背光(pin 8,低有效) + K1/K2 按键输入(pin 0 / pin 1)。
 // 直接复用 bsp_i2c 已建好的 I2C 总线,不引入 esp_io_expander 组件依赖。
+//
+// 【寄存器映射】本板官方板级实现(atk_dnesp32s3_box3)用的是
+// esp_io_expander_tca95xx_16bit 驱动 —— 即 AW9523 在这里按 TCA9535 的寄存器布局访问:
+//     0x00/0x01 输入 P0/P1   0x02/0x03 输出 P0/P1   0x06/0x07 方向 P0/P1(1=输入,0=输出)
+// 之前误按"方向=0x06、模式=0x10/0x11、初值 DIR_P1=0xFF"去初始化:
+//   0xFF 的含义是【P1 全部当输入】→ VDD_3V3_EN/VBAT_EN/VDDA_3V3_EN/VDD_2V8_EN/背光
+//   这些输出脚从来没被驱动过 → 板子缺电 + 黑屏。现按官方驱动逐条对齐。
 //
 // 注意:IDF v5.x 的 I2C 新驱动要求先在总线上"添加设备"得到 dev 句柄,
 //       再以 dev 句柄做收发(旧 API 直接传 bus+地址已失效)。
@@ -16,43 +23,36 @@ static const char *TAG = "bsp_xio";
 static bool                    s_inited;
 static i2c_master_dev_handle_t s_dev;   // AW9523 设备句柄
 
-// AW9523 寄存器(TCA95xx 兼容;16 位方向/输出分两个 8 位端口 P0/P1)
-#define XIO_REG_INPUT_P0   0x00
-#define XIO_REG_INPUT_P1   0x01
-#define XIO_REG_OUTPUT_P0  0x02
-#define XIO_REG_OUTPUT_P1  0x03
-#define XIO_REG_DIR_P0     0x06   // 1 = 输入, 0 = 输出
-#define XIO_REG_DIR_P1     0x07
-#define XIO_REG_MODE_P0    0x10   // 0 = GPIO 模式(非 LED 渐变)
-#define XIO_REG_MODE_P1    0x11
+// AW9523 / TCA9535 兼容寄存器(TCA9535 布局:16 位值 = 低 8 位 P0 + 高 8 位 P1,
+// 连续两个寄存器地址,一次 3 字节写即可同时设置两个端口)。
+#define XIO_REG_INPUT   0x00   // 读 2 字节 → P0, P1
+#define XIO_REG_OUTPUT  0x02   // 写 2 字节 → P0, P1
+#define XIO_REG_DIR     0x06   // 写 2 字节 → P0, P1 (1=输入, 0=输出)
 
-// 先写寄存器指针,再读回数据(单笔 I2C 事务,符合 AW9523 时序)。
-static esp_err_t xio_write(uint8_t reg, uint8_t val) {
-    uint8_t buf[2] = { reg, val };
-    return i2c_master_transmit(s_dev, buf, 2, -1);
-}
-static esp_err_t xio_read(uint8_t reg, uint8_t *val) {
-    return i2c_master_transmit_receive(s_dev, &reg, 1, val, 1, -1);
+// 16 位输出影子寄存器,便于按位改电平而不用重读硬件。
+static uint16_t s_out = 0xFFFF;
+
+static esp_err_t xio_write16(uint8_t reg, uint16_t val) {
+    uint8_t buf[3] = { reg, (uint8_t)(val & 0xFF), (uint8_t)(val >> 8) };
+    return i2c_master_transmit(s_dev, buf, 3, 1000);
 }
 
-static uint8_t s_out_p0 = 0;
-static uint8_t s_out_p1 = 0;
+static esp_err_t xio_read16(uint8_t reg, uint16_t *val) {
+    uint8_t buf[2] = { 0, 0 };
+    esp_err_t e = i2c_master_transmit_receive(s_dev, &reg, 1, buf, 2, 1000);
+    if (e == ESP_OK && val) *val = (uint16_t)(buf[0] | (buf[1] << 8));
+    return e;
+}
 
-static void xio_set_pin(uint8_t pin, uint8_t level) {
-    if (pin < 8) {
-        if (level) s_out_p0 |= (1u << pin); else s_out_p0 &= ~(1u << pin);
-        xio_write(XIO_REG_OUTPUT_P0, s_out_p0);
-    } else {
-        uint8_t p = pin - 8;
-        if (level) s_out_p1 |= (1u << p); else s_out_p1 &= ~(1u << p);
-        xio_write(XIO_REG_OUTPUT_P1, s_out_p1);
-    }
+static esp_err_t xio_set_pin(uint8_t pin, uint8_t level) {
+    if (level) s_out |=  (uint16_t)(1u << pin);
+    else       s_out &= (uint16_t)~(1u << pin);
+    return xio_write16(XIO_REG_OUTPUT, s_out);
 }
 
 esp_err_t bsp_xio_init(void) {
     if (s_inited) return ESP_OK;
 
-    // 确保总线已建(幂等)
     esp_err_t e = bsp_i2c_init();
     if (e != ESP_OK) return e;
     i2c_master_bus_handle_t bus = bsp_i2c_bus();
@@ -61,7 +61,7 @@ esp_err_t bsp_xio_init(void) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    // 在总线上添加 AW9523 设备(7 位地址,100kHz)
+    // 在总线上添加 AW9523 设备(7 位地址,100kHz —— 官方驱动亦为 400k,100k 更稳)
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = BSP_XIO_ADDR,
@@ -72,25 +72,33 @@ esp_err_t bsp_xio_init(void) {
         return e;
     }
 
-    // 先切 GPIO 模式(关 LED 渐变),再设方向、再设输出电平 —— 顺序不能反。
-    if ((e = xio_write(XIO_REG_MODE_P0, 0x00)) != ESP_OK) goto fail;
-    if ((e = xio_write(XIO_REG_MODE_P1, 0x00)) != ESP_OK) goto fail;
-    // 方向:P0_0/P0_1 输入(键),其余输出;P1 全输出。
-    if ((e = xio_write(XIO_REG_DIR_P0, 0x03)) != ESP_OK) goto fail;
-    if ((e = xio_write(XIO_REG_DIR_P1, 0xFF)) != ESP_OK) goto fail;
+    // ---- 与官方 tca95xx_16bit 驱动的 reset() 逐条对齐 ----
+    // 1) 方向先全部置输入(复位默认态),避免方向未定期间误驱动
+    if ((e = xio_write16(XIO_REG_DIR, 0xFFFF)) != ESP_OK) goto fail;
+    // 2) 输出寄存器全高:电源使能为高有效,默认拉高即"上电"
+    s_out = 0xFFFF;
+    if ((e = xio_write16(XIO_REG_OUTPUT, s_out)) != ESP_OK) goto fail;
+    // 3) 方向:P0_0/P0_1(K1/K2 按键)= 输入,其余全部输出
+    if ((e = xio_write16(XIO_REG_DIR, 0x0003)) != ESP_OK) goto fail;
 
-    // 输出初值:全部先清 0,再按需拉高。
-    s_out_p0 = 0; s_out_p1 = 0;
-    xio_set_pin(4, 1);   // P0_4 ESP_ADC_SEL
-    xio_set_pin(5, 1);   // P0_5 音频功放 PA
-    xio_set_pin(8 + 3, 1); // P1_3 VDD_3V3_EN
-    xio_set_pin(8 + 4, 1); // P1_4 VBAT_EN
-    xio_set_pin(8 + 5, 1); // P1_5 VDDA_3V3_EN(音频电源)
-    xio_set_pin(8 + 6, 1); // P1_6 VDD_2V8_EN
-    xio_set_pin(8 + 0, 0); // P1_0 LCD_BL 低有效 → 开背光
+    // 4) 按板级定义落具体电平(与官方 InitializeIoExpander 一致):
+    //    VDD_2V8_EN(14)=1  VDD_3V3_EN(11)=1  ESP_ADC_SEL(4)=1
+    //    VDDA_3V3_EN(13)=1 VBAT_EN(12)=1     PA_CTRL(5)=1    LCD_BL(8)=0(低有效=点亮)
+    if ((e = xio_set_pin(BSP_XIO_BL_PIN, 0)) != ESP_OK) goto fail;   // 背光先灭一下再点
+    if ((e = xio_set_pin(BSP_XIO_ADC_SEL_PIN,  1)) != ESP_OK) goto fail;   // ESP_ADC_SEL
+    if ((e = xio_set_pin(BSP_XIO_PA_PIN,       1)) != ESP_OK) goto fail;   // PA_CTRL 音频功放
+    if ((e = xio_set_pin(BSP_XIO_VDD_3V3_PIN,  1)) != ESP_OK) goto fail;   // VDD_3V3_EN
+    if ((e = xio_set_pin(BSP_XIO_VBAT_PIN,     1)) != ESP_OK) goto fail;   // VBAT_EN
+    if ((e = xio_set_pin(BSP_XIO_VDDA_3V3_PIN, 1)) != ESP_OK) goto fail;   // VDDA_3V3_EN
+    if ((e = xio_set_pin(BSP_XIO_VDD_2V8_PIN,  1)) != ESP_OK) goto fail;   // VDD_2V8_EN
+    if ((e = xio_set_pin(BSP_XIO_BL_PIN, 1)) != ESP_OK) goto fail;   // 背光低有效 → 写 0
+
+    // 5) 回读一次输入寄存器做连通性确认(能读到就说明 I2C 真的通了)
+    uint16_t in = 0;
+    if ((e = xio_read16(XIO_REG_INPUT, &in)) != ESP_OK) goto fail;
 
     s_inited = true;
-    ESP_LOGI(TAG, "AW9523 就绪(背光已开,电源使能已拉高)");
+    ESP_LOGI(TAG, "AW9523 就绪:电源使能已拉高,背光已开,输出=0x%04X,输入=0x%04X", s_out, in);
     return ESP_OK;
 
 fail:
@@ -99,14 +107,16 @@ fail:
     return e;
 }
 
+// 背光为低有效:on=1 → 写 0 点亮
 void bsp_xio_set_bl(uint8_t on) {
     if (!s_inited) return;
-    xio_set_pin(BSP_XIO_BL_PIN, on ? 0 : 1);   // 低有效
+    xio_set_pin(BSP_XIO_BL_PIN, on ? 0 : 1);
 }
 
 bool bsp_xio_get_key(uint8_t xio_pin) {
-    uint8_t v = 0;
-    if (xio_read(XIO_REG_INPUT_P0, &v) != ESP_OK) return false;
+    uint16_t v = 0;
+    if (!s_inited) return false;
+    if (xio_read16(XIO_REG_INPUT, &v) != ESP_OK) return false;
     return (v >> xio_pin) & 1u;
 }
 

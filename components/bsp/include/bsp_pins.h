@@ -59,9 +59,16 @@
 
 // ============================================================================
 // AW9523 扩展 IO(I2C 地址 0x59):管背光 / 功放 / K1-K2 键 / 板上多路电源使能
+// pin 编号按 16 位扩展器的线性编号(0..7 = P0,8..15 = P1),与官方
+// IO_EXPANDER_PIN_NUM_x 一一对应。
 // ============================================================================
 #define BSP_XIO_ADDR         0x59
-#define BSP_XIO_BL_PIN       8       // P0_8 LCD 背光(低有效)
-#define BSP_XIO_PA_PIN       5       // P0_5 音频功放
-#define BSP_XIO_K1_PIN       0       // P0_0
-#define BSP_XIO_K2_PIN       1       // P0_1
+#define BSP_XIO_K1_PIN       0       // pin0  K1        (输入)
+#define BSP_XIO_K2_PIN       1       // pin1  K2        (输入)
+#define BSP_XIO_ADC_SEL_PIN  4       // pin4  ESP_ADC_SEL
+#define BSP_XIO_PA_PIN       5       // pin5  音频功放 PA_CTRL
+#define BSP_XIO_BL_PIN       8       // pin8  LCD 背光(低有效)
+#define BSP_XIO_VDD_3V3_PIN  11      // pin11 VDD_3V3_EN
+#define BSP_XIO_VBAT_PIN     12      // pin12 VBAT_EN
+#define BSP_XIO_VDDA_3V3_PIN 13      // pin13 VDDA_3V3_EN(音频模拟电源)
+#define BSP_XIO_VDD_2V8_PIN  14      // pin14 VDD_2V8_EN
