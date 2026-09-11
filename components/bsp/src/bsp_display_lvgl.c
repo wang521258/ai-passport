@@ -25,17 +25,17 @@ lv_display_t *bsp_lvgl_init(void) {
     const lvgl_port_display_cfg_t dc = {
         .panel_handle = bsp_display_panel(),
         .io_handle    = bsp_display_io(),
-        // ⚠ C3 无 PSRAM,DMA 只能用内部 RAM(总共约 150KB)。
-        // 20 行单缓冲 ≈ 9.6KB;若改成 40 行双缓冲(≈37.5KB)会把 I2S 等外设的
-        // DMA 描述符挤到 NO_MEM。刷新略慢但稳。
-        .buffer_size   = (uint32_t)BSP_LCD_W * 20,
-        .double_buffer = false,
+        // S3 有 8MB octal PSRAM:用 40 行双缓冲放 PSRAM,刷新快且稳。
+        .buffer_size   = (uint32_t)BSP_LCD_W * 40,
+        .double_buffer = true,
         .hres = BSP_LCD_W, .vres = BSP_LCD_H,
         // 旋转/镜像必须在这里配:esp_lvgl_port 注册显示时会重新下发 MADCTL,
         // 覆盖 bsp_display.c 里 esp_lcd_panel_mirror() 的设置。
+        // box3 物理玻璃是 240x320 竖屏,宠物 UI 也是 240x320 竖屏设计 → 不旋转不镜像。
+        // (若真机上画面上下颠倒/左右镜像,改这里 mirror_x/mirror_y 即可,一行的事。)
         .rotation = { .swap_xy = false, .mirror_x = false, .mirror_y = false },
         // swap_bytes:LVGL 输出小端 RGB565,ST7789 走 SPI 要大端 → 需交换高低字节。
-        .flags = { .buff_dma = true, .swap_bytes = true },
+        .flags = { .buff_spiram = true, .swap_bytes = true },
     };
     s_disp = lvgl_port_add_disp(&dc);
     if (!s_disp) { ESP_LOGE(TAG, "lvgl_port_add_disp 失败"); return NULL; }

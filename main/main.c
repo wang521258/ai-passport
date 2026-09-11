@@ -114,6 +114,13 @@ void app_main(void) {
     bsp_i2c_init();
     bsp_i2c_scan();
 
+    // AW9523 扩展 IO:拉高板上多路电源使能(VDD_3V3/VDDA_3V3/VDD_2V8/VBAT/ADC_SEL/PA)
+    // 并点亮背光。必须在显示/音频初始化之前完成,否则板子没电或黑屏。
+    if (bsp_xio_init() != ESP_OK) {
+        ESP_LOGE(TAG, "AW9523 初始化失败 —— 屏将黑屏。检查 I2C(SDA=GPIO%d SCL=GPIO%d, addr 0x%02X)与供电",
+                 BSP_I2C_SDA, BSP_I2C_SCL, BSP_XIO_ADDR);
+    }
+
     // 屏幕是本 demo 的 UI 载体,失败就没有菜单可言 —— 打清楚日志后退出,
     // 不做"串口菜单"降级(那会让本文件复杂一倍,违背参考示例的初衷)。
     if (bsp_display_init() != ESP_OK || !bsp_lvgl_init()) {
@@ -132,7 +139,7 @@ void app_main(void) {
     s_ok[4] = true;                                    // 页面内按需初始化并显示错误
     s_ok[5] = true;
     s_ok[6] = true;
-    s_ok[7] = true;                                    // 宝可梦玩法无需外设前置条件,直接可用
+    s_ok[7] = true;                                    /* Pet：纯软件 demo */
 
     if (bsp_lvgl_lock(1000)) { enter_menu(); bsp_lvgl_unlock(); }
 

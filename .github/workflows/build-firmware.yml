@@ -30,11 +30,11 @@ jobs:
             ccache-${{ github.ref_type }}-${{ github.ref_name }}-
             ccache-
 
-      - name: Build firmware (ESP-IDF 5.5.3 / esp32c3)
+      - name: Build firmware (ESP-IDF 5.5.3 / esp32s3)
         uses: espressif/esp-idf-ci-action@9d38657f3d789ca759b2b37aaf5ceffbc42c4f0d # v1
         with:
           esp_idf_version: v5.5.3
-          target: esp32c3
+          target: esp32s3
           extra_docker_args: >-
             -e CCACHE_DIR=/app/${{ github.repository }}/.ccache
             -e IDF_CCACHE_ENABLE=1

@@ -3,7 +3,7 @@
 #include "bsp_display.h"
 #include "bsp_pins.h"
 #include "driver/spi_master.h"
-#include "driver/ledc.h"
+#include "bsp_xio.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
@@ -15,7 +15,6 @@ static const char *TAG = "bsp_disp";
 
 static esp_lcd_panel_handle_t    s_panel;
 static esp_lcd_panel_io_handle_t s_io;
-static bool                      s_bl_ready;
 
 // ---------------------------------------------------------------------------
 // ST7789P3 厂商专属初始化序列(porch / power / gamma)。
@@ -54,30 +53,11 @@ static const st_init_cmd_t ST7789P3_CMDS[] = {
 };
 
 static void backlight_init(void) {
-    if (BSP_LCD_BL < 0) { ESP_LOGW(TAG, "背光引脚未接 MCU,亮度不可调"); return; }
-    ledc_timer_config_t t = {
-        .speed_mode      = BSP_BL_LEDC_MODE,
-        .timer_num       = BSP_BL_LEDC_TIMER,
-        .duty_resolution = BSP_BL_LEDC_RES,
-        .freq_hz         = BSP_BL_LEDC_FREQ_HZ,
-        .clk_cfg         = LEDC_AUTO_CLK,
-    };
-    esp_err_t e = ledc_timer_config(&t);
-    if (e != ESP_OK) { ESP_LOGE(TAG, "ledc_timer_config 失败: %s", esp_err_to_name(e)); return; }
-
-    ledc_channel_config_t ch = {
-        .gpio_num   = BSP_LCD_BL,
-        .speed_mode = BSP_BL_LEDC_MODE,
-        .channel    = BSP_BL_LEDC_CHANNEL,
-        .timer_sel  = BSP_BL_LEDC_TIMER,
-        .duty       = 0,
-        .hpoint     = 0,
-    };
-    e = ledc_channel_config(&ch);
-    if (e != ESP_OK) { ESP_LOGE(TAG, "ledc_channel_config 失败: %s", esp_err_to_name(e)); return; }
-
-    s_bl_ready = true;
-    ESP_LOGI(TAG, "背光 LEDC 就绪 gpio=%d", BSP_LCD_BL);
+    // box3 背光走 AW9523 扩展 IO(P0_8,低有效),不接 MCU LEDC。
+    // bsp_xio_init() 已在 main.c 调过(拉高电源使能 + 点亮背光);这里只确保背光为开。
+    // 若 AW9523 初始化失败,此处背光打不开 → 黑屏,日志会报 "AW9523 初始化失败",据此排查。
+    bsp_xio_set_bl(1);
+    ESP_LOGI(TAG, "背光由 AW9523 P0_8 控制(低有效)");
 }
 
 esp_err_t bsp_display_init(void) {
@@ -140,10 +120,6 @@ esp_lcd_panel_handle_t bsp_display_panel(void) { return s_panel; }
 esp_lcd_panel_io_handle_t bsp_display_io(void) { return s_io; }
 
 void bsp_display_backlight(uint8_t percent) {
-    if (!s_bl_ready) return;
-    if (percent > 100) percent = 100;
-    uint32_t max_duty = (1u << BSP_BL_LEDC_RES) - 1u;
-    uint32_t duty = (max_duty * percent) / 100u;
-    ledc_set_duty(BSP_BL_LEDC_MODE, BSP_BL_LEDC_CHANNEL, duty);
-    ledc_update_duty(BSP_BL_LEDC_MODE, BSP_BL_LEDC_CHANNEL);
+    // box3 背光只有开/关(低有效),无亮度调节。percent>0 即点亮。
+    bsp_xio_set_bl(percent > 0 ? 1 : 0);
 }

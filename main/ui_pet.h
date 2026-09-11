@@ -1,27 +1,13 @@
 /**
  * @file ui_pet.h
- * @brief 像素画风格电子宠物接口
+ * @brief 像素画风宠物 UI：圆滚滚宠物 + 像素风精灵蛋
  */
 #pragma once
 #include "lvgl.h"
 
-/**
- * @brief 创建像素画宠物（圆滚滚粉色）
- * @param parent 父对象
- * @param x 左上角 X
- * @param y 左上角 Y
- * @return 宠物对象指针
- */
+/* ---------- 像素宠物（粉色圆滚滚，替代品，未实际使用但保留接口） ---------- */
 lv_obj_t *ui_pixel_pet_create(lv_obj_t *parent, int x, int y);
-
-/**
- * @brief 宠物跳跃动画
- */
 void ui_pixel_pet_jump(lv_obj_t *pet);
-
-/**
- * @brief 表情枚举
- */
 typedef enum {
     PET_FACE_NORMAL = 0,
     PET_FACE_HAPPY,
@@ -30,13 +16,27 @@ typedef enum {
     PET_FACE_HUNGRY,
     PET_FACE_ANGRY,
 } pet_face_t;
-
-/**
- * @brief 设置宠物表情
- */
 void ui_pixel_pet_set_face(lv_obj_t *pet, pet_face_t face);
 
-/* ---------- 精灵球 ---------- */
-lv_obj_t *ui_pixel_ball_create(lv_obj_t *parent, int x, int y);
-void ui_pixel_ball_shake(lv_obj_t *ball, int level);  /* level: 1~3 */
-void ui_pixel_ball_open(lv_obj_t *ball);               /* 爆开并自删 */
+/* ---------- 精灵蛋（宝可梦风，米白椭圆 + 绿色斑点 + 描边） ----------
+ * 实现方式：lv_canvas 72×90，RGB565 逐像素填色。
+ * 蛋大小：72×90（比原来的 24×24 精灵球大 2.7×，好看很多） */
+#define EGG_W 72
+#define EGG_H 90
+
+/**
+ * @brief 创建像素风精灵蛋
+ * @return lv_canvas 对象（按 x,y 摆放, 不占用父对象布局）
+ */
+lv_obj_t *ui_pixel_egg_create(lv_obj_t *parent, int x, int y);
+
+/**
+ * @brief 摇晃动画（破壳点击时调用）
+ * @param level 1~3，摇晃幅度递增
+ */
+void ui_pixel_egg_shake(lv_obj_t *egg, int level);
+
+/**
+ * @brief 销毁蛋对象（破壳后调用）
+ */
+void ui_pixel_egg_destroy(lv_obj_t *egg);

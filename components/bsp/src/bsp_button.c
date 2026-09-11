@@ -1,33 +1,19 @@
 // components/bsp/src/bsp_button.c
-// 移植自 trae_card/components/platform/platform_esp32/src/btn_iot_button.c
+// 正点原子 DN-ESP32-S3-BOX3 三键:BOOT(GPIO0 直连) + K1/K2(经 AW9523 扩展 IO)。
+// 映射 BOOT→OK、K1→UP、K2→DOWN,宠物/菜单逻辑零改动。
 #include "bsp_button.h"
 #include "bsp_pins.h"
+#include "bsp_xio.h"
 #include "iot_button.h"
-#include "button_adc.h"
-#include "esp_adc/adc_oneshot.h"
-#include "esp_adc/adc_cali.h"
-#include "esp_adc/adc_cali_scheme.h"
 #include "esp_log.h"
 
 static const char *TAG = "bsp_btn";
-
-static const uint16_t BTN_MV[BSP_BTN_COUNT][2] = BSP_BTN_MV_TABLE;
 
 static button_handle_t s_btn[BSP_BTN_COUNT];
 static bsp_btn_cb_t    s_cb;
 static void           *s_user;
 
-// ADC1 是 unit 级独占资源:iot_button 与 bsp_button_read_mv() 必须共用同一个 oneshot
-// 句柄。谁第二个调 adc_oneshot_new_unit() 谁就拿到 "adc1 is already in use"。
-static adc_oneshot_unit_handle_t s_adc;
-static adc_cali_handle_t         s_cali;
-
-// 电压读取的衰减档必须与 button 组件内部的 ADC_BUTTON_ATTEN 一致 —— 通道只被配置一次
-// (由组件在 iot_button_new_adc_device() 里下发),两边对不上会让读数与按键阈值错位。
-// managed_components/espressif__button/button_adc.c:26 在 C3 上取 ADC_ATTEN_DB_6+1。
-#define BSP_BTN_ATTEN  ADC_ATTEN_DB_12       // 量程约 0~3100mV,覆盖松开态
-
-// 每个按键把"哪个键"随回调带回来。button 组件的回调签名固定,故用 usr_data 传索引。
+// 按键回调运行在 button 组件的任务里;用 usr_data 传"哪个键"(bsp_btn_t)。
 static void on_event(void *arg, void *usr_data, bsp_btn_ev_t ev) {
     (void)arg;
     if (!s_cb) return;
@@ -38,66 +24,65 @@ static void cb_click (void *a, void *u) { on_event(a, u, BSP_BTN_CLICK);  }
 static void cb_double(void *a, void *u) { on_event(a, u, BSP_BTN_DOUBLE); }
 static void cb_long  (void *a, void *u) { on_event(a, u, BSP_BTN_LONG);   }
 
+// K1/K2 经 AW9523,均为低有效(按下=0),与 BOOT 键一致。
+// 若真机上某键"按了没反应/松了才触发",说明该键实际高有效 —— 把对应
+// 那行的 "? 1 : 0" 翻成 "? 0 : 1" 即可(一行极性翻转)。
+static uint8_t k1_get_key_level(button_driver_t *drv) {
+    (void)drv; return bsp_xio_get_key(BSP_BTN_K1_XIO) ? 1 : 0;
+}
+static uint8_t k2_get_key_level(button_driver_t *drv) {
+    (void)drv; return bsp_xio_get_key(BSP_BTN_K2_XIO) ? 1 : 0;
+}
+
+static void reg(bsp_btn_t btn) {
+    iot_button_register_cb(s_btn[btn], BUTTON_PRESS_DOWN,      NULL, cb_press, (void *)(intptr_t)btn);
+    iot_button_register_cb(s_btn[btn], BUTTON_SINGLE_CLICK,    NULL, cb_click, (void *)(intptr_t)btn);
+    iot_button_register_cb(s_btn[btn], BUTTON_DOUBLE_CLICK,    NULL, cb_double, (void *)(intptr_t)btn);
+    iot_button_register_cb(s_btn[btn], BUTTON_LONG_PRESS_START,NULL, cb_long,  (void *)(intptr_t)btn);
+}
+
 esp_err_t bsp_button_init(bsp_btn_cb_t cb, void *user) {
     s_cb = cb; s_user = user;
 
-    // 先由 BSP 建 unit,再把句柄交给 button 组件(button_adc.h:adc_handle 非 NULL 即复用),
-    // 这样本文件的 bsp_button_read_mv() 也能读同一路 ADC。
-    const adc_oneshot_unit_init_cfg_t ucfg = { .unit_id = BSP_BTN_ADC_UNIT };
-    esp_err_t ae = adc_oneshot_new_unit(&ucfg, &s_adc);
-    if (ae != ESP_OK) {
-        ESP_LOGE(TAG, "ADC unit 创建失败 (%s)", esp_err_to_name(ae));
-        s_adc = NULL;
-        return ae;
-    }
+    esp_err_t e;
 
-    for (int i = 0; i < BSP_BTN_COUNT; i++) {
-        const button_adc_config_t ac = {
-            .adc_handle   = &s_adc,          // 复用上面这一个,别让组件自建
-            .unit_id      = BSP_BTN_ADC_UNIT,
-            .adc_channel  = BSP_BTN_ADC_CHANNEL,
-            .button_index = i,
-            .min          = BTN_MV[i][0],
-            .max          = BTN_MV[i][1],
-        };
-        const button_config_t bc = { 0 };
-        esp_err_t e = iot_button_new_adc_device(&bc, &ac, &s_btn[i]);
-        if (e != ESP_OK || !s_btn[i]) {
-            ESP_LOGE(TAG, "按键 %d 创建失败 (%s) —— 检查 GPIO%d 的 ADC 配置与分压电阻",
-                     i, esp_err_to_name(e), BSP_BTN_ADC_CHANNEL);
-            return e == ESP_OK ? ESP_FAIL : e;
-        }
-        void *idx = (void *)(intptr_t)i;
-        iot_button_register_cb(s_btn[i], BUTTON_PRESS_DOWN,      NULL, cb_press,  idx);
-        iot_button_register_cb(s_btn[i], BUTTON_SINGLE_CLICK,    NULL, cb_click,  idx);
-        iot_button_register_cb(s_btn[i], BUTTON_DOUBLE_CLICK,    NULL, cb_double, idx);
-        iot_button_register_cb(s_btn[i], BUTTON_LONG_PRESS_START,NULL, cb_long,   idx);
-    }
-
-    // 通道已由组件配置好,这里只补一份校准句柄给 bsp_button_read_mv() 用。
-    // 失败不致命:按键照常工作,只是读不出电压(标定分压电阻时才需要)。
-    const adc_cali_curve_fitting_config_t cal = {
-        .unit_id  = BSP_BTN_ADC_UNIT,
-        .chan     = BSP_BTN_ADC_CHANNEL,
-        .atten    = BSP_BTN_ATTEN,
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    // BOOT → OK(低有效,直连 GPIO0)
+    button_gpio_config_t boot_cfg = {
+        .gpio_num = BSP_BTN_BOOT_GPIO,
+        .active_level = 0,
+        .enable_power_save = false,
+        .disable_pull = false,
     };
-    if (adc_cali_create_scheme_curve_fitting(&cal, &s_cali) != ESP_OK) {
-        ESP_LOGW(TAG, "ADC 校准创建失败,Button 页将无法显示电压");
-        s_cali = NULL;
+    if ((e = iot_button_new_gpio_device(&(button_config_t){0}, &boot_cfg, &s_btn[BSP_BTN_OK])) != ESP_OK) {
+        ESP_LOGE(TAG, "BOOT 键创建失败 (%s)", esp_err_to_name(e));
+        return e;
     }
 
-    ESP_LOGI(TAG, "按键就绪:ADC1_CH%d 三键分压", BSP_BTN_ADC_CHANNEL);
+    // K1 → UP(自定义 driver 读 AW9523)
+    button_driver_t *k1_drv = calloc(1, sizeof(button_driver_t));
+    k1_drv->enable_power_save = false;
+    k1_drv->get_key_level = k1_get_key_level;
+    if ((e = iot_button_create(&(button_config_t){0}, k1_drv, &s_btn[BSP_BTN_UP])) != ESP_OK) {
+        ESP_LOGE(TAG, "K1 键创建失败 (%s)", esp_err_to_name(e));
+        return e;
+    }
+
+    // K2 → DOWN
+    button_driver_t *k2_drv = calloc(1, sizeof(button_driver_t));
+    k2_drv->enable_power_save = false;
+    k2_drv->get_key_level = k2_get_key_level;
+    if ((e = iot_button_create(&(button_config_t){0}, k2_drv, &s_btn[BSP_BTN_DOWN])) != ESP_OK) {
+        ESP_LOGE(TAG, "K2 键创建失败 (%s)", esp_err_to_name(e));
+        return e;
+    }
+
+    reg(BSP_BTN_OK);
+    reg(BSP_BTN_UP);
+    reg(BSP_BTN_DOWN);
+
+    ESP_LOGI(TAG, "按键就绪:BOOT(OK) + K1(UP) + K2(DOWN)");
     return ESP_OK;
 }
 
-int bsp_button_read_mv(void) {
-    // 读的是 bsp_button_init() 建好、并与 iot_button 共用的那一路 ADC。
-    // 单次采样与组件的按键轮询互不干扰(oneshot 内部自带锁)。
-    if (!s_adc || !s_cali) return -1;
-
-    int raw = 0, mv = 0;
-    if (adc_oneshot_read(s_adc, BSP_BTN_ADC_CHANNEL, &raw) != ESP_OK) return -1;
-    if (adc_cali_raw_to_voltage(s_cali, raw, &mv) != ESP_OK) return -1;
-    return mv;
-}
+// box3 无 ADC 分压键,保留接口返回 -1(demo 的电压显示页会用,宠物页不用)。
+int bsp_button_read_mv(void) { return -1; }

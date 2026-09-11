@@ -1,19 +1,30 @@
 # --- 目标芯片 ---
-CONFIG_IDF_TARGET="esp32c3"
-# 注:ESP32-C3 无 PSRAM,故不设 CONFIG_SPIRAM。
+CONFIG_IDF_TARGET="esp32s3"
+# 正点原子 DN-ESP32-S3-BOX3:ESP32-S3,octal PSRAM 8MB / 80MHz,Flash 8MB QIO。
+
+# --- PSRAM(octal) ---
+# S3 板载 8MB octal PSRAM @ 80MHz(板子启动日志实测)。不开 PSRAM 大缓冲/LVGL 会崩。
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_TYPE_OCT=y
+CONFIG_SPIRAM_TYPE="oct"
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_OCTAL_PSRAM_FIXED_SIZE=y
+CONFIG_SPIRAM_OCTAL_PSRAM_80M_SPEED=y
 
 # --- Flash ---
 # FoloToy AI Passport 当前产品/固件基线使用 8MB Flash。
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
-# 固定 8MB 镜像头，关闭 detect，便于 idf.py merge-bin。
+# 固定 8MB 镜像头,关闭 detect,便于 idf.py merge-bin。
 CONFIG_ESPTOOLPY_HEADER_FLASHSIZE_UPDATE=n
+# box3 Flash 为 QIO(板子启动日志实测 "flash 8MB QIO")。
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 # 3 MB 应用上限与小程序 BLE Recovery 安装器保持一致。分区表
-# 还固定保留 cardid@0x356000 与 recovery@0x700000，二创不得改动。
+# 还固定保留 cardid@0x356000 与 recovery@0x700000,二创不得改动。
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 
-# 开机持续按住上键（GPIO0）5 秒，由自定义 bootloader 跳转到工厂
+# 开机持续按住上键(BOOT/GPIO0)5 秒,由自定义 bootloader 跳转到工厂
 # 预装的 0x700000 Recovery。这些选项为 bootloader 提供长按检测配置。
 CONFIG_BOOTLOADER_FACTORY_RESET=y
 CONFIG_BOOTLOADER_NUM_PIN_FACTORY_RESET=0
@@ -22,14 +33,11 @@ CONFIG_BOOTLOADER_OTA_DATA_ERASE=y
 CONFIG_BOOTLOADER_DATA_FACTORY_RESET=""
 CONFIG_BOOTLOADER_HOLD_TIME_GPIO=5
 
-# --- 控制台:UART0 ---
-# 【本版本专供 QEMU/WASM 模拟器验证】QEMU 不支持 USB-Serial-JTAG,必须用 UART0 才能启动。
-# 注意:官方默认用 USB-Serial-JTAG,原因是"UART0 默认 TX=GPIO21 与本板背光引脚冲突"。
-# 因此本配置编出的固件仅用于模拟器验证玩法;刷真机前需改回 JTAG 再编一版。
+# --- 控制台:UART0 默认引脚(GPIO43/44)→ 板载 CH343/COM3 ---
+# 真机用 USB-UART(CH343)看日志,走 UART0 默认引脚即可
+# (QEMU 那版改 GPIO21/20 仅用于模拟器,刷真机必须改回默认)。
 CONFIG_ESP_CONSOLE_UART=y
-CONFIG_ESP_CONSOLE_UART_CUSTOM=y
-CONFIG_ESP_CONSOLE_UART_TX_GPIO=21
-CONFIG_ESP_CONSOLE_UART_RX_GPIO=20
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
 # --- 调试:崩溃时打印调用栈再重启,便于定位问题 ---
@@ -40,17 +48,17 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LV_COLOR_DEPTH_16=y
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
-# LVGL 内置 malloc 池大小(KB)。它是独立静态区、不与系统堆共享,配大了会白白占用 RAM。
-# 宠物页 65+ LVGL 对象 + canvas + 状态条 + 训练面板,24KB 装不下(s_namelabel 等返回 NULL
-# 导致后续 lv_label_set_text 写入 0x0 段错误)。提到 48KB 后动态堆从 81KB 降到约 57KB,
-# 仍够 GIFIMAGE 9KB + canvas buf 8KB 的一次性分配。Petit page 主菜单等其他 demo 也更稳。
+# cn_16 子集字库由 lv_font_conv 生成,glyph 位图是 RLE 压缩格式(bitmap_format=1)。
+# 此开关必须打开,否则中文全部不显示。
+CONFIG_LV_USE_FONT_COMPRESSED=y
+# LVGL 内置 malloc 池(KB)。宠物页 65+ 对象 + canvas + 面板,提到 48KB 才稳。
 CONFIG_LV_MEM_SIZE_KILOBYTES=48
 
 # --- 系统 ---
 CONFIG_FREERTOS_HZ=1000
 
 # --- Bluetooth LE / NimBLE ---
-# ESP32-C3 仅支持 BLE；示例只启用单连接 peripheral 所需的最小 host 配置。
+# ESP32-S3 支持 BLE;示例只启用单连接 peripheral 所需的最小 host 配置。
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=n

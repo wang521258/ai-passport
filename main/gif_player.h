@@ -10,6 +10,8 @@
 #define GIF_PLAYER_H
 
 #include "lvgl.h"
+#include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,6 +50,30 @@ void gif_player_stop(lv_obj_t *canvas);
  * 不释放会一直占着 ESP32-C3 本就紧张的动态堆。
  */
 void gif_player_destroy(void);
+
+/**
+ * @brief 注册"背景取色"回调，消除 canvas 的白底方块
+ *
+ * LVGL 的 RGB565 canvas 没有 alpha 通道，清空画布只能填一个纯色，
+ * 于是宠物周围会出现一块和场景不符的白色方块。
+ * 注册该回调后，播放器每帧按画布的屏幕绝对坐标逐像素取场景背景色
+ * 填充，宠物就像直接站在背景上，方块消失。
+ * @param fn 入参为屏幕绝对坐标 (x, y)，返回 RGB565 颜色
+ */
+void gif_player_set_bg_fn(uint16_t (*fn)(int x, int y));
+
+/**
+ * @brief 开启/关闭宠物上下轻微浮动（呼吸感）
+ *
+ * 浮动在解码绘制阶段给整只宠物加纵向偏移，背景不动，
+ * 幅度 2px、8 帧一个周期，与 GIF 帧率同步，不额外占内存。
+ */
+void gif_player_set_bob(lv_obj_t *canvas, bool enable);
+
+/**
+ * @brief 移动画布（同时更新背景取色的坐标基准）
+ */
+void gif_player_set_pos(lv_obj_t *canvas, int x, int y);
 
 #ifdef __cplusplus
 }
