@@ -3,13 +3,14 @@ CONFIG_IDF_TARGET="esp32s3"
 # 正点原子 DN-ESP32-S3-BOX3:ESP32-S3,octal PSRAM 8MB / 80MHz,Flash 8MB QIO。
 
 # --- PSRAM(octal) ---
-# S3 板载 8MB octal PSRAM @ 80MHz(板子启动日志实测)。不开 PSRAM 大缓冲/LVGL 会崩。
+# S3 板载 8MB octal PSRAM @ 80MHz。
+# 注意:必须显式开 CONFIG_SPIRAM_MODE_OCT,否则 IDF 默认按 QUAD 初始化,
+# 会报 "quad_psram: PSRAM chip is not connected, or wrong PSRAM line mode"
+# 并 abort 无限重启(真机实测)。旧写法 CONFIG_SPIRAM_TYPE_OCT 在 IDF v5.5 无效,已废弃。
 CONFIG_SPIRAM=y
-CONFIG_SPIRAM_TYPE_OCT=y
-CONFIG_SPIRAM_TYPE="oct"
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_ESPPSRAM64=y
 CONFIG_SPIRAM_SPEED_80M=y
-CONFIG_SPIRAM_OCTAL_PSRAM_FIXED_SIZE=y
-CONFIG_SPIRAM_OCTAL_PSRAM_80M_SPEED=y
 
 # --- Flash ---
 # FoloToy AI Passport 当前产品/固件基线使用 8MB Flash。

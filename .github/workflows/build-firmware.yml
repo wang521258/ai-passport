@@ -64,7 +64,7 @@ jobs:
           git config user.name  "ci-bot"
           git add -f build/FoloToy-AI-Passport-full.bin
           git commit -m "ci firmware bin $REF" || echo "nothing to commit"
-          git push "https://x-access-token:${TOK}@github.com/wang521258/ai-passport.git" HEAD:ci-bin
+          git push "https://x-access-token:${TOK}@github.com/wang521258/ai-passport.git" HEAD:refs/heads/ci-bin
 
   release:
     if: github.ref_type == 'tag'
