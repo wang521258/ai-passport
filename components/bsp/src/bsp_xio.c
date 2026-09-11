@@ -3,6 +3,9 @@
 // 负责:板上多路电源使能(VDD_3V3 / VDDA_3V3 / VDD_2V8 / VBAT / ESP_ADC_SEL / PA)
 //       + LCD 背光(P0_8,低有效) + K1/K2 按键输入(P0_0 / P0_1)。
 // 直接复用 bsp_i2c 已建好的 I2C 总线,不引入 esp_io_expander 组件依赖。
+//
+// 注意:IDF v5.x 的 I2C 新驱动要求先在总线上"添加设备"得到 dev 句柄,
+//       再以 dev 句柄做收发(旧 API 直接传 bus+地址已失效)。
 #include "bsp_xio.h"
 #include "bsp_i2c.h"
 #include "bsp_pins.h"
@@ -10,7 +13,8 @@
 #include "esp_log.h"
 
 static const char *TAG = "bsp_xio";
-static bool s_inited;
+static bool                    s_inited;
+static i2c_master_dev_handle_t s_dev;   // AW9523 设备句柄
 
 // AW9523 寄存器(TCA95xx 兼容;16 位方向/输出分两个 8 位端口 P0/P1)
 #define XIO_REG_INPUT_P0   0x00
@@ -22,12 +26,13 @@ static bool s_inited;
 #define XIO_REG_MODE_P0    0x10   // 0 = GPIO 模式(非 LED 渐变)
 #define XIO_REG_MODE_P1    0x11
 
+// 先写寄存器指针,再读回数据(单笔 I2C 事务,符合 AW9523 时序)。
 static esp_err_t xio_write(uint8_t reg, uint8_t val) {
     uint8_t buf[2] = { reg, val };
-    return i2c_master_transmit(bsp_i2c_bus(), BSP_XIO_ADDR, buf, 2, 50);
+    return i2c_master_transmit(s_dev, buf, 2, -1);
 }
 static esp_err_t xio_read(uint8_t reg, uint8_t *val) {
-    return i2c_master_receive(bsp_i2c_bus(), BSP_XIO_ADDR, val, 1, 50);
+    return i2c_master_transmit_receive(s_dev, &reg, 1, val, 1, -1);
 }
 
 static uint8_t s_out_p0 = 0;
@@ -46,12 +51,27 @@ static void xio_set_pin(uint8_t pin, uint8_t level) {
 
 esp_err_t bsp_xio_init(void) {
     if (s_inited) return ESP_OK;
-    if (!bsp_i2c_bus()) {
-        ESP_LOGE(TAG, "请先成功调用 bsp_i2c_init()");
+
+    // 确保总线已建(幂等)
+    esp_err_t e = bsp_i2c_init();
+    if (e != ESP_OK) return e;
+    i2c_master_bus_handle_t bus = bsp_i2c_bus();
+    if (!bus) {
+        ESP_LOGE(TAG, "I2C 总线为空");
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_err_t e;
+    // 在总线上添加 AW9523 设备(7 位地址,100kHz)
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = BSP_XIO_ADDR,
+        .scl_speed_hz    = 100000,
+    };
+    if ((e = i2c_master_bus_add_device(bus, &dev_cfg, &s_dev)) != ESP_OK) {
+        ESP_LOGE(TAG, "AW9523 设备添加失败 (%s)", esp_err_to_name(e));
+        return e;
+    }
+
     // 先切 GPIO 模式(关 LED 渐变),再设方向、再设输出电平 —— 顺序不能反。
     if ((e = xio_write(XIO_REG_MODE_P0, 0x00)) != ESP_OK) goto fail;
     if ((e = xio_write(XIO_REG_MODE_P1, 0x00)) != ESP_OK) goto fail;
