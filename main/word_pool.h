@@ -547,7 +547,7 @@ static const word_entry_t word_pool[] = {
     {"fork", "餐叉", "fɔːk", 3},
     {"knife", "刀", "naɪf", 3},
     {"spoon", "汤匙", "spuːn", 3},
-    {"dinner", "正餐", "'dɪnə", 3},
+    {"dinner", "晚餐；正餐", "'dɪnə", 3},
     {"ready", "准备好", "'redɪ", 3},
     {"help yourself", "请自便", "", 3},
     {"pass", "传递；通过", "pɑːs", 3},
