@@ -22,6 +22,7 @@
 #include "ui_pixel.h"
 #include "ui_pet.h"
 #include "gif_player.h"
+#include "ui_sound.h"
 #include "pokemon_sprites.h"
 #include "word_pool.h"
 #include "lvgl.h"
@@ -32,10 +33,11 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* 中文字库：由 tools/gen_font.py 从系统字体子集化生成（1142 汉字 + ASCII，约 88KB）。
-   LVGL 9.5 已移除 lv_font_simsun_16_cjk，内置的思源黑体子集又只含 1187 个 CJK 字符
-   （本项目要 1142 汉字，实测缺 722 个），所以自己生成一份 100% 覆盖的。 */
-extern lv_font_t cn_16;
+/* 中文字库：由 gen_cn_font.py 生成（微软雅黑粗体 18px 子集，1334 字，约 1.1MB）。
+   选它是因为实测笔画覆盖率 44.6%，明显粗于黑体(29.0%)/等线粗体(33.7%)。
+   改字号/换字体只需重跑 gen_cn_font.py，并同步这里的符号名。 */
+extern lv_font_t cn_18;
+#define CN_FONT (&cn_18)
 
 #define TAG "PET"
 #define LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
@@ -180,7 +182,7 @@ static void build_topbar(void)
 
         lv_obj_t *lb = lv_label_create(b);
         lv_label_set_text(lb, LBL[i]);
-        lv_obj_set_style_text_font(lb, &cn_16, 0);
+        lv_obj_set_style_text_font(lb, CN_FONT, 0);
         lv_obj_set_style_text_color(lb, lv_color_hex(0xECEFF1), 0);
         lv_obj_center(lb);
         s_menu_btns[i] = b;
@@ -202,9 +204,10 @@ static void build_topbar(void)
 
     lv_obj_t *ic = lv_label_create(s_atkbox);
     lv_label_set_text(ic, "攻");
-    lv_obj_set_style_text_font(ic, &cn_16, 0);
+    lv_obj_set_style_text_font(ic, CN_FONT, 0);
     lv_obj_set_style_text_color(ic, lv_color_hex(C_ATK), 0);
-    lv_obj_set_pos(ic, 2, 4);
+    /* 18px 字行高约 22~24px,框高 26 → y 取 1 才不会把底部笔画切掉 */
+    lv_obj_set_pos(ic, 2, 1);
 
     s_atk_num = lv_label_create(s_atkbox);
     lv_label_set_text(s_atk_num, "0");
@@ -269,7 +272,7 @@ static void render_panel(void)
     /* 题干：e2c 显英文 / c2e 显中文；音标不显示（Montserrat 无 IPA 字形会出方块） */
     lv_label_set_text(s_p_word, s_qDir ? word_pool[s_qWord].cn : word_pool[s_qWord].en);
     lv_obj_set_style_text_font(s_p_word,
-        s_qDir ? &cn_16 : &lv_font_montserrat_20, 0);
+        s_qDir ? CN_FONT : &lv_font_montserrat_20, 0);
     /* 中文题干最长 11 字（"舞者，舞蹈演员，舞蹈家"），16px CJK 在 240 宽内可一行放下 */
     lv_label_set_long_mode(s_p_word, LV_LABEL_LONG_WRAP);  /* 极端情况下允许换行 */
     lv_obj_set_height(s_p_word, 32);                       /* 压缩题区给选项让位 */
@@ -279,10 +282,10 @@ static void render_panel(void)
         if (i < 4) {
             text = s_qDir ? word_pool[s_qOpts[i]].en : word_pool[s_qOpts[i]].cn;
             lv_obj_set_style_text_font(s_p_txt[i],
-                s_qDir ? &lv_font_montserrat_20 : &cn_16, 0);
+                s_qDir ? &lv_font_montserrat_20 : CN_FONT, 0);
         } else {
             text = (s_mode == MODE_REVIEW) ? "结束温习，返回" : "结束训练，返回";
-            lv_obj_set_style_text_font(s_p_txt[i], &cn_16, 0);
+            lv_obj_set_style_text_font(s_p_txt[i], CN_FONT, 0);
         }
         lv_label_set_text(s_p_txt[i], text);
 
@@ -385,7 +388,14 @@ static int cn_overlap(const char *a, const char *b)
 static void build_question(void)
 {
     if (s_mode == MODE_REVIEW && s_wrong_n > 0) {
-        s_qWord = s_wrong_book[rand() % s_wrong_n];
+        /* 温习只从错题本出题（仅"答错"和"答对后遗忘"两条来源会进错题本）。
+           错题本只有 1~2 个词时纯随机会连着出同一个，这里避开上一题。 */
+        int idx = s_wrong_book[rand() % s_wrong_n];
+        if (s_wrong_n > 1) {
+            for (int t = 0; t < 8 && idx == s_qWord; t++)
+                idx = s_wrong_book[rand() % s_wrong_n];
+        }
+        s_qWord = idx;
     } else {
         s_qWord = pick_train_word();
     }
@@ -464,6 +474,7 @@ static void start_train(void)
 static void start_review(void)
 {
     if (s_wrong_n == 0) return;
+    LOGI("review start: 错题 %d 个", s_wrong_n);
     s_mode = MODE_REVIEW;
     s_opt = 0;
     build_question();
@@ -482,9 +493,13 @@ static void exit_qa(void)
 static void answer(int option)
 {
     bool right = (option == s_qCorrect);
+    ui_sound_play(right ? UI_SND_CORRECT : UI_SND_WRONG);   /* 答对/答错提示音 */
     if (right) {
         s_mem[s_qWord] = MEM_FULL;            /* 学会 / 记忆刷新到满分 */
-        if (s_mode == MODE_REVIEW) remove_wrong(s_qWord);
+        /* 答对即出温习 —— 不分训练还是温习（王总 0911 反馈）。
+           原来只在 MODE_REVIEW 里移除，导致训练中"先答错、后答对"的词
+           永远留在错题本里，温习时又冒出来，被当成"平白无故的新词"。 */
+        remove_wrong(s_qWord);
         s_stat.hunger = CLAMP(s_stat.hunger + 25);
         s_stat.happy  = CLAMP(s_stat.happy  + 10);
         try_evolve();                          /* 词数变了，检查进化 */
@@ -813,8 +828,14 @@ void demo_pet_enter(void)
     lv_obj_set_style_text_color(s_p_word, lv_color_hex(C_INK), 0);
     lv_obj_set_style_text_align(s_p_word, LV_TEXT_ALIGN_CENTER, 0);
 
+    /* 行宽按"最长内容"定，别拍脑袋：
+     *   中文选项最长 126px（"帕帕韦斯特雷岛" 7 字 × 18px）
+     *   返回行最长   126px（"结束训练，返回" 7 字 × 18px）
+     * 文字区可用宽度 = 行宽 - 26（左边距 20 + 右边距 6）。
+     * v11 时返回行行宽 154 → 文字区仅 120px < 126px，"回"字换到第二行、
+     * 被 24px 的行高切掉，王总看到的就是"只有一个返字"（0911）。 */
     for (int i = 0; i < 5; i++) {
-        int w = (i < 4) ? 220 : 154;      /* 返回行变窄 */
+        int w = (i < 4) ? 226 : 190;      /* 返回行仍略窄，保留视觉区分 */
         lv_obj_t *row = lv_obj_create(s_panel);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_pos(row, (240 - w) / 2, 58 + i * 48);
@@ -830,13 +851,15 @@ void demo_pet_enter(void)
         lv_label_set_text(s_p_cursor[i], ">");
         lv_obj_set_style_text_font(s_p_cursor[i], &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(s_p_cursor[i], lv_color_hex(0xE53935), 0);
-        lv_obj_set_pos(s_p_cursor[i], 8, 12);
+        lv_obj_set_pos(s_p_cursor[i], 6, 12);
         lv_obj_set_style_bg_opa(s_p_cursor[i], LV_OPA_TRANSP, 0);
 
         s_p_txt[i] = lv_label_create(row);
         lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(C_INK), 0);
-        lv_obj_set_pos(s_p_txt[i], 26, 10);
-        lv_obj_set_size(s_p_txt[i], w - 34, 24);
+        lv_obj_set_pos(s_p_txt[i], 20, 10);
+        lv_obj_set_size(s_p_txt[i], w - 26, 24);
+        /* 锁死单行：行高 42 只放得下一行，换行必然把第二个字切掉 */
+        lv_label_set_long_mode(s_p_txt[i], LV_LABEL_LONG_CLIP);
     }
 
     lv_screen_load(s_scr);
@@ -880,6 +903,7 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
     /* 睡觉锁键：只有 OK 能唤醒，其余键全吞（黑幕动画中也吞） */
     if (s_sleeping) {
         if (ev == BSP_BTN_CLICK && btn == BSP_BTN_OK && s_curtain_t == NULL) {
+            ui_sound_play(UI_SND_SWITCH);
             start_wake();
         }
         return;
@@ -890,13 +914,15 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
         if (ev == BSP_BTN_CLICK) {
             if (btn == BSP_BTN_UP) {
                 s_opt = (s_opt + 4) % 5;
+                ui_sound_play(UI_SND_SWITCH);
                 render_panel();
             } else if (btn == BSP_BTN_DOWN) {
                 s_opt = (s_opt + 1) % 5;
+                ui_sound_play(UI_SND_SWITCH);
                 render_panel();
             } else if (btn == BSP_BTN_OK) {
-                if (s_opt == 4) exit_qa();
-                else            answer(s_opt);
+                if (s_opt == 4) { ui_sound_play(UI_SND_SWITCH); exit_qa(); }
+                else            answer(s_opt);          /* 判题音在 answer() 里出 */
             }
         }
         return;
@@ -905,6 +931,7 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
     /* 蛋状态：只响应 OK */
     if (s_mode == MODE_EGG) {
         if (ev == BSP_BTN_CLICK && btn == BSP_BTN_OK) {
+            ui_sound_play(UI_SND_SWITCH);
             s_hatch_clicks++;
             if (s_egg) ui_pixel_egg_shake(s_egg, s_hatch_clicks <= 3 ? s_hatch_clicks : 3);
             if (s_hatch_clicks >= 3) {
@@ -919,11 +946,14 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
     if (ev == BSP_BTN_CLICK) {
         if (btn == BSP_BTN_UP) {
             s_menu = (s_menu + 3) % 4;
+            ui_sound_play(UI_SND_SWITCH);
             blink_timer_cb(NULL);
         } else if (btn == BSP_BTN_DOWN) {
             s_menu = (s_menu + 1) % 4;
+            ui_sound_play(UI_SND_SWITCH);
             blink_timer_cb(NULL);
         } else if (btn == BSP_BTN_OK) {
+            ui_sound_play(UI_SND_SWITCH);
             switch ((int)s_menu) {
                 case MENU_TRAIN:  start_train(); break;
                 case MENU_SLEEP:  start_sleep(); break;
