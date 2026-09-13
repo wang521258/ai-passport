@@ -42,7 +42,10 @@
 #define BSP_LCD_D6           9
 #define BSP_LCD_D7           46
 
-#define BSP_LCD_PCLK_HZ      (10 * 1000 * 1000)
+// v19: 10MHz 时写一行 GRAM(240px)要 384us,面板扫描一行只要 ~52us —— 写屏远慢于
+// 扫描,面板扫描线横穿正在更新的区域,表现为"宠物身上横向一条线往下走"(撕裂)。
+// 提到 40MHz 后写一行 96us,写入窗口缩到 1/4,撕裂大幅减轻。官方 BOX demo 同款屏跑 40~80MHz。
+#define BSP_LCD_PCLK_HZ      (40 * 1000 * 1000)
 #define BSP_LCD_SWAP_XY      1
 #define BSP_LCD_MIRROR_X     1
 #define BSP_LCD_MIRROR_Y     0
