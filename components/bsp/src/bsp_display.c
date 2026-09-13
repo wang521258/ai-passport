@@ -58,7 +58,11 @@ esp_err_t bsp_display_init(void) {
     esp_lcd_panel_io_i80_config_t io_cfg = {
         .cs_gpio_num        = BSP_LCD_CS,
         .pclk_hz            = BSP_LCD_PCLK_HZ,
-        .trans_queue_depth  = 10,
+        /* v20: 0 = 同步传输(每次 draw_bitmap 完成才返回)。
+         * 之前 10(异步)在 40MHz PCLK 下会打爆 GDMA 描述符池:
+         * 排队的 transfer 都占着 LLI,报 gdma-link "lli full" 刷屏,画面异常。
+         * LVGL 的 flush 本来就是逐块同步调用,异步队列毫无收益。 */
+        .trans_queue_depth  = 0,
         .on_color_trans_done = NULL,
         .user_ctx           = NULL,
         .lcd_cmd_bits       = 8,
