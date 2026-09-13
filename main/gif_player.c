@@ -23,13 +23,19 @@ static const char *GP = "GIFP";
 /* UI_PAPER=0xF4F4EA → RGB565: R5=30 G6=61 B5=29 = 0xF7DD */
 #define BG_RGB565  ((uint16_t)0xF7DD)
 
-/* GIF 原始帧延迟(通常 50~100ms)在小屏上看着像抽搐。
- * 统一放慢到 GIF_SLOWDOWN 倍，并设 GIF_MIN_DELAY 下限，动作更柔和。 */
-#define GIF_SLOWDOWN  3
-#define GIF_MIN_DELAY 120
+/* v18 动效修正：实测 42 只 Gen5 精灵图帧延迟都是 100~200ms（原作节奏 5~10FPS）。
+ * 之前 GIF_SLOWDOWN=3 是没实测凭感觉放的，把原作压成 1.6~3.3FPS —— 卡成幻灯片。
+ * 现在 ×1 完整保留原作节奏，只钳下限防个别 0ms 帧闪烁。 */
+#define GIF_SLOWDOWN  1
+#define GIF_MIN_DELAY 70
 
-/* 待机动效：上下浮动 2px，8 帧一个周期（约 1 秒一次呼吸） */
-static const int8_t BOB_TABLE[8] = { 0, -1, -1, -2, -2, -1, -1, 0 };
+/* 待机上下浮动：16 级对称正弦、幅 ±2px。
+ * v18 前 8 级表 {0,-1,-1,-2,-2,-1,-1,0} 不对称（均值偏上 0.86px）且级差大，
+ * 帧率正常后 16 级每帧走一级，1.6~3.2 秒一次完整呼吸，肉眼是连续浮动。 */
+static const int8_t BOB_TABLE[16] = {
+     0, 1, 1, 2, 2, 2, 1, 1,
+     0,-1,-1,-2,-2,-2,-1,-1,
+};
 
 typedef struct {
     GIFIMAGE gif;
@@ -229,7 +235,7 @@ static void frame_timer_cb(lv_timer_t *t)
     p->cur_dirty  = false;
 
     p->frame_no++;
-    p->bob = p->bob_on ? BOB_TABLE[p->frame_no & 7] : 0;
+    p->bob = p->bob_on ? BOB_TABLE[p->frame_no & 15] : 0;
 
     s_cur = p;
     int res = GIF_playFrame(&p->gif, &delay, NULL);
@@ -411,7 +417,7 @@ int gif_player_play(lv_obj_t *canvas, const uint8_t *data, int len)
     /* 解第一帧：能跑到这里就说明解码器可用 */
     int delay = 0;
     fill_background(p);
-    p->bob = p->bob_on ? BOB_TABLE[p->frame_no & 7] : 0;
+    p->bob = p->bob_on ? BOB_TABLE[p->frame_no & 15] : 0;
     p->frame_no++;
     p->cur_dirty = false;
     s_cur = p;
