@@ -1,382 +1,1063 @@
-// main/demo_pet.c —— 电子宠物演示页（UI 优化版 + 英语训练）。
-// 精灵球破壳 → 随机宝可梦 GIF 动画；四项状态随时间衰减；
-// 3 按键映射 5 动作：上=喂食 下=玩耍 中=睡觉 上长按=清洁 下长按=训练；
-// 训练 = 英语单词选词（反向学习）：显示英文，选中文释义。
+// main/demo_pet.c —— 宝可梦电子宠物（v18 动效：恢复 GIF 原作帧率 5~10FPS + 16 级对称呼吸浮动）
+//
+// 布局（240x320）：
+//   y=0..28     顶部栏：4 按钮 [训练][睡觉][温习][重修] + 右侧 攻+词数框
+//   y=28..320   主舞台：蛋 / 宠物 / 全屏训练面板（绿豆色）
+//
+// v13 相对 v12 的四处改动：
+//   - 出题收敛：册别权重由 1/(1+0.9d) 软衰减改为"当前进度 ±1 册"窗口，
+//     干扰项册别范围同步收到 ±2（原来最远的册还有 12% 权重，会抽到高年级生词）
+//   - 英文长词按【实测像素宽】自动缩字号（20/18/16/14），不再被行宽切掉尾巴
+//   - 8bit 背景乐（main/bgm.c）：睡觉暂停、醒来/进宠物页续播
+//   - 答对即出错题本（不分模式）+ 温习出题避开上一题 + "结束训练，返回"不再缺字
+//
+// 沿用 v12 特性（与 HTML 预览 pet_preview.html 一致）：
+//   - 词库：入门档 335 词（GitHub 小学高频+PEP1-2）+ PEP 3-6 年级 8 册 817 词 = 1152 词
+//   - 题型：英选汉 / 汉选英 各 50% 随机
+//   - 等级 = 学会的词数（右上角 攻+数字），进化阈值 210 / 915 词
+//   - 进化：严格同家族逐档升级，绝不跨种越级
+//   - 遗忘：记忆度每小时 -1（约 4 天忘光），归 0 掉进错题本，攻数值跟着掉并闪红
+//   - 破壳：只从"有进化链的基础形态"随机（15 只）
+//   - 背景：纯色绿豆 #C8DFA0，无分段
+//   - 睡觉：黑幕从顶部三段拉下（噔噔噔）→ 全黑+Zzz；醒来黑幕向下撤、上方先亮
+//   - 睡觉锁键：只有 OK 能唤醒，其余键全吞
+//   - 重修 = 回蛋（学习记录保留）
+
 #include "demo.h"
 #include "bsp_display.h"
 #include "ui_pixel.h"
 #include "ui_pet.h"
 #include "gif_player.h"
+#include "ui_sound.h"
 #include "pokemon_sprites.h"
 #include "word_pool.h"
 #include "lvgl.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_log.h"
 #include "esp_random.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include <string.h>
 #include <stdlib.h>
-#include <math.h>
 
-/* ---------- 宠物状态 ---------- */
-typedef struct {
-    uint8_t hunger;   /* 饱食 0~100 */
-    uint8_t happy;    /* 心情 0~100 */
-    uint8_t energy;   /* 精力 0~100 */
-    uint8_t clean;    /* 清洁 0~100 */
-    uint8_t lv;       /* 等级 */
-    uint16_t exp;     /* 经验 0~99 */
-} pet_stat_t;
+/* 中文字库：由 gen_cn_font.py 生成（微软雅黑粗体 18px 子集，1363 字，约 1.15MB）。
+   选它是因为实测笔画覆盖率 44.6%，明显粗于黑体(29.0%)/等线粗体(33.7%)。
+   改字号/换字体只需重跑 gen_cn_font.py，并同步这里的符号名。
+   ⚠ 词库/界面加了新汉字后，务必重跑 gen_cn_font.py —— 否则新字是空白（v15 教训）。 */
+extern lv_font_t cn_18;
+#define CN_FONT (&cn_18)
 
-static pet_stat_t s_stat = { 80, 80, 80, 80, 1, 0 };
-static lv_obj_t  *s_scr;
-static lv_obj_t  *s_gif;       /* 宝可梦 GIF canvas */
-static lv_obj_t  *s_ball;
-static lv_obj_t  *s_namelabel;
-static lv_obj_t  *s_stat_bg;    /* 顶部状态条半透明背景 */
-static lv_obj_t  *s_stat_icons[4]; /* 状态图标块 */
-static lv_obj_t  *s_stat_vals[4];   /* 状态数字 */
-static lv_obj_t  *s_lvlabel;
-static lv_obj_t  *s_flash;     /* 进化闪光全屏矩形 */
-static lv_obj_t  *s_sleepmask; /* 睡觉半透明遮罩 */
-static esp_timer_handle_t s_timer;
-static bool s_active;
-static bool s_hatched;
-static bool s_sleeping;
-static uint8_t s_hatch_clicks;
-static uint8_t s_cur_poke_idx;  /* 当前宝可梦在 pokemon_gifs[] 中的索引 */
-
-/* ---------- 训练模式（英语单词选词） ---------- */
-static bool s_training;          /* 是否在训练模式 */
-static int  s_train_word_idx;    /* 当前题目的正确单词索引 */
-static int  s_train_option_idx;  /* 当前选中的选项（0-3） */
-static int  s_train_correct;     /* 正确选项的位置 */
-static lv_obj_t *s_train_panel;  /* 训练面板 */
-static lv_obj_t *s_train_word;   /* 英文单词标签 */
-static lv_obj_t *s_train_opts[4]; /* 4 个中文选项 */
-static lv_obj_t *s_train_cursor;  /* 选中指示器 */
-
-/* 进化等级阈值（stage 0→1 需要 LV16，1→2 需要 LV32）*/
-#define EVO_LV_STAGE1 16
-#define EVO_LV_STAGE2 32
+#define TAG "PET"
+#define LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#define LOGW(...) ESP_LOGW(TAG, __VA_ARGS__)
 
 #define CLAMP(v) ((v) < 0 ? 0 : ((v) > 100 ? 100 : (v)))
-#define EXP_PER_LEVEL 100
 
-/* ---------- 背景绘制：天空 + 草地（简化版，减少 LVGL 对象数量） ---------- */
+#define PET_SIZE 112
+#define PET_X    ((240 - PET_SIZE) / 2)   /* 64 */
+#define PET_Y    118
+#define EGG_X    ((240 - 72) / 2)         /* 84 */
+#define EGG_Y    129
+
+#define MAX_WRONG    120                /* 错题本容量（遗忘会灌入，比 v4 大） */
+#define MEM_FULL     100                /* 学会时记忆度满分 */
+#define FORGET_SEC   3600               /* 每 3600 秒记忆度 -1 → 约 4 天忘光 */
+#define EVO_KNOWN_1  210                /* stage0→1：学会 210 词（1152 词库等比自 150）*/
+#define EVO_KNOWN_2  915                /* stage1→2：学会 915 词（1152 词库等比自 650）*/
+
+#define C_BG       0xC8DFA0             /* 绿豆色（场景 + 面板） */
+/* 0xC8DFA0 的 RGB565 精确换算：R200>>3=25 G223>>2=55 B160>>3=20 → 0xCEF4。
+ * 之前误写 0xC6F4(R=24) 偏暗，宠物 canvas 背景块与场景绿豆色出现肉眼可见色差。 */
+#define C_BG565    0xCEF4               /* 同色的 RGB565 */
+#define C_ROW      0x3A5A2C             /* 选项行底：深绿（深底亮字，字显实） */
+#define C_ROWTXT   0xEDF5DC             /* 选项行文字：亮米绿 */
+#define C_ROWBRD   0x6B8E4E             /* 选项行描边 */
+#define C_SELBRD   0x33691E             /* 选中描边 */
+/* 面板文字：浅绿行底(#EDF5DC)上原来用 #1B3A0F 偏灰绿，对比仅约 4.5:1，
+ * 16px 小字的笔画被亮底吃掉、看着发虚。改纯黑后对比拉满，字更实。 */
+#define C_INK      0x000000             /* 面板文字 */
+#define C_ATK      0xFFB74D             /* 攻图标色 */
+#define C_ATKNUM   0xFFCC80             /* 攻数字色 */
+
+/* 训练/温习面板的行几何。渲染与创建两处必须用同一组常量，
+ * 否则"按算好的宽度建行、按另一个宽度判字号"会再一次把字切掉。 */
+#define ROW_W       226                 /* 选项行宽 */
+#define ROW_W5      190                 /* 返回行宽（略窄，保留视觉区分） */
+#define TXT_X        20                 /* 行内文字左边界 */
+#define TXT_PAD       6                 /* 行内文字右边距 */
+#define ROW_H        42                 /* 行高 */
+#define ROW_AVAIL(w) ((w) - TXT_X - TXT_PAD)   /* 文字区可用宽度 */
+
+typedef enum { MODE_EGG, MODE_HOME, MODE_GRADE_SELECT, MODE_TRAIN, MODE_REVIEW } pet_mode_t;
+typedef enum { MENU_TRAIN = 0, MENU_SLEEP, MENU_REVIEW, MENU_RESET } pet_menu_t;
+
+static struct {
+    uint8_t hunger, happy, energy;
+} s_stat = { 80, 80, 80 };
+
+static pet_mode_t s_mode = MODE_EGG;
+static pet_menu_t s_menu = MENU_TRAIN;
+static uint8_t  s_opt;                    /* 当前选择 0..4（4=返回） */
+static uint8_t  s_grade = 3;                /* 当前训练年级：3..6 */
+static uint8_t  s_hatch_clicks;
+static uint8_t  s_cur_poke_idx;
+static uint8_t  s_tick_div;
+static bool     s_sleeping;
+static bool     s_active;
+static int      s_wrong_book[MAX_WRONG];
+static int      s_wrong_n;
+
+/* 学习状态：每词记忆度 0..100，>0 即"已学会" */
+static uint8_t  s_mem[WORD_POOL_SIZE];
+
+/* 破壳候选：有进化链的基础形态下标 */
+static int      s_bases[64];
+static int      s_base_n;
+
+/* 当前题 */
+static int  s_qWord = -1;
+static int  s_qOpts[4];
+static int  s_qCorrect;
+static uint8_t s_qDir;                    /* 0=英选汉 1=汉选英 */
+
+/* 攻数值告警（遗忘掉词时闪红几次） */
+static int  s_atk_alert_blinks;
+
+/* LVGL 对象 */
+static lv_obj_t *s_scr;
+static lv_obj_t *s_egg;
+static lv_obj_t *s_gif;
+static lv_obj_t *s_topbar_bg;
+static lv_obj_t *s_menu_btns[4];
+static lv_obj_t *s_atkbox;
+static lv_obj_t *s_atk_num;
+static lv_obj_t *s_night;                 /* 睡觉黑幕 */
+static lv_obj_t *s_zzz;
+static lv_obj_t *s_flash;
+static lv_obj_t *s_panel;
+static lv_obj_t *s_p_word;
+static lv_obj_t *s_p_opts[5];             /* 行容器 */
+static lv_obj_t *s_p_txt[5];              /* 行内文字 */
+static lv_obj_t *s_p_cursor[5];
+
+static lv_timer_t *s_blink_t;
+static lv_timer_t *s_curtain_t;           /* 黑幕动画定时器（非 NULL 时表示动画中） */
+static esp_timer_handle_t s_tick_timer;
+static uint32_t s_forget_cnt;
+
+static void try_evolve(void);             /* 前向声明（answer 先于定义调用） */
+
+/* ============================================================
+ *  掉电保存（NVS）
+ *
+ *  王总 0911：机器按电源键关机再开机，练的全都清零了。
+ *  根因 —— 学习记录（s_mem / 错题本）与宠物状态只活在内存里，
+ *  demo_pet_enter() 每次进来都无条件清零，断电自然全丢。
+ *
+ *  做法：分 3 个 blob 写进 nvs 分区（partitions.csv 里 24KB）：
+ *    hdr   24B  —— 版本/词库大小/已破壳标记/宠物状态
+ *    mem   1148B —— 每词记忆度
+ *    wrong 480B  —— 错题本
+ *  词库大小变了（pool_size 不匹配）就作废旧档，避免新旧错位读到脏数据。
+ * ============================================================ */
+#define PS_NS        "petsave"
+#define PS_MAGIC     0x50455432u           /* 'PET2' */
+#define PS_VER       2
+#define PS_KEY_HDR   "hdr"
+#define PS_KEY_MEM   "mem"
+#define PS_KEY_WRONG "wrong"
+#define PS_SAVE_GAP_US  (20LL * 1000 * 1000)   /* 最快 20 秒写一次 flash */
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t ver;
+    uint16_t pool_size;                    /* 词库大小，不匹配就作废 */
+    uint8_t  hatched;                      /* 1 = 已破壳（下次开机直接回宠物） */
+    uint8_t  hatch_clicks;
+    uint8_t  cur_poke;                     /* 当前宠物下标 */
+    uint8_t  hunger, happy, energy;
+    uint16_t wrong_n;
+    uint16_t reserved;
+} ps_hdr_t;
+
+static bool    s_nvs_ok;
+static bool    s_save_dirty;
+static int64_t s_last_save_us;
+static bool    s_restored;                 /* 本次进入是否恢复了存档 */
+
+static bool pet_storage_ready(void)
+{
+    static bool tried;
+    if (tried) return s_nvs_ok;
+    tried = true;
+    esp_err_t e = nvs_flash_init();
+    if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        e = nvs_flash_init();
+    }
+    s_nvs_ok = (e == ESP_OK);
+    if (!s_nvs_ok) LOGW("NVS 不可用(%s)：学习进度无法掉电保存", esp_err_to_name(e));
+    return s_nvs_ok;
+}
+
+static void pet_save(void)
+{
+    if (!pet_storage_ready()) return;
+    nvs_handle_t h;
+    if (nvs_open(PS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+
+    ps_hdr_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic        = PS_MAGIC;
+    hdr.ver          = PS_VER;
+    hdr.pool_size    = (uint16_t)WORD_POOL_SIZE;
+    hdr.hatched      = (s_mode == MODE_EGG) ? 0 : 1;
+    hdr.hatch_clicks = s_hatch_clicks;
+    hdr.cur_poke     = s_cur_poke_idx;
+    hdr.hunger       = s_stat.hunger;
+    hdr.happy        = s_stat.happy;
+    hdr.energy       = s_stat.energy;
+    hdr.wrong_n      = (uint16_t)s_wrong_n;
+
+    esp_err_t e = nvs_set_blob(h, PS_KEY_HDR, &hdr, sizeof(hdr));
+    if (e == ESP_OK) e = nvs_set_blob(h, PS_KEY_MEM, s_mem, sizeof(s_mem));
+    if (e == ESP_OK) e = nvs_set_blob(h, PS_KEY_WRONG, s_wrong_book, sizeof(s_wrong_book));
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+    if (e != ESP_OK) LOGW("存档失败: %s", esp_err_to_name(e));
+}
+
+/* 节流保存：答题很密，不能每次都写 flash。标记脏，20 秒内最多落一次盘。 */
+static void pet_save_soon(void)
+{
+    s_save_dirty = true;
+    int64_t now = esp_timer_get_time();
+    if (now - s_last_save_us < PS_SAVE_GAP_US) return;
+    s_last_save_us = now;
+    s_save_dirty = false;
+    pet_save();
+}
+
+/* 立即落盘（破壳/重修/离开页面这种关键节点用） */
+static void pet_save_now(void)
+{
+    s_last_save_us = esp_timer_get_time();
+    s_save_dirty = false;
+    pet_save();
+}
+
+/* 读档。返回 true = 已破壳过（下次开机直接进宠物，不回蛋）。 */
+static bool pet_load(void)
+{
+    if (!pet_storage_ready()) return false;
+    nvs_handle_t h;
+    if (nvs_open(PS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+
+    ps_hdr_t hdr;
+    size_t sz = sizeof(hdr);
+    bool hatched = false;
+    if (nvs_get_blob(h, PS_KEY_HDR, &hdr, &sz) == ESP_OK &&
+        hdr.magic == PS_MAGIC && hdr.ver == PS_VER &&
+        hdr.pool_size == (uint16_t)WORD_POOL_SIZE) {
+
+        size_t msz = sizeof(s_mem);
+        size_t wsz = sizeof(s_wrong_book);
+        if (nvs_get_blob(h, PS_KEY_MEM, s_mem, &msz) == ESP_OK &&
+            nvs_get_blob(h, PS_KEY_WRONG, s_wrong_book, &wsz) == ESP_OK) {
+
+            s_hatch_clicks = hdr.hatch_clicks;
+            if (hdr.cur_poke < pokemon_gif_count) s_cur_poke_idx = hdr.cur_poke;
+            s_stat.hunger = hdr.hunger;      /* 读回来再夹一次，防旧档越界 */
+            s_stat.happy  = hdr.happy;
+            s_stat.energy = hdr.energy;
+            s_stat.hunger = CLAMP(s_stat.hunger);
+            s_stat.happy  = CLAMP(s_stat.happy);
+            s_stat.energy = CLAMP(s_stat.energy);
+            s_wrong_n = (hdr.wrong_n <= MAX_WRONG) ? (int)hdr.wrong_n : 0;
+            hatched = (hdr.hatched != 0);
+        }
+    }
+    nvs_close(h);
+    return hatched;
+}
+
+/* ============================================================
+ *  工具
+ * ============================================================ */
+static int known_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < WORD_POOL_SIZE; i++) if (s_mem[i] > 0) n++;
+    return n;
+}
+
+static uint16_t bg_color_at(int x, int y)
+{
+    (void)x; (void)y;
+    return C_BG565;
+}
+
+/* ============================================================
+ *  背景：纯色绿豆，一色到底
+ * ============================================================ */
 static void draw_background(lv_obj_t *parent)
 {
-    /* 天空：3 个大色块代替 50 个小色块 */
-    block(parent, 0, 0,   240, 80,  0x1689E8);
-    block(parent, 0, 80,  240, 60,  0x4FA0E8);
-    block(parent, 0, 140, 240, 60,  0x7BB8F0);
-    /* 草地：3 个大色块 */
-    block(parent, 0, 200, 240, 40,  0x82BE2D);
-    block(parent, 0, 240, 240, 40,  0x6BA825);
-    block(parent, 0, 280, 240, 40,  0x5A9020);
-    /* 远处小山：1 个大块代替 120 个小柱子 */
-    block(parent, 0, 160, 240, 40, 0x5A9A4A);
+    block(parent, 0, 0, 240, 320, C_BG);
 }
 
-/* ---------- 顶部状态条（GBA 风格图标 + 数字） ---------- */
-static const uint32_t STAT_COLORS[4] = { 0xFF8A3D, 0xFFD928, 0x82BE2D, 0x4FC3F7 };
-static const char *STAT_LABELS[4] = { "FOOD", "MOOD", "NRG", "WASH" };
-
-static void build_status_bar(void)
+/* ============================================================
+ *  顶部按钮栏（4 按钮 + 攻+词数框）
+ * ============================================================ */
+static void build_topbar(void)
 {
-    /* 半透明背景条 */
-    s_stat_bg = lv_obj_create(s_scr);
-    lv_obj_remove_flag(s_stat_bg, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(s_stat_bg, 0, 0);
-    lv_obj_set_size(s_stat_bg, 240, 24);
-    lv_obj_set_style_bg_color(s_stat_bg, lv_color_hex(0x17202A), 0);
-    lv_obj_set_style_bg_opa(s_stat_bg, LV_OPA_70, 0);
-    lv_obj_set_style_border_width(s_stat_bg, 0, 0);
-    lv_obj_set_style_pad_all(s_stat_bg, 0, 0);
-    lv_obj_set_style_radius(s_stat_bg, 0, 0);
+    s_topbar_bg = lv_obj_create(s_scr);
+    lv_obj_remove_flag(s_topbar_bg, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(s_topbar_bg, 0, 0);
+    lv_obj_set_size(s_topbar_bg, 240, 28);
+    lv_obj_set_style_bg_color(s_topbar_bg, lv_color_hex(0x17202A), 0);
+    lv_obj_set_style_bg_opa(s_topbar_bg, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(s_topbar_bg, 0, 0);
+    lv_obj_set_style_pad_all(s_topbar_bg, 0, 0);
+    lv_obj_set_style_radius(s_topbar_bg, 0, 0);
 
-    /* 4 个状态块：图标 + 数字，水平排列 */
+    static const char *LBL[4] = { "训练", "睡觉", "温习", "重修" };
     for (int i = 0; i < 4; i++) {
-        int x = 4 + i * 56;
-        /* 颜色块（图标占位） */
-        s_stat_icons[i] = lv_obj_create(s_stat_bg);
-        lv_obj_remove_flag(s_stat_icons[i], LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(s_stat_icons[i], x, 4);
-        lv_obj_set_size(s_stat_icons[i], 16, 16);
-        lv_obj_set_style_bg_color(s_stat_icons[i], lv_color_hex(STAT_COLORS[i]), 0);
-        lv_obj_set_style_bg_opa(s_stat_icons[i], LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(s_stat_icons[i], 1, 0);
-        lv_obj_set_style_border_color(s_stat_icons[i], lv_color_hex(0xFFFFFF), 0);
-        lv_obj_set_style_pad_all(s_stat_icons[i], 0, 0);
-        lv_obj_set_style_radius(s_stat_icons[i], 0, 0);
-        /* 数字 */
-        s_stat_vals[i] = ui_pixel_label(s_stat_bg, "80", &lv_font_montserrat_14, 0xFFFFFF);
-        lv_obj_set_pos(s_stat_vals[i], x + 20, 4);
+        lv_obj_t *b = lv_obj_create(s_topbar_bg);
+        lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_pos(b, 1 + i * 47, 1);
+        lv_obj_set_size(b, 46, 26);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x37474F), 0);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(b, lv_color_hex(0x546E7A), 0);
+        lv_obj_set_style_border_width(b, 1, 0);
+        lv_obj_set_style_radius(b, 0, 0);
+        lv_obj_set_style_pad_all(b, 0, 0);
+
+        lv_obj_t *lb = lv_label_create(b);
+        lv_label_set_text(lb, LBL[i]);
+        lv_obj_set_style_text_font(lb, CN_FONT, 0);
+        lv_obj_set_style_text_color(lb, lv_color_hex(0xECEFF1), 0);
+        lv_obj_center(lb);
+        s_menu_btns[i] = b;
     }
-    /* 等级标签（右上角） */
-    s_lvlabel = ui_pixel_label(s_stat_bg, "Lv1", &lv_font_montserrat_14, 0xFFD928);
-    lv_obj_set_pos(s_lvlabel, 200, 4);
+
+    /* 温习按钮只显示"温习"，不挂数量角标（角标会把按钮撑变形） */
+
+    /* 攻框：攻 图标 + 学会词数（右半部分） */
+    s_atkbox = lv_obj_create(s_topbar_bg);
+    lv_obj_remove_flag(s_atkbox, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(s_atkbox, 189, 1);
+    lv_obj_set_size(s_atkbox, 50, 26);
+    lv_obj_set_style_bg_color(s_atkbox, lv_color_hex(0x17202A), 0);
+    lv_obj_set_style_bg_opa(s_atkbox, LV_OPA_90, 0);
+    lv_obj_set_style_border_color(s_atkbox, lv_color_hex(C_ATK), 0);
+    lv_obj_set_style_border_width(s_atkbox, 1, 0);
+    lv_obj_set_style_radius(s_atkbox, 0, 0);
+    lv_obj_set_style_pad_all(s_atkbox, 0, 0);
+
+    lv_obj_t *ic = lv_label_create(s_atkbox);
+    lv_label_set_text(ic, "攻");
+    lv_obj_set_style_text_font(ic, CN_FONT, 0);
+    lv_obj_set_style_text_color(ic, lv_color_hex(C_ATK), 0);
+    /* 18px 字行高约 22~24px,框高 26 → y 取 1 才不会把底部笔画切掉 */
+    lv_obj_set_pos(ic, 2, 1);
+
+    s_atk_num = lv_label_create(s_atkbox);
+    lv_label_set_text(s_atk_num, "0");
+    lv_obj_set_style_text_font(s_atk_num, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_atk_num, lv_color_hex(C_ATKNUM), 0);
+    lv_obj_set_pos(s_atk_num, 20, 6);
 }
 
-/* 刷新状态条 + 等级 */
-static void refresh(void)
+/* 顶栏刷新定时器：当前菜单黄高亮 + 告警**常红不闪**（闪太快反而看不清）。
+ * 告警规则（2026-09-10 王总定的）：温习（有错题）优先红；
+ * 饥饿<30 才提示训练；睡觉永不告警——睡不睡玩家自己按。 */
+static void blink_timer_cb(lv_timer_t *t)
 {
-    uint8_t vals[4] = { s_stat.hunger, s_stat.happy, s_stat.energy, s_stat.clean };
+    (void)t;
+
+    if (s_mode != MODE_HOME) {
+        for (int i = 0; i < 4; i++) {
+            lv_obj_set_style_bg_color(s_menu_btns[i], lv_color_hex(0x37474F), 0);
+            lv_obj_set_style_border_color(s_menu_btns[i], lv_color_hex(0x546E7A), 0);
+            lv_obj_set_style_text_color(s_menu_btns[i], lv_color_hex(0xECEFF1), 0);
+        }
+        return;
+    }
+
+    int warn_idx = -1;
+    if      (s_wrong_n > 0)       warn_idx = MENU_REVIEW;   /* 温习优先 */
+    else if (s_stat.hunger < 30)  warn_idx = MENU_TRAIN;
+
     for (int i = 0; i < 4; i++) {
-        lv_label_set_text_fmt(s_stat_vals[i], "%d", vals[i]);
+        lv_obj_set_style_bg_color(s_menu_btns[i], lv_color_hex(0x37474F), 0);
+        lv_obj_set_style_border_color(s_menu_btns[i], lv_color_hex(0x546E7A), 0);
+        lv_obj_set_style_text_color(s_menu_btns[i], lv_color_hex(0xECEFF1), 0);
     }
-    if (s_lvlabel) lv_label_set_text_fmt(s_lvlabel, "Lv%d", s_stat.lv);
+    lv_obj_set_style_bg_color(s_menu_btns[s_menu], lv_color_hex(0xFFD928), 0);
+    lv_obj_set_style_border_color(s_menu_btns[s_menu], lv_color_hex(0x17202A), 0);
+    lv_obj_set_style_text_color(s_menu_btns[s_menu], lv_color_hex(0x17202A), 0);
+
+    if (warn_idx >= 0 && warn_idx != (int)s_menu) {
+        lv_obj_set_style_bg_color(s_menu_btns[warn_idx], lv_color_hex(0xE53935), 0);
+        lv_obj_set_style_border_color(s_menu_btns[warn_idx], lv_color_hex(0xB71C1C), 0);
+        lv_obj_set_style_text_color(s_menu_btns[warn_idx], lv_color_hex(0xFFFFFF), 0);
+    }
+
+    /* 攻数值；掉词时攻框**常红**数秒（不闪烁） */
+    if (s_atk_num) lv_label_set_text_fmt(s_atk_num, "%d", known_count());
+    if (s_atkbox) {
+        if (s_atk_alert_blinks > 0) {
+            s_atk_alert_blinks--;
+            lv_obj_set_style_bg_color(s_atkbox, lv_color_hex(0xB71C1C), 0);
+        } else {
+            lv_obj_set_style_bg_color(s_atkbox, lv_color_hex(0x17202A), 0);
+        }
+        lv_obj_set_style_bg_opa(s_atkbox, LV_OPA_90, 0);
+    }
 }
 
-/* 进化闪光淡出回调 */
-static void flash_fade_cb(lv_timer_t *tm)
+/* ============================================================
+ *  字号自适应：英文长词单独缩小（v13）
+ * ------------------------------------------------------------
+ * 不动版面、也不裁字：按【实测像素宽】从大到小挑第一个放得下的字号。
+ * 20px 的 "doing morning exercises" 要 229px，而选项行文字区只有 200px，
+ * 以前 LV_LABEL_LONG_CLIP 会把尾巴直接切掉（王总 0911 反馈）。
+ * 中文只有 cn_18 一档字库，没有可换的档位，所以只对英文生效。
+ * ============================================================ */
+static const lv_font_t *const EN_FONTS[4] = {
+    &lv_font_montserrat_20, &lv_font_montserrat_18,
+    &lv_font_montserrat_16, &lv_font_montserrat_14,
+};
+
+static const lv_font_t *fit_font(const char *s, int avail_px)
 {
-    lv_obj_t *mask = (lv_obj_t *)lv_timer_get_user_data(tm);
-    if (mask) lv_obj_add_flag(mask, LV_OBJ_FLAG_HIDDEN);
+    if (avail_px <= 0) return EN_FONTS[3];
+    for (int i = 0; i < 4; i++) {
+        lv_point_t sz;
+        /* 用 LVGL 9.5 的公共接口量单行宽度。
+           ⚠ 不要用 lv_txt_get_width —— 9.5 起它被挪进 lv_text_private.h，
+             在 lvgl.h 里已不可见。max_width 给 LV_COORD_MAX = 不折行，只量原样宽度。 */
+        lv_text_get_size(&sz, s, EN_FONTS[i], 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        if (sz.x <= avail_px) return EN_FONTS[i];
+    }
+    return EN_FONTS[3];   /* 连 14px 都放不下：缩到最小，总比被切掉强 */
+}
+
+static const lv_font_t *pick_font(const char *s, bool zh, int avail_px)
+{
+    return zh ? CN_FONT : fit_font(s, avail_px);
+}
+
+/* ============================================================
+ *  训练面板（全屏绿豆，无标题无提示文字）
+ * ============================================================ */
+static void render_panel(void)
+{
+    /* 题干：e2c 显英文 / c2e 显中文；音标不显示（Montserrat 无 IPA 字形会出方块） */
+    const char *qtext = s_qDir ? word_pool[s_qWord].cn : word_pool[s_qWord].en;
+    const lv_font_t *qf = pick_font(qtext, s_qDir != 0, 232);
+    lv_label_set_text(s_p_word, qtext);
+    lv_obj_set_style_text_font(s_p_word, qf, 0);
+    /* 中文题干最长 11 字（"舞者，舞蹈演员，舞蹈家"）= 198px < 232px 一行放得下；
+       英文长词由 pick_font 选小字号。极端情况仍允许换行兜底。 */
+    lv_label_set_long_mode(s_p_word, LV_LABEL_LONG_WRAP);
+    lv_obj_set_height(s_p_word, 32);
+    /* 字号变了行高也变，垂直居中才不会忽高忽低 */
+    lv_obj_set_pos(s_p_word, 0, 16 + (32 - (int)qf->line_height) / 2);
+
+    for (int i = 0; i < 5; i++) {
+        int rw = (i < 4) ? ROW_W : ROW_W5;
+        const char *text;
+        const lv_font_t *f;
+        if (i < 4) {
+            bool zh = (s_qDir == 0);        /* 英选汉 → 选项是中文 */
+            text = zh ? word_pool[s_qOpts[i]].cn : word_pool[s_qOpts[i]].en;
+            f = pick_font(text, zh, ROW_AVAIL(rw));
+        } else {
+            text = (s_mode == MODE_REVIEW) ? "结束温习，返回" : "结束训练，返回";
+            f = CN_FONT;
+        }
+        lv_label_set_text(s_p_txt[i], text);
+        lv_obj_set_style_text_font(s_p_txt[i], f, 0);
+        /* 文字区高度 = 行高：CLIP 只切到行高之外，不会伤到笔画 */
+        lv_obj_set_pos(s_p_txt[i], TXT_X, (ROW_H - (int)f->line_height) / 2);
+        lv_obj_set_size(s_p_txt[i], ROW_AVAIL(rw), (int)f->line_height);
+
+        if (i == (int)s_opt) {
+            /* 选中：黄底深字，最醒目 */
+            lv_obj_set_style_border_color(s_p_opts[i], lv_color_hex(C_SELBRD), 0);
+            lv_obj_set_style_border_width(s_p_opts[i], 3, 0);
+            lv_obj_set_style_bg_color(s_p_opts[i], lv_color_hex(0xFFD928), 0);
+            lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(0x1B3A0F), 0);
+            lv_obj_set_style_opa(s_p_cursor[i], LV_OPA_COVER, 0);
+        } else {
+            /* 未选中：深绿底 + 亮字（学顶栏"攻"的深底亮字，笔画显实不发虚） */
+            lv_obj_set_style_border_color(s_p_opts[i], lv_color_hex(C_ROWBRD), 0);
+            lv_obj_set_style_border_width(s_p_opts[i], 2, 0);
+            lv_obj_set_style_bg_color(s_p_opts[i], lv_color_hex(C_ROW), 0);
+            lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(C_ROWTXT), 0);
+            lv_obj_set_style_opa(s_p_cursor[i], LV_OPA_TRANSP, 0);
+        }
+    }
+}
+
+/* ============================================================
+ *  出题：v7 权重滑动随机（起点三年级，随进度滑向高年级）
+ * ============================================================ */
+static float focus_book(void)
+{
+    return (float)known_count() / (float)WORD_POOL_SIZE * 8.0f;   /* 0~8：入门档→六下 */
+}
+static float book_weight(int book, float focus)
+{
+    float d = (float)book - focus;
+    if (d < 0) d = -d;
+    return 1.0f / (1.0f + d * 0.9f);
+}
+static float mem_weight(int idx)
+{
+    uint8_t m = s_mem[idx];
+    if (m == 0)  return 1.0f;    /* 没学过：正常权重 */
+    if (m <= 40) return 1.8f;    /* 快忘了：加重复习 */
+    return 0.35f;                /* 记得牢：少出 */
+}
+
+static uint8_t grade_for_book(uint8_t book)
+{
+    return (uint8_t)(3 + (book - 1) / 2);
+}
+
+static int pick_train_word(void)
+{
+    /* 训练只在所选年级的上下册中抽词；快忘的词优先。 */
+    float total = 0;
+    for (int i = 0; i < WORD_POOL_SIZE; i++)
+        if (grade_for_book(word_pool[i].book) == s_grade) total += mem_weight(i);
+    if (total <= 0) return 0;
+    float r = (float)(rand() % 10000) / 10000.0f * total;
+    for (int i = 0; i < WORD_POOL_SIZE; i++) {
+        if (grade_for_book(word_pool[i].book) != s_grade) continue;
+        r -= mem_weight(i);
+        if (r <= 0) return i;
+    }
+    for (int i = 0; i < WORD_POOL_SIZE; i++)
+        if (grade_for_book(word_pool[i].book) == s_grade) return i;
+    return 0;
+}
+
+/* 义项分隔符：ASCII 逗号/分号 + 全角"，；、"（UTF-8 各占 3 字节） */
+static int sep_len(const char *p)
+{
+    unsigned char c = (unsigned char)p[0];
+    if (c == ',' || c == ';') return 1;
+    if (c == 0xEF && (unsigned char)p[1] == 0xBC) {
+        if ((unsigned char)p[2] == 0x8C) return 3;   /* ， */
+        if ((unsigned char)p[2] == 0x9B) return 3;   /* ； */
+    }
+    if (c == 0xE3 && (unsigned char)p[1] == 0x80 && (unsigned char)p[2] == 0x81) return 3; /* 、 */
+    return 0;
+}
+
+/* 中文释义是否有交集：earth="地球，世界" 与 world="世界" 在孩子眼里是一个意思，
+   只做 strcmp 全等比较会漏掉，必须用义项级判断 */
+static int cn_overlap(const char *a, const char *b)
+{
+    char buf[32];
+    const char *p = a;
+    while (*p) {
+        const char *q = p;
+        while (*q && !sep_len(q)) q++;
+        size_t len = (size_t)(q - p);
+        if (len > 0 && len < sizeof(buf)) {
+            memcpy(buf, p, len);
+            buf[len] = 0;
+            if (strstr(b, buf)) return 1;
+        }
+        if (!*q) break;
+        p = q + sep_len(q);
+    }
+    return 0;
+}
+
+static void build_question(void)
+{
+    if (s_mode == MODE_REVIEW && s_wrong_n > 0) {
+        /* 温习只从错题本出题（仅"答错"和"答对后遗忘"两条来源会进错题本）。
+           错题本只有 1~2 个词时纯随机会连着出同一个，这里避开上一题。 */
+        int idx = s_wrong_book[rand() % s_wrong_n];
+        if (s_wrong_n > 1) {
+            for (int t = 0; t < 8 && idx == s_qWord; t++)
+                idx = s_wrong_book[rand() % s_wrong_n];
+        }
+        s_qWord = idx;
+    } else {
+        s_qWord = pick_train_word();
+    }
+    s_qDir = rand() & 1;          /* 英选汉 / 汉选英 各半 */
+
+    uint8_t option_grade = grade_for_book(word_pool[s_qWord].book);
+    s_qOpts[0] = s_qWord;
+    int filled = 1;
+    for (int tries = 0; tries < 200 && filled < 4; tries++) {
+        int idx = rand() % WORD_POOL_SIZE;
+        int dup = 0;
+        for (int j = 0; j < filled; j++) if (s_qOpts[j] == idx) dup++;
+        if (dup) continue;
+        if (grade_for_book(word_pool[idx].book) != option_grade) continue;  /* 同年级干扰项 */
+        /* 干扰项不能与正确答案同义：两种题型都要判 en 和 cn 义项，
+           否则题干"帽子"、选项 cap/hat 两个都对 */
+        if (strcmp(word_pool[idx].en, word_pool[s_qWord].en) == 0) continue;
+        if (cn_overlap(word_pool[idx].cn, word_pool[s_qWord].cn)) continue;
+        s_qOpts[filled++] = idx;
+    }
+    while (filled < 4) {          /* 极端兜底：顺序补不重复的 */
+        int idx = rand() % WORD_POOL_SIZE;
+        int dup = 0;
+        for (int j = 0; j < filled; j++) if (s_qOpts[j] == idx) dup++;
+        if (!dup) s_qOpts[filled++] = idx;
+    }
+    for (int i = 3; i > 0; i--) { /* shuffle */
+        int j = rand() % (i + 1);
+        int t = s_qOpts[i]; s_qOpts[i] = s_qOpts[j]; s_qOpts[j] = t;
+    }
+    for (int i = 0; i < 4; i++) if (s_qOpts[i] == s_qWord) { s_qCorrect = i; break; }
+    s_opt = 0;
+}
+
+static bool in_wrong_book(int idx)
+{
+    for (int i = 0; i < s_wrong_n; i++) if (s_wrong_book[i] == idx) return true;
+    return false;
+}
+static void add_wrong(int idx)
+{
+    if (s_wrong_n >= MAX_WRONG) return;
+    if (in_wrong_book(idx)) return;
+    s_wrong_book[s_wrong_n++] = idx;
+}
+static void remove_wrong(int idx)
+{
+    for (int i = 0; i < s_wrong_n; i++) {
+        if (s_wrong_book[i] == idx) {
+            for (int k = i; k < s_wrong_n - 1; k++) s_wrong_book[k] = s_wrong_book[k + 1];
+            s_wrong_n--;
+            return;
+        }
+    }
+}
+
+static void pet_gif_hide(bool hide)
+{
+    if (s_gif) {
+        if (hide) lv_obj_add_flag(s_gif, LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_remove_flag(s_gif, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void render_grade_select(void)
+{
+    static const char *const labels[5] = { "三年级（200词）", "四年级（191词）", "五年级（198词）", "六年级（196词）", "返回宠物" };
+    lv_label_set_text(s_p_word, "选择训练年级");
+    lv_obj_set_style_text_font(s_p_word, CN_FONT, 0);
+    lv_obj_set_pos(s_p_word, 0, 16);
+    for (int i = 0; i < 5; i++) {
+        lv_label_set_text(s_p_txt[i], labels[i]);
+        lv_obj_set_style_text_font(s_p_txt[i], CN_FONT, 0);
+        lv_obj_set_pos(s_p_txt[i], TXT_X, 10);
+        lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(C_ROWTXT), 0);
+        lv_obj_set_style_opa(s_p_cursor[i], i == s_opt ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+    }
+}
+
+static void start_grade_select(void)
+{
+    s_mode = MODE_GRADE_SELECT;
+    s_opt = 0;
+    pet_gif_hide(true);
+    ui_sound_bgm_suspend(true);
+    if (s_panel) lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
+    render_grade_select();
+}
+
+static void start_train_for_grade(uint8_t grade)
+{
+    s_grade = grade;
+    s_mode = MODE_TRAIN;
+    s_opt = 0;
+    build_question();
+    pet_gif_hide(true);
+    ui_sound_bgm_suspend(true);
+    if (s_panel) lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
+    render_panel();
+}
+static void start_review(void)
+{
+    if (s_wrong_n == 0) return;
+    LOGI("review start: 错题 %d 个", s_wrong_n);
+    s_mode = MODE_REVIEW;
+    s_opt = 0;
+    build_question();
+    pet_gif_hide(true);
+    ui_sound_bgm_suspend(true);            /* 温习同训练：题板期静音 */
+    if (s_panel) lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
+    render_panel();
+}
+static void exit_qa(void)
+{
+    s_mode = MODE_HOME;
+    if (s_panel) lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
+    pet_gif_hide(false);                   /* 回主页恢复宠物 */
+    ui_sound_bgm_suspend(false);           /* 回到宠物页，音乐从暂停处续播 */
+    s_stat.energy = CLAMP((int)s_stat.energy - 4);
+}
+
+static void answer(int option)
+{
+    bool right = (option == s_qCorrect);
+    ui_sound_play(right ? UI_SND_CORRECT : UI_SND_WRONG);   /* 答对/答错提示音 */
+    if (right) {
+        s_mem[s_qWord] = MEM_FULL;            /* 学会 / 记忆刷新到满分 */
+        /* 答对即出温习 —— 不分训练还是温习（王总 0911 反馈）。
+           原来只在 MODE_REVIEW 里移除，导致训练中"先答错、后答对"的词
+           永远留在错题本里，温习时又冒出来，被当成"平白无故的新词"。 */
+        remove_wrong(s_qWord);
+        s_stat.hunger = CLAMP(s_stat.hunger + 25);
+        s_stat.happy  = CLAMP(s_stat.happy  + 10);
+        try_evolve();                          /* 词数变了，检查进化 */
+        if (s_mode == MODE_REVIEW && s_wrong_n == 0) {
+            exit_qa();                         /* 错题本清空 → 自动回主页 */
+            return;
+        }
+    } else {
+        s_stat.happy = CLAMP((int)s_stat.happy - 3);
+        add_wrong(s_qWord);
+    }
+    s_stat.energy = CLAMP((int)s_stat.energy - 2);
+    build_question();
+    render_panel();
+    pet_save_soon();                       /* 掉电保存：答完一题就记一笔（节流 20s） */
+}
+
+/* 闪光淡出回调（一次性，手动 delete） */
+static void fade_flash_cb(lv_timer_t *tm)
+{
+    if (s_flash) lv_obj_add_flag(s_flash, LV_OBJ_FLAG_HIDDEN);
     lv_timer_delete(tm);
 }
 
-/* 经验增加，满则升级；到达阈值触发进化 */
+/* ============================================================
+ *  进化：严格同家族、逐档，缺档不越级
+ * ============================================================ */
 static void try_evolve(void)
 {
+    static const int TH[3] = { 0, EVO_KNOWN_1, EVO_KNOWN_2 };
     const pokemon_gif_t *cur = &pokemon_gifs[s_cur_poke_idx];
+    int target = cur->evo_stage + 1;
+    if (target > 2) return;
+    if (known_count() < TH[target]) return;
+
     int next_idx = -1;
     for (int i = 0; i < pokemon_gif_count; i++) {
-        if (i == s_cur_poke_idx) continue;
         if (pokemon_gifs[i].evo_family == cur->evo_family &&
-            pokemon_gifs[i].evo_stage == cur->evo_stage + 1) {
-            next_idx = i;
-            break;
+            pokemon_gifs[i].evo_stage == target) {
+            next_idx = i; break;
         }
     }
     if (next_idx < 0) return;
-
-    bool can_evolve = false;
-    if (cur->evo_stage == 0 && s_stat.lv >= EVO_LV_STAGE1) can_evolve = true;
-    if (cur->evo_stage == 1 && s_stat.lv >= EVO_LV_STAGE2) can_evolve = true;
-    if (!can_evolve) return;
-
     s_cur_poke_idx = next_idx;
+    LOGI("evolve -> %s (known=%d)", pokemon_gifs[next_idx].name, known_count());
+
     if (s_flash) {
-        lv_obj_set_style_bg_color(s_flash, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_move_foreground(s_flash);
         lv_obj_set_style_bg_opa(s_flash, LV_OPA_90, 0);
         lv_obj_remove_flag(s_flash, LV_OBJ_FLAG_HIDDEN);
-        lv_timer_create(flash_fade_cb, 400, s_flash);
+        lv_timer_create(fade_flash_cb, 350, NULL);
     }
-    if (s_gif) gif_player_stop(s_gif);
-    s_gif = gif_player_create(s_scr, 88, 156, 64, 64);
+
     if (s_gif) {
-        gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data, pokemon_gifs[s_cur_poke_idx].len);
+        gif_player_stop(s_gif);
+        /* 千万别在这里 lv_obj_delete(s_gif)！播放器是全局单例，内部 p->canvas
+         * 仍指着这个对象；下次 gif_player_create 复用单例时会对已删对象再删一次
+         * → use-after-free（重修后再孵蛋必崩的根因）。只隐藏，旧画布由
+         * gif_player_create 复用路径安全删除。 */
+        lv_obj_add_flag(s_gif, LV_OBJ_FLAG_HIDDEN);
+        s_gif = NULL;
     }
-    if (s_namelabel) lv_label_set_text(s_namelabel, pokemon_gifs[s_cur_poke_idx].name);
+    s_gif = gif_player_create(s_scr, PET_X, PET_Y, PET_SIZE, PET_SIZE);
+    if (s_gif) {
+        gif_player_set_bob(s_gif, true);
+        gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data,
+                        pokemon_gifs[s_cur_poke_idx].len);
+        /* 训练/温习答题中触发的进化：题板全屏，新宠物画布保持隐藏 */
+        if (s_mode == MODE_TRAIN || s_mode == MODE_REVIEW) pet_gif_hide(true);
+    }
 }
 
-/* 经验增加，满则升级 */
-static void add_exp(uint16_t amount)
+/* ============================================================
+ *  破壳 / 重开蛋
+ * ============================================================ */
+static void do_hatch(void)
 {
-    s_stat.exp += amount;
-    while (s_stat.exp >= EXP_PER_LEVEL) {
-        s_stat.exp -= EXP_PER_LEVEL;
-        s_stat.lv++;
-        try_evolve();
+    if (s_egg) {
+        ui_pixel_egg_destroy(s_egg);
+        s_egg = NULL;
+    }
+    s_cur_poke_idx = (uint8_t)s_bases[rand() % s_base_n];   /* 只出有进化链的基础形态 */
+    LOGI("hatch -> %s", pokemon_gifs[s_cur_poke_idx].name);
+    s_mode = MODE_HOME;
+    s_gif = gif_player_create(s_scr, PET_X, PET_Y, PET_SIZE, PET_SIZE);
+    if (s_gif) {
+        gif_player_set_bob(s_gif, true);
+        gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data,
+                        pokemon_gifs[s_cur_poke_idx].len);
+    }
+    pet_save_now();                        /* 破壳是关键节点，立刻落盘 */
+}
+
+static void reset_egg(void)
+{
+    if (s_gif) {
+        gif_player_stop(s_gif);
+        /* 只隐藏不删除，原因同 try_evolve：单例 p->canvas 悬空会导致
+         * 重修后再孵蛋时 use-after-free 崩溃 */
+        lv_obj_add_flag(s_gif, LV_OBJ_FLAG_HIDDEN);
+        s_gif = NULL;
+    }
+    if (s_egg) {
+        ui_pixel_egg_destroy(s_egg);
+        s_egg = NULL;
+    }
+    s_stat.hunger = 80; s_stat.happy = 80; s_stat.energy = 80;
+    s_hatch_clicks = 0;
+    s_sleeping = false;
+    ui_sound_bgm(true);                   /* 重修回到蛋期，音乐照放 */
+    /* 学习记录（s_mem / 错题本）保留 —— 重修是重养宠物，不是清空学习 */
+    s_mode = MODE_EGG;
+    s_menu = MENU_TRAIN;
+    s_opt = 0;
+    s_tick_div = 0;
+    if (s_night) lv_obj_add_flag(s_night, LV_OBJ_FLAG_HIDDEN);
+    if (s_panel) lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
+    if (s_topbar_bg) lv_obj_add_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
+    pet_gif_hide(false);
+    s_egg = ui_pixel_egg_create(s_scr, EGG_X, EGG_Y);
+    pet_save_now();                        /* 重修=回蛋：学习记录保留，只是宠物重来 */
+}
+
+/* ============================================================
+ *  睡觉：黑幕三段拉下 / 向上撤出
+ * ============================================================ */
+typedef struct { int step; bool leaving; } curtain_ctx_t;
+
+static void curtain_cb(lv_timer_t *t)
+{
+    curtain_ctx_t *c = (curtain_ctx_t *)lv_timer_get_user_data(t);
+    static const int H_IN[3]  = { 107, 213, 320 };   /* 入睡：顶部往下拉（噔噔噔） */
+    static const int H_OUT[3] = { 213, 107, 0 };     /* 醒来：底部锚定收缩，上方先亮 */
+    int h = c->leaving ? H_OUT[c->step] : H_IN[c->step];
+    if (c->leaving) lv_obj_set_pos(s_night, 0, 320 - h);
+    else            lv_obj_set_pos(s_night, 0, 0);
+    lv_obj_set_size(s_night, 240, h);
+    c->step++;
+    if (c->step >= 3) {
+        if (c->leaving) {
+            lv_obj_add_flag(s_night, LV_OBJ_FLAG_HIDDEN);
+            s_sleeping = false;                       /* 动画走完才真正解锁 */
+        } else {
+            lv_obj_remove_flag(s_zzz, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_timer_delete(t);
+        free(c);
+        s_curtain_t = NULL;
     }
 }
 
-/* 每秒衰减 */
+static void curtain_start(bool leaving)
+{
+    curtain_ctx_t *c = (curtain_ctx_t *)malloc(sizeof(curtain_ctx_t));
+    if (!c) {                             /* 内存不足兜底：直接到位 */
+        if (leaving) {
+            lv_obj_add_flag(s_night, LV_OBJ_FLAG_HIDDEN);
+            s_sleeping = false;
+        } else {
+            lv_obj_set_pos(s_night, 0, 0);
+            lv_obj_set_size(s_night, 240, 320);
+            lv_obj_remove_flag(s_zzz, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+    c->step = 0;
+    c->leaving = leaving;
+    s_curtain_t = lv_timer_create(curtain_cb, 130, c);
+}
+
+static void start_sleep(void)
+{
+    s_sleeping = true;
+    ui_sound_bgm(false);                  /* 睡了就别放着音乐了 */
+    s_stat.energy = CLAMP(s_stat.energy + 30);
+    s_stat.hunger = CLAMP((int)s_stat.hunger - 3);
+    lv_obj_add_flag(s_zzz, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_pos(s_night, 0, 0);
+    lv_obj_set_size(s_night, 240, 0);
+    lv_obj_remove_flag(s_night, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_night);        /* 黑幕压宠物 */
+    curtain_start(false);
+    pet_save_soon();                        /* 睡一觉能量 +30，记一下 */
+}
+
+static void start_wake(void)
+{
+    lv_obj_add_flag(s_zzz, LV_OBJ_FLAG_HIDDEN);
+    ui_sound_bgm(true);                     /* 醒了接着放（睡觉时暂停的那段不补） */
+    curtain_start(true);                    /* s_sleeping 在动画结束时清 */
+}
+
+/* ============================================================
+ *  遗忘：记忆度每小时 -1，归 0 掉进错题本，攻数值跟着掉
+ * ============================================================ */
+static void forget_tick(void)
+{
+    bool dropped = false;
+    for (int i = 0; i < WORD_POOL_SIZE; i++) {
+        if (s_mem[i] == 0) continue;
+        s_mem[i]--;
+        if (s_mem[i] == 0) {
+            add_wrong(i);
+            dropped = true;
+        }
+    }
+    if (dropped) s_atk_alert_blinks = 6;    /* 攻框闪红约 2 秒 */
+}
+
+/* ============================================================
+ *  状态衰减 tick（1 秒）
+ * ============================================================ */
 static void tick_cb(void *arg)
 {
     (void)arg;
-    if (!s_active || !s_hatched || s_training) return;
-    s_stat.hunger = CLAMP(s_stat.hunger - 1);
-    s_stat.happy  = CLAMP(s_stat.happy  - 1);
-    s_stat.energy = CLAMP(s_stat.energy - 1);
-    s_stat.clean  = CLAMP(s_stat.clean  - 1);
-    if (s_sleeping) {
-        s_stat.energy = CLAMP(s_stat.energy + 2);
-        s_stat.hunger = CLAMP(s_stat.hunger - 1);
-    }
-    if (bsp_lvgl_lock(100)) {
-        refresh();
-        bsp_lvgl_unlock();
-    }
-}
+    if (!s_active || s_mode == MODE_EGG) return;
 
-/* 破壳：随机选一只基础形态宝可梦，播放 GIF */
-static void do_hatch(void)
-{
-    if (!s_ball) return;
-    ui_pixel_ball_open(s_ball);
-    s_ball = NULL;
-    s_hatched = true;
-
-    int tries = 0;
-    do {
-        s_cur_poke_idx = rand() % pokemon_gif_count;
-        tries++;
-    } while (pokemon_gifs[s_cur_poke_idx].evo_stage != 0 && tries < 20);
-    const pokemon_gif_t *pg = &pokemon_gifs[s_cur_poke_idx];
-
-    s_gif = gif_player_create(s_scr, 88, 156, 64, 64);
-    if (s_gif) {
-        gif_player_play(s_gif, pg->data, pg->len);
-    }
-
-    if (s_namelabel) lv_label_set_text(s_namelabel, pg->name);
-
-    refresh();
-}
-
-/* ---------- 训练模式：英语单词选词 ---------- */
-static void train_start(void);
-static void train_show_question(void);
-static void train_answer(int option);
-static void train_exit(void);
-
-static void train_start(void)
-{
-    s_training = true;
-    /* 隐藏 GIF 和名字 */
-    if (s_gif) lv_obj_add_flag(s_gif, LV_OBJ_FLAG_HIDDEN);
-    if (s_namelabel) lv_obj_add_flag(s_namelabel, LV_OBJ_FLAG_HIDDEN);
-
-    /* 创建训练面板 */
-    s_train_panel = lv_obj_create(s_scr);
-    lv_obj_remove_flag(s_train_panel, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(s_train_panel, 20, 100);
-    lv_obj_set_size(s_train_panel, 200, 180);
-    lv_obj_set_style_bg_color(s_train_panel, lv_color_hex(0xF4F4EA), 0);
-    lv_obj_set_style_bg_opa(s_train_panel, LV_OPA_90, 0);
-    lv_obj_set_style_border_width(s_train_panel, 2, 0);
-    lv_obj_set_style_border_color(s_train_panel, lv_color_hex(0x17202A), 0);
-    lv_obj_set_style_pad_all(s_train_panel, 8, 0);
-    lv_obj_set_style_radius(s_train_panel, 0, 0);
-
-    /* 英文单词标签 */
-    s_train_word = ui_pixel_label(s_train_panel, "", &lv_font_montserrat_20, 0x17202A);
-    lv_obj_set_pos(s_train_word, 10, 10);
-
-    /* 4 个中文选项 */
-    for (int i = 0; i < 4; i++) {
-        s_train_opts[i] = lv_obj_create(s_train_panel);
-        lv_obj_remove_flag(s_train_opts[i], LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(s_train_opts[i], 10, 40 + i * 28);
-        lv_obj_set_size(s_train_opts[i], 170, 24);
-        lv_obj_set_style_bg_color(s_train_opts[i], lv_color_hex(0xFFFFFF), 0);
-        lv_obj_set_style_bg_opa(s_train_opts[i], LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(s_train_opts[i], 1, 0);
-        lv_obj_set_style_border_color(s_train_opts[i], lv_color_hex(0x888888), 0);
-        lv_obj_set_style_pad_all(s_train_opts[i], 2, 0);
-        lv_obj_set_style_radius(s_train_opts[i], 0, 0);
-    }
-
-    /* 选中指示器（>符号） */
-    s_train_cursor = ui_pixel_label(s_train_panel, ">", &lv_font_montserrat_14, 0xFF0000);
-    lv_obj_set_pos(s_train_cursor, 0, 44);
-
-    train_show_question();
-}
-
-static void train_show_question(void)
-{
-    /* 随机选一个单词作为正确答案 */
-    s_train_word_idx = rand() % WORD_POOL_SIZE;
-    /* 随机选 3 个干扰项 */
-    int wrong_indices[3];
-    for (int i = 0; i < 3; i++) {
-        int idx;
-        do {
-            idx = rand() % WORD_POOL_SIZE;
-        } while (idx == s_train_word_idx);
-        wrong_indices[i] = idx;
-    }
-
-    /* 随机决定正确答案的位置（0-3） */
-    s_train_correct = rand() % 4;
-    s_train_option_idx = 0;
-
-    /* 设置英文单词 */
-    lv_label_set_text(s_train_word, word_pool[s_train_word_idx].en);
-
-    /* 设置 4 个选项 */
-    int wrong_pos = 0;
-    for (int i = 0; i < 4; i++) {
-        if (i == s_train_correct) {
-            lv_label_set_text(s_train_opts[i], word_pool[s_train_word_idx].cn);
-        } else {
-            lv_label_set_text(s_train_opts[i], word_pool[wrong_indices[wrong_pos]].cn);
-            wrong_pos++;
+    if (++s_tick_div >= 3) {               /* 每 3 秒掉 1 点 */
+        s_tick_div = 0;
+        s_stat.hunger = CLAMP((int)s_stat.hunger - 1);
+        s_stat.happy  = CLAMP((int)s_stat.happy  - 1);
+        s_stat.energy = CLAMP((int)s_stat.energy - 1);
+        if (s_sleeping) {
+            s_stat.energy = CLAMP(s_stat.energy + 1);
+            s_stat.hunger = CLAMP((int)s_stat.hunger - 1);
         }
     }
 
-    /* 移动光标到第一个选项 */
-    lv_obj_set_pos(s_train_cursor, 0, 44);
-}
+    if (++s_forget_cnt >= FORGET_SEC) {    /* 遗忘时钟 */
+        s_forget_cnt = 0;
+        forget_tick();
+        pet_save_soon();                   /* 掉词了，错题本变了，标脏 */
+    }
 
-static void train_answer(int option)
-{
-    if (option == s_train_correct) {
-        /* 答对：经验+25，心情+10 */
-        add_exp(25);
-        s_stat.happy = CLAMP(s_stat.happy + 10);
-        /* 显示下一题 */
-        train_show_question();
-    } else {
-        /* 答错：经验+5，心情-5 */
-        add_exp(5);
-        s_stat.happy = CLAMP((int)s_stat.happy - 5);
-        /* 标记错误选项（红色边框） */
-        lv_obj_set_style_border_color(s_train_opts[option], lv_color_hex(0xFF0000), 0);
-        /* 0.5 秒后恢复并出下一题 */
-        /* 简化：直接出下一题 */
-        train_show_question();
+    /* 兜底落盘：脏数据攒够了就写一次。注意【状态自然衰减不标脏】——
+       每 3 秒掉 1 点体力也要写 flash 的话，一天几千次，flash 会被写穿。 */
+    if (s_save_dirty && (esp_timer_get_time() - s_last_save_us) >= PS_SAVE_GAP_US) {
+        pet_save_soon();
     }
 }
 
-static void train_exit(void)
-{
-    s_training = false;
-    if (s_train_panel) {
-        lv_obj_delete(s_train_panel);
-        s_train_panel = NULL;
-    }
-    /* 恢复显示 GIF 和名字 */
-    if (s_gif) lv_obj_remove_flag(s_gif, LV_OBJ_FLAG_HIDDEN);
-    if (s_namelabel) lv_obj_remove_flag(s_namelabel, LV_OBJ_FLAG_HIDDEN);
-    /* 训练消耗精力 + 饥饿 */
-    s_stat.energy = CLAMP((int)s_stat.energy - 15);
-    s_stat.hunger = CLAMP((int)s_stat.hunger - 8);
-    refresh();
-}
-
-/* ---------- demo 接口 ---------- */
+/* ============================================================
+ *  demo 接口
+ * ============================================================ */
 void demo_pet_enter(void)
 {
+    LOGI("enter free=%d", (int)esp_get_free_heap_size());
     srand(esp_random());
-    s_stat.hunger = 80; s_stat.happy = 80;
-    s_stat.energy = 80; s_stat.clean = 80;
-    s_stat.lv = 1; s_stat.exp = 0;
-    s_hatched = false; s_hatch_clicks = 0;
+    /* 先按"新档"铺默认值，再用 NVS 存档覆盖 —— 有档就接着上次练 */
+    s_stat.hunger = 80; s_stat.happy = 80; s_stat.energy = 80;
+    s_hatch_clicks = 0;
+    s_sleeping = false;
+    s_tick_div = 0;
+    s_forget_cnt = 0;
+    s_menu = MENU_TRAIN;
+    s_opt = 0;
+    s_cur_poke_idx = 0;
+    s_wrong_n = 0;
+    s_atk_alert_blinks = 0;
     s_active = true;
-    s_training = false;
+    s_save_dirty = false;
+    s_last_save_us = esp_timer_get_time();
+    memset(s_mem, 0, sizeof(s_mem));
+    memset(s_wrong_book, 0, sizeof(s_wrong_book));
+
+    s_restored = pet_load();               /* 掉电保存：读回学习进度与宠物状态 */
+    s_mode = s_restored ? MODE_HOME : MODE_EGG;
+    LOGI("存档 %s：已学会 %d 词 / 错题 %d 个 / 宠物#%d / 饱%d 乐%d 力%d",
+         s_restored ? "已恢复" : "无(新档)", known_count(), s_wrong_n,
+         s_cur_poke_idx, s_stat.hunger, s_stat.happy, s_stat.energy);
+
+    /* 对象清零（防止上次退出残留） */
+    s_scr = NULL; s_egg = NULL; s_gif = NULL;
+    s_topbar_bg = NULL; s_atkbox = NULL; s_atk_num = NULL;
+    s_night = NULL; s_zzz = NULL; s_flash = NULL;
+    s_panel = NULL; s_p_word = NULL;
+    for (int i = 0; i < 4; i++) s_menu_btns[i] = NULL;
+    for (int i = 0; i < 5; i++) { s_p_opts[i] = NULL; s_p_txt[i] = NULL; s_p_cursor[i] = NULL; }
+    s_blink_t = NULL; s_curtain_t = NULL;
+
+    /* 破壳候选：stage0 且家族内有 stage1（有进化链才入候选） */
+    s_base_n = 0;
+    for (int i = 0; i < pokemon_gif_count; i++) {
+        if (pokemon_gifs[i].evo_stage != 0) continue;
+        for (int j = 0; j < pokemon_gif_count; j++) {
+            if (pokemon_gifs[j].evo_family == pokemon_gifs[i].evo_family &&
+                pokemon_gifs[j].evo_stage == 1) {
+                if (s_base_n < (int)(sizeof(s_bases) / sizeof(s_bases[0])))
+                    s_bases[s_base_n++] = i;
+                break;
+            }
+        }
+    }
+    LOGI("hatch bases=%d", s_base_n);
+
+    gif_player_set_bg_fn(bg_color_at);
 
     s_scr = ui_pixel_screen_create("PET");
-
-    /* 背景：天空 + 草地 */
     draw_background(s_scr);
 
-    /* 顶部状态条 */
-    build_status_bar();
+    build_topbar();
+    lv_obj_add_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
 
-    /* 精灵球（屏幕居中），点击 3 次破壳 */
-    s_ball = ui_pixel_ball_create(s_scr, 108, 148);
+    if (s_restored) {
+        /* 有存档：直接回到宠物身边，跳过一次破壳（王总 0911 关机不丢进度） */
+        s_hatch_clicks = 3;
+        s_gif = gif_player_create(s_scr, PET_X, PET_Y, PET_SIZE, PET_SIZE);
+        if (s_gif) {
+            gif_player_set_bob(s_gif, true);
+            gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data,
+                            pokemon_gifs[s_cur_poke_idx].len);
+        }
+        lv_obj_remove_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        s_egg = ui_pixel_egg_create(s_scr, EGG_X, EGG_Y);
+    }
+    /* 睡觉黑幕（初始隐藏；Zzz 为子对象，拉幕到位才显示） */
+    s_night = lv_obj_create(s_scr);
+    lv_obj_remove_flag(s_night, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(s_night, 0, 0);
+    lv_obj_set_size(s_night, 240, 320);
+    lv_obj_set_style_bg_color(s_night, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(s_night, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_night, 0, 0);
+    lv_obj_set_style_pad_all(s_night, 0, 0);
+    lv_obj_set_style_radius(s_night, 0, 0);
+    lv_obj_add_flag(s_night, LV_OBJ_FLAG_HIDDEN);
+    s_zzz = lv_label_create(s_night);
+    lv_label_set_text(s_zzz, "Zzz");
+    lv_obj_set_style_text_font(s_zzz, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_zzz, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(s_zzz);
+    lv_obj_add_flag(s_zzz, LV_OBJ_FLAG_HIDDEN);
 
-    /* 宠物名字标签（破壳后显示） */
-    s_namelabel = ui_pixel_label(s_scr, "", &lv_font_montserrat_14, UI_INK);
-    lv_obj_set_pos(s_namelabel, 100, 230);
-    lv_obj_set_style_bg_color(s_namelabel, lv_color_hex(0xF4F4EA), 0);
-    lv_obj_set_style_bg_opa(s_namelabel, LV_OPA_80, 0);
-    lv_obj_set_style_pad_all(s_namelabel, 2, 0);
-
-    /* 进化闪光层（全屏白色矩形，初始隐藏）*/
+    /* 进化闪光 */
     s_flash = lv_obj_create(s_scr);
     lv_obj_remove_flag(s_flash, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_pos(s_flash, 0, 0);
@@ -384,108 +1065,185 @@ void demo_pet_enter(void)
     lv_obj_set_style_bg_color(s_flash, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_bg_opa(s_flash, LV_OPA_0, 0);
     lv_obj_set_style_border_width(s_flash, 0, 0);
-    lv_obj_set_style_pad_all(s_flash, 0, 0);
     lv_obj_add_flag(s_flash, LV_OBJ_FLAG_HIDDEN);
 
-    /* 睡觉半透明遮罩（覆盖 GIF 区域，初始隐藏）*/
-    s_sleepmask = lv_obj_create(s_scr);
-    lv_obj_remove_flag(s_sleepmask, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(s_sleepmask, 88, 156);
-    lv_obj_set_size(s_sleepmask, 64, 64);
-    lv_obj_set_style_bg_color(s_sleepmask, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(s_sleepmask, LV_OPA_40, 0);
-    lv_obj_set_style_border_width(s_sleepmask, 0, 0);
-    lv_obj_set_style_pad_all(s_sleepmask, 0, 0);
-    lv_obj_add_flag(s_sleepmask, LV_OBJ_FLAG_HIDDEN);
+    /* 训练 / 温习面板：全屏绿豆覆盖，无任何标题提示文字 */
+    s_panel = lv_obj_create(s_scr);
+    lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(s_panel, 0, 0);
+    lv_obj_set_size(s_panel, 240, 320);
+    lv_obj_set_style_bg_color(s_panel, lv_color_hex(C_BG), 0);
+    lv_obj_set_style_bg_opa(s_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_panel, 0, 0);
+    lv_obj_set_style_pad_all(s_panel, 0, 0);
+    lv_obj_set_style_radius(s_panel, 0, 0);
+    lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
 
-    /* 操作提示（底部简化） */
-    lv_obj_t *tip = ui_pixel_label(s_scr,
-        "UP:FEED  DOWN:PLAY  OK:SLEEP",
-        &lv_font_montserrat_14, UI_INK);
-    lv_obj_set_pos(tip, 16, 268);
-    lv_obj_t *tip2 = ui_pixel_label(s_scr,
-        "LONG UP:WASH  LONG DOWN:TRAIN",
-        &lv_font_montserrat_14, UI_INK);
-    lv_obj_set_pos(tip2, 10, 286);
+    s_p_word = lv_label_create(s_panel);
+    lv_obj_set_pos(s_p_word, 0, 16);
+    lv_obj_set_size(s_p_word, 240, 34);
+    lv_obj_set_style_text_color(s_p_word, lv_color_hex(C_INK), 0);
+    lv_obj_set_style_text_align(s_p_word, LV_TEXT_ALIGN_CENTER, 0);
+
+    /* 行宽按"最长内容"定，别拍脑袋：
+     *   中文选项最长 126px（"帕帕韦斯特雷岛" 7 字 × 18px）
+     *   返回行最长   126px（"结束训练，返回" 7 字 × 18px）
+     * 文字区可用宽度 = 行宽 - 26（左边距 20 + 右边距 6）。
+     * v11 时返回行行宽 154 → 文字区仅 120px < 126px，"回"字换到第二行、
+     * 被 24px 的行高切掉，王总看到的就是"只有一个返字"（0911）。 */
+    for (int i = 0; i < 5; i++) {
+        int w = (i < 4) ? ROW_W : ROW_W5; /* 返回行仍略窄，保留视觉区分 */
+        lv_obj_t *row = lv_obj_create(s_panel);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_pos(row, (240 - w) / 2, 58 + i * 48);
+        lv_obj_set_size(row, w, ROW_H);
+        lv_obj_set_style_bg_color(row, lv_color_hex(C_ROW), 0);
+        lv_obj_set_style_border_width(row, 2, 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(C_ROWBRD), 0);
+        lv_obj_set_style_radius(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        s_p_opts[i] = row;
+
+        s_p_cursor[i] = lv_label_create(row);
+        lv_label_set_text(s_p_cursor[i], ">");
+        lv_obj_set_style_text_font(s_p_cursor[i], &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(s_p_cursor[i], lv_color_hex(0xE53935), 0);
+        lv_obj_set_pos(s_p_cursor[i], 6, (ROW_H - (int)lv_font_montserrat_14.line_height) / 2);
+        lv_obj_set_style_bg_opa(s_p_cursor[i], LV_OPA_TRANSP, 0);
+
+        s_p_txt[i] = lv_label_create(row);
+        lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(C_INK), 0);
+        /* 位置/字号由 render_panel() 每次按内容定（英文长词要缩档），
+           这里只给一份初值，保证首帧不出奇怪的样子。 */
+        lv_obj_set_pos(s_p_txt[i], TXT_X, 10);
+        lv_obj_set_size(s_p_txt[i], ROW_AVAIL(w), 24);
+        /* 锁死单行：行高 42 只放得下一行，换行必然把第二个字切掉 */
+        lv_label_set_long_mode(s_p_txt[i], LV_LABEL_LONG_CLIP);
+    }
 
     lv_screen_load(s_scr);
 
-    esp_timer_create_args_t args = {
-        .callback = tick_cb,
-        .name = "pet_tick",
-    };
-    esp_timer_create(&args, &s_timer);
-    esp_timer_start_periodic(s_timer, 1000000);
+    ui_sound_bgm(true);                       /* 进宠物页就起 8bit 背景乐 */
+
+    s_blink_t = lv_timer_create(blink_timer_cb, 350, NULL);
+
+    esp_timer_create_args_t args = { .callback = tick_cb, .name = "pet_tick" };
+    esp_timer_create(&args, &s_tick_timer);
+    esp_timer_start_periodic(s_tick_timer, 1000000);
 }
 
 void demo_pet_exit(void)
 {
+    LOGI("exit free=%d", (int)esp_get_free_heap_size());
+    pet_save_now();                           /* 离开前把进度落盘（掉电保存） */
     s_active = false;
     s_sleeping = false;
-    s_training = false;
-    if (s_timer) { esp_timer_stop(s_timer); esp_timer_delete(s_timer); s_timer = NULL; }
-    if (s_scr)  { lv_obj_delete(s_scr); s_scr = NULL; s_gif = NULL; s_ball = NULL; s_flash = NULL; s_sleepmask = NULL; s_train_panel = NULL; }
+    ui_sound_bgm(false);                      /* 离开宠物页就停背景乐 */
+    if (s_tick_timer) { esp_timer_stop(s_tick_timer); esp_timer_delete(s_tick_timer); s_tick_timer = NULL; }
+    if (s_blink_t) { lv_timer_delete(s_blink_t); s_blink_t = NULL; }
+    /* s_curtain_t 若还在跑，其 ctx 由 cb 自释放；屏幕整体删除后定时器不再触发安全路径，
+       这里主动停掉防悬空 */
+    if (s_curtain_t) {
+        void *c = lv_timer_get_user_data(s_curtain_t);
+        lv_timer_delete(s_curtain_t);
+        if (c) free(c);
+        s_curtain_t = NULL;
+    }
+    gif_player_destroy();
+    if (s_scr) lv_obj_delete(s_scr);
+    s_scr = NULL;
+    s_egg = NULL; s_gif = NULL;
+    s_topbar_bg = NULL; s_atkbox = NULL; s_atk_num = NULL;
+    s_night = NULL; s_zzz = NULL; s_flash = NULL;
+    s_panel = NULL; s_p_word = NULL;
+    for (int i = 0; i < 4; i++) s_menu_btns[i] = NULL;
+    for (int i = 0; i < 5; i++) { s_p_opts[i] = NULL; s_p_txt[i] = NULL; s_p_cursor[i] = NULL; }
+    LOGI("exit done free=%d", (int)esp_get_free_heap_size());
 }
 
 void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
 {
-    /* 训练模式下：上下选选项，OK 确认，长按 OK 退出 */
-    if (s_training) {
+    /* 睡觉锁键：只有 OK 能唤醒，其余键全吞（黑幕动画中也吞） */
+    if (s_sleeping) {
+        if (ev == BSP_BTN_CLICK && btn == BSP_BTN_OK && s_curtain_t == NULL) {
+            ui_sound_play(UI_SND_SWITCH);
+            start_wake();
+        }
+        return;
+    }
+
+    /* 训练：先选三、四、五、六年级。 */
+    if (s_mode == MODE_GRADE_SELECT) {
         if (ev == BSP_BTN_CLICK) {
             if (btn == BSP_BTN_UP) {
-                s_train_option_idx = (s_train_option_idx - 1 + 4) % 4;
-                lv_obj_set_pos(s_train_cursor, 0, 44 + s_train_option_idx * 28);
+                s_opt = (s_opt + 4) % 5;
+                ui_sound_play(UI_SND_SWITCH);
+                render_grade_select();
             } else if (btn == BSP_BTN_DOWN) {
-                s_train_option_idx = (s_train_option_idx + 1) % 4;
-                lv_obj_set_pos(s_train_cursor, 0, 44 + s_train_option_idx * 28);
+                s_opt = (s_opt + 1) % 5;
+                ui_sound_play(UI_SND_SWITCH);
+                render_grade_select();
             } else if (btn == BSP_BTN_OK) {
-                train_answer(s_train_option_idx);
+                if (s_opt == 4) { ui_sound_play(UI_SND_SWITCH); exit_qa(); }
+                else { ui_sound_play(UI_SND_SWITCH); start_train_for_grade((uint8_t)(3 + s_opt)); }
             }
-        } else if (ev == BSP_BTN_LONG && btn == BSP_BTN_OK) {
-            train_exit();
         }
         return;
     }
 
-    /* 未破壳：任意按键累计破壳进度 */
-    if (!s_hatched) {
-        if (ev != BSP_BTN_CLICK) return;
-        s_hatch_clicks++;
-        if (s_ball) ui_pixel_ball_shake(s_ball, s_hatch_clicks <= 3 ? s_hatch_clicks : 3);
-        if (s_hatch_clicks >= 3) do_hatch();
+    /* 训练 / 温习：上下选项，OK 确认 */
+    if (s_mode == MODE_TRAIN || s_mode == MODE_REVIEW) {
+        if (ev == BSP_BTN_CLICK) {
+            if (btn == BSP_BTN_UP) {
+                s_opt = (s_opt + 4) % 5;
+                ui_sound_play(UI_SND_SWITCH);
+                render_panel();
+            } else if (btn == BSP_BTN_DOWN) {
+                s_opt = (s_opt + 1) % 5;
+                ui_sound_play(UI_SND_SWITCH);
+                render_panel();
+            } else if (btn == BSP_BTN_OK) {
+                if (s_opt == 4) { ui_sound_play(UI_SND_SWITCH); exit_qa(); }
+                else            answer(s_opt);          /* 判题音在 answer() 里出 */
+            }
+        }
         return;
     }
 
+    /* 蛋状态：只响应 OK */
+    if (s_mode == MODE_EGG) {
+        if (ev == BSP_BTN_CLICK && btn == BSP_BTN_OK) {
+            ui_sound_play(UI_SND_SWITCH);
+            s_hatch_clicks++;
+            if (s_egg) ui_pixel_egg_shake(s_egg, s_hatch_clicks <= 3 ? s_hatch_clicks : 3);
+            if (s_hatch_clicks >= 3) {
+                do_hatch();
+                if (s_topbar_bg) lv_obj_remove_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        return;
+    }
+
+    /* HOME */
     if (ev == BSP_BTN_CLICK) {
         if (btn == BSP_BTN_UP) {
-            /* 喂食 */
-            s_stat.hunger = CLAMP(s_stat.hunger + 25);
-            s_stat.clean  = CLAMP(s_stat.clean  - 5);
+            s_menu = (s_menu + 3) % 4;
+            ui_sound_play(UI_SND_SWITCH);
+            blink_timer_cb(NULL);
         } else if (btn == BSP_BTN_DOWN) {
-            /* 玩耍 */
-            s_stat.happy  = CLAMP(s_stat.happy  + 20);
-            s_stat.energy = CLAMP(s_stat.energy - 12);
-            s_stat.hunger = CLAMP(s_stat.hunger - 5);
+            s_menu = (s_menu + 1) % 4;
+            ui_sound_play(UI_SND_SWITCH);
+            blink_timer_cb(NULL);
         } else if (btn == BSP_BTN_OK) {
-            /* 睡觉/唤醒切换 */
-            s_sleeping = !s_sleeping;
-            if (s_sleeping) {
-                s_stat.energy = CLAMP(s_stat.energy + 30);
-                s_stat.hunger = CLAMP(s_stat.hunger - 3);
-                if (s_sleepmask) lv_obj_remove_flag(s_sleepmask, LV_OBJ_FLAG_HIDDEN);
-            } else {
-                if (s_sleepmask) lv_obj_add_flag(s_sleepmask, LV_OBJ_FLAG_HIDDEN);
+            ui_sound_play(UI_SND_SWITCH);
+            switch ((int)s_menu) {
+                case MENU_TRAIN:  start_grade_select(); break;
+                case MENU_SLEEP:  start_sleep(); break;
+                case MENU_REVIEW: start_review(); break;   /* 错题空时内部直接返回 */
+                case MENU_RESET:  reset_egg(); break;
             }
         }
-    } else if (ev == BSP_BTN_LONG) {
-        if (btn == BSP_BTN_UP) {
-            /* 清洁 */
-            s_stat.clean  = CLAMP(s_stat.clean  + 30);
-            s_stat.energy = CLAMP(s_stat.energy - 3);
-        } else if (btn == BSP_BTN_DOWN) {
-            /* 训练：进入英语单词选词模式 */
-            train_start();
-        }
+    } else if (ev == BSP_BTN_LONG && btn == BSP_BTN_UP) {
+        reset_egg();
     }
-    refresh();
 }
