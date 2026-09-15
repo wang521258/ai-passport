@@ -16,6 +16,7 @@
 #include "esp_log.h"
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 static const char *TAG = "ui_sound";
 
@@ -40,23 +41,59 @@ static TaskHandle_t  s_task;
 static bool          s_ready;
 static int16_t      *s_buf;        // 混音/增益缓冲(堆上分配,不占内部 RAM 的 .bss)
 static size_t        s_buf_cap;    // 容量(样本数)
+static volatile bool  s_bgm_enabled;
+static volatile bool  s_bgm_suspended;
+static uint8_t        s_bgm_step;
+
+/* 轻快的三角波旋律：无需额外音频文件，适合小喇叭且不会破音。 */
+static void write_tone(int period, int samples, int amplitude)
+{
+    if (!s_buf || samples <= 0) return;
+    if ((size_t)samples > s_buf_cap) samples = (int)s_buf_cap;
+    int half = period / 2;
+    for (int i = 0; i < samples; i++) {
+        int x = i % period;
+        int v = (x < half) ? (-amplitude + (2 * amplitude * x) / half)
+                           : ( amplitude - (2 * amplitude * (x - half)) / half);
+        s_buf[i] = (int16_t)v;
+    }
+    bsp_audio_write_mono(s_buf, (size_t)samples);
+}
+
+static void play_wrong_notice(void)
+{
+    /* 两个清晰的下行短音，比原来的闷响更容易分辨，音量也更高。 */
+    write_tone(80, 1280, 22000);   /* 200Hz */
+    write_tone(106, 1760, 21000);  /* 151Hz */
+}
+
+static void play_bgm_step(void)
+{
+    /* C大调五声音阶小循环：轻快、不刺耳。period 越小音越高。 */
+    static const uint8_t periods[] = { 61, 68, 76, 68, 61, 76, 91, 76, 68, 61, 68, 76, 61, 91, 76, 68 };
+    write_tone(periods[s_bgm_step % (sizeof(periods) / sizeof(periods[0]))], 1180, 5200);
+    s_bgm_step++;
+}
 
 static void sound_task(void *arg)
 {
     (void)arg;
     uint8_t id;
     for (;;) {
-        if (xQueueReceive(s_q, &id, portMAX_DELAY) != pdTRUE) continue;
-        if (id >= UI_SND_COUNT) continue;
-        const clip_t *c = &CLIPS[id];
-        if (!c->pcm || c->n <= 0) continue;
-
-        // 软件增益逐样本缩放后直接推给 BSP（BSP 内部展开成双声道槽）
-        int n = c->n;
-        if ((size_t)n > s_buf_cap) n = (int)s_buf_cap;
-        for (int i = 0; i < n; i++)
-            s_buf[i] = (int16_t)(((int)c->pcm[i] * SND_GAIN_NUM) / SND_GAIN_DEN);
-        bsp_audio_write_mono(s_buf, (size_t)n);
+        if (xQueueReceive(s_q, &id, pdMS_TO_TICKS(12)) == pdTRUE) {
+            if (id >= UI_SND_COUNT) continue;
+            if (id == UI_SND_WRONG) { play_wrong_notice(); continue; }
+            const clip_t *c = &CLIPS[id];
+            if (!c->pcm || c->n <= 0) continue;
+            int n = c->n;
+            if ((size_t)n > s_buf_cap) n = (int)s_buf_cap;
+            int gain = (id == UI_SND_CORRECT) ? 5 : 4;
+            for (int i = 0; i < n; i++)
+                s_buf[i] = (int16_t)(((int)c->pcm[i] * gain) / 8);
+            bsp_audio_write_mono(s_buf, (size_t)n);
+        } else if (s_bgm_enabled && !s_bgm_suspended) {
+            play_bgm_step();
+        }
     }
 }
 
@@ -98,4 +135,15 @@ void ui_sound_play(ui_sound_t id)
     uint8_t v = (uint8_t)id;
     xQueueReset(s_q);                 // 丢积压：保证手感跟手
     xQueueSend(s_q, &v, 0);
+}
+
+void ui_sound_bgm(bool enabled)
+{
+    s_bgm_enabled = enabled;
+    if (!enabled) s_bgm_step = 0;
+}
+
+void ui_sound_bgm_suspend(bool suspended)
+{
+    s_bgm_suspended = suspended;
 }
