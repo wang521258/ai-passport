@@ -36,12 +36,6 @@
 #ifndef lv_font_montserrat_16
 #define lv_font_montserrat_16 lv_font_montserrat_14
 #endif
-#ifndef ui_sound_bgm_suspend
-#define ui_sound_bgm_suspend(...) ((void)0)
-#endif
-#ifndef ui_sound_bgm
-#define ui_sound_bgm(...) ((void)0)
-#endif
 #include "pokemon_sprites.h"
 #include "word_pool.h"
 #include "lvgl.h"
@@ -123,6 +117,8 @@ static int      s_wrong_n;
 
 /* 学习状态：每词记忆度 0..100，>0 即"已学会" */
 static uint8_t  s_mem[WORD_POOL_SIZE];
+/* 本轮已答对的词：本次训练中绝不重复出现。 */
+static bool     s_seen_this_round[WORD_POOL_SIZE];
 
 /* 破壳候选：有进化链的基础形态下标 */
 static int      s_bases[64];
@@ -181,6 +177,7 @@ static void try_evolve(void);             /* 前向声明（answer 先于定义�
 #define PS_KEY_MEM   "mem"
 #define PS_KEY_WRONG "wrong"
 #define PS_SAVE_GAP_US  (20LL * 1000 * 1000)   /* 最快 20 秒写一次 flash */
+#define PS_WORDSET_MARK  0x2026u /* 新小学词库标识：首次升级时只清学习记录，保留宠物 */
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -232,6 +229,7 @@ static void pet_save(void)
     hdr.happy        = s_stat.happy;
     hdr.energy       = s_stat.energy;
     hdr.wrong_n      = (uint16_t)s_wrong_n;
+    hdr.reserved     = PS_WORDSET_MARK;
 
     esp_err_t e = nvs_set_blob(h, PS_KEY_HDR, &hdr, sizeof(hdr));
     if (e == ESP_OK) e = nvs_set_blob(h, PS_KEY_MEM, s_mem, sizeof(s_mem));
@@ -288,6 +286,13 @@ static bool pet_load(void)
             s_stat.happy  = CLAMP(s_stat.happy);
             s_stat.energy = CLAMP(s_stat.energy);
             s_wrong_n = (hdr.wrong_n <= MAX_WRONG) ? (int)hdr.wrong_n : 0;
+            /* 旧词库按下标保存过进度，不能套到新课本词表；只清学习/错题，宠物继续保留。 */
+            if (hdr.reserved != PS_WORDSET_MARK) {
+                memset(s_mem, 0, sizeof(s_mem));
+                memset(s_wrong_book, 0, sizeof(s_wrong_book));
+                s_wrong_n = 0;
+                s_save_dirty = true;
+            }
             hatched = (hdr.hatched != 0);
         }
     }
@@ -544,20 +549,16 @@ static uint8_t grade_for_book(uint8_t book)
 
 static int pick_train_word(void)
 {
-    /* 训练只在所选年级的上下册中抽词；快忘的词优先。 */
-    float total = 0;
-    for (int i = 0; i < WORD_POOL_SIZE; i++)
-        if (grade_for_book(word_pool[i].book) == s_grade) total += mem_weight(i);
-    if (total <= 0) return 0;
-    float r = (float)(rand() % 10000) / 10000.0f * total;
-    for (int i = 0; i < WORD_POOL_SIZE; i++) {
+    /* 只从当前年级尚未答对的词里随机抽取；答对后跨本次和下次训练都不再出现。 */
+    int candidates[220];
+    int n = 0;
+    for (int i = 0; i < WORD_POOL_SIZE && n < (int)(sizeof(candidates) / sizeof(candidates[0])); i++) {
         if (grade_for_book(word_pool[i].book) != s_grade) continue;
-        r -= mem_weight(i);
-        if (r <= 0) return i;
+        if (s_seen_this_round[i] || s_mem[i] >= MEM_FULL) continue;
+        candidates[n++] = i;
     }
-    for (int i = 0; i < WORD_POOL_SIZE; i++)
-        if (grade_for_book(word_pool[i].book) == s_grade) return i;
-    return 0;
+    if (n == 0) return -1;
+    return candidates[(unsigned)esp_random() % n];
 }
 
 /* 义项分隔符：ASCII 逗号/分号 + 全角"，；、"（UTF-8 各占 3 字节） */
@@ -599,22 +600,23 @@ static void build_question(void)
     if (s_mode == MODE_REVIEW && s_wrong_n > 0) {
         /* 温习只从错题本出题（仅"答错"和"答对后遗忘"两条来源会进错题本）。
            错题本只有 1~2 个词时纯随机会连着出同一个，这里避开上一题。 */
-        int idx = s_wrong_book[rand() % s_wrong_n];
+        int idx = s_wrong_book[esp_random() % (unsigned)s_wrong_n];
         if (s_wrong_n > 1) {
             for (int t = 0; t < 8 && idx == s_qWord; t++)
-                idx = s_wrong_book[rand() % s_wrong_n];
+                idx = s_wrong_book[esp_random() % (unsigned)s_wrong_n];
         }
         s_qWord = idx;
     } else {
         s_qWord = pick_train_word();
+        if (s_qWord < 0) return;
     }
-    s_qDir = rand() & 1;          /* 英选汉 / 汉选英 各半 */
+    s_qDir = esp_random() & 1;          /* 英选汉 / 汉选英 各半 */
 
     uint8_t option_grade = grade_for_book(word_pool[s_qWord].book);
     s_qOpts[0] = s_qWord;
     int filled = 1;
     for (int tries = 0; tries < 200 && filled < 4; tries++) {
-        int idx = rand() % WORD_POOL_SIZE;
+        int idx = (int)(esp_random() % WORD_POOL_SIZE);
         int dup = 0;
         for (int j = 0; j < filled; j++) if (s_qOpts[j] == idx) dup++;
         if (dup) continue;
@@ -626,13 +628,13 @@ static void build_question(void)
         s_qOpts[filled++] = idx;
     }
     while (filled < 4) {          /* 极端兜底：顺序补不重复的 */
-        int idx = rand() % WORD_POOL_SIZE;
+        int idx = (int)(esp_random() % WORD_POOL_SIZE);
         int dup = 0;
         for (int j = 0; j < filled; j++) if (s_qOpts[j] == idx) dup++;
         if (!dup) s_qOpts[filled++] = idx;
     }
     for (int i = 3; i > 0; i--) { /* shuffle */
-        int j = rand() % (i + 1);
+        int j = (int)(esp_random() % (unsigned)(i + 1));
         int t = s_qOpts[i]; s_qOpts[i] = s_qOpts[j]; s_qOpts[j] = t;
     }
     for (int i = 0; i < 4; i++) if (s_qOpts[i] == s_qWord) { s_qCorrect = i; break; }
@@ -686,6 +688,9 @@ static void render_grade_select(void)
 
 static void start_grade_select(void)
 {
+    /* 防止睡眠黑幕残留导致训练页面看起来黑屏。 */
+    s_sleeping = false;
+    if (s_night) lv_obj_add_flag(s_night, LV_OBJ_FLAG_HIDDEN);
     s_mode = MODE_GRADE_SELECT;
     s_opt = 0;
     pet_gif_hide(true);
@@ -696,6 +701,10 @@ static void start_grade_select(void)
 
 static void start_train_for_grade(uint8_t grade)
 {
+    s_sleeping = false;
+    if (s_night) lv_obj_add_flag(s_night, LV_OBJ_FLAG_HIDDEN);
+    memset(s_seen_this_round, 0, sizeof(s_seen_this_round));
+    srand((unsigned)esp_random());
     s_grade = grade;
     s_mode = MODE_TRAIN;
     s_opt = 0;
@@ -732,6 +741,7 @@ static void answer(int option)
     ui_sound_play(right ? UI_SND_CORRECT : UI_SND_WRONG);   /* 答对/答错提示音 */
     if (right) {
         s_mem[s_qWord] = MEM_FULL;            /* 学会 / 记忆刷新到满分 */
+        s_seen_this_round[s_qWord] = true;      /* 本轮已掌握：不再重复 */
         /* 答对即出温习 —— 不分训练还是温习（王总 0911 反馈）。
            原来只在 MODE_REVIEW 里移除，导致训练中"先答错、后答对"的词
            永远留在错题本里，温习时又冒出来，被当成"平白无故的新词"。 */
@@ -749,6 +759,7 @@ static void answer(int option)
     }
     s_stat.energy = CLAMP((int)s_stat.energy - 2);
     build_question();
+    if (s_qWord < 0) { exit_qa(); pet_save_now(); return; }
     render_panel();
     pet_save_soon();                       /* 掉电保存：答完一题就记一笔（节流 20s） */
 }
