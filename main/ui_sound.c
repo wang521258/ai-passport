@@ -55,7 +55,8 @@ static void write_tone(int period, int samples, int amplitude)
         int x = i % period;
         int v = (x < half) ? (-amplitude + (2 * amplitude * x) / half)
                            : ( amplitude - (2 * amplitude * (x - half)) / half);
-        s_buf[i] = (int16_t)v;
+        int fade = i < 96 ? i : (samples - i < 96 ? samples - i : 96);
+        s_buf[i] = (int16_t)((v * fade) / 96);
     }
     bsp_audio_write_mono(s_buf, (size_t)samples);
 }
@@ -71,7 +72,7 @@ static void play_bgm_step(void)
 {
     /* C大调五声音阶小循环：轻快、不刺耳。period 越小音越高。 */
     static const uint8_t periods[] = { 61, 68, 76, 68, 61, 76, 91, 76, 68, 61, 68, 76, 61, 91, 76, 68 };
-    write_tone(periods[s_bgm_step % (sizeof(periods) / sizeof(periods[0]))], 1180, 5200);
+    write_tone(periods[s_bgm_step % (sizeof(periods) / sizeof(periods[0]))], 3400, 3800);
     s_bgm_step++;
 }
 
