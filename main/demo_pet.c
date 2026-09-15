@@ -29,6 +29,19 @@
 #include "ui_pet.h"
 #include "gif_player.h"
 #include "ui_sound.h"
+/* Compatibility with the older S3 firmware branch: it only ships the 14/20px Latin fonts and basic UI sound effects. */
+#ifndef lv_font_montserrat_18
+#define lv_font_montserrat_18 lv_font_montserrat_14
+#endif
+#ifndef lv_font_montserrat_16
+#define lv_font_montserrat_16 lv_font_montserrat_14
+#endif
+#ifndef ui_sound_bgm_suspend
+#define ui_sound_bgm_suspend(...) ((void)0)
+#endif
+#ifndef ui_sound_bgm
+#define ui_sound_bgm(...) ((void)0)
+#endif
 #include "pokemon_sprites.h"
 #include "word_pool.h"
 #include "lvgl.h"
@@ -1247,3 +1260,4 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
         reset_egg();
     }
 }
+
