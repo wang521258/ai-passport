@@ -22,3 +22,7 @@ bool ui_sound_ready(void);
 
 // 请求播放。非阻塞；若上一个音还在放，会丢弃积压、立刻切到新音（手感更跟手）。
 void ui_sound_play(ui_sound_t id);
+
+/* 宠物页循环背景旋律；训练和睡觉时可暂停。 */
+void ui_sound_bgm(bool enabled);
+void ui_sound_bgm_suspend(bool suspended);
