@@ -25,8 +25,8 @@ static const char *GP = "GIFP";
 
 /* GIF 原始帧延迟(通常 50~100ms)在小屏上看着像抽搐。
  * 统一放慢到 GIF_SLOWDOWN 倍，并设 GIF_MIN_DELAY 下限，动作更柔和。 */
-#define GIF_SLOWDOWN  3
-#define GIF_MIN_DELAY 120
+#define GIF_SLOWDOWN  1
+#define GIF_MIN_DELAY 50
 
 /* 待机动效：上下浮动 2px，8 帧一个周期（约 1 秒一次呼吸） */
 static const int8_t BOB_TABLE[8] = { 0, -1, -1, -2, -2, -1, -1, 0 };
@@ -448,3 +448,4 @@ void gif_player_stop(lv_obj_t *canvas)
     p->playing = false;
     if (p->opened) { GIF_close(&p->gif); p->opened = false; }
 }
+
