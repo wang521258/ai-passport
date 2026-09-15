@@ -827,7 +827,7 @@ static void try_evolve(void)
     }
     s_gif = gif_player_create(s_scr, PET_X, PET_Y, PET_SIZE, PET_SIZE);
     if (s_gif) {
-        gif_player_set_bob(s_gif, true);
+        gif_player_set_bob(s_gif, false);
         gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data,
                         pokemon_gifs[s_cur_poke_idx].len);
         /* 训练/温习答题中触发的进化：题板全屏，新宠物画布保持隐藏 */
@@ -849,7 +849,7 @@ static void do_hatch(void)
     s_mode = MODE_HOME;
     s_gif = gif_player_create(s_scr, PET_X, PET_Y, PET_SIZE, PET_SIZE);
     if (s_gif) {
-        gif_player_set_bob(s_gif, true);
+        gif_player_set_bob(s_gif, false);
         gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data,
                         pokemon_gifs[s_cur_poke_idx].len);
     }
@@ -1071,7 +1071,7 @@ void demo_pet_enter(void)
         s_hatch_clicks = 3;
         s_gif = gif_player_create(s_scr, PET_X, PET_Y, PET_SIZE, PET_SIZE);
         if (s_gif) {
-            gif_player_set_bob(s_gif, true);
+            gif_player_set_bob(s_gif, false);
             gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data,
                             pokemon_gifs[s_cur_poke_idx].len);
         }
@@ -1287,4 +1287,5 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
         reset_egg();
     }
 }
+
 
