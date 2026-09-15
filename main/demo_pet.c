@@ -321,7 +321,18 @@ static uint16_t bg_color_at(int x, int y)
  * ============================================================ */
 static void draw_background(lv_obj_t *parent)
 {
-    block(parent, 0, 0, 240, 320, C_BG);
+    /* 纯 LVGL 像素块：不加载图片、不额外占用大块内存。 */
+    block(parent, 0, 0, 240, 320, 0xB9D8E8);       /* 天空 */
+    block(parent, 0, 132, 240, 188, 0x91BC77);     /* 远山草地 */
+    block(parent, 0, 180, 240, 140, 0x6E9E5B);     /* 近景草地 */
+    /* 云朵 */
+    block(parent, 18, 48, 42, 8, 0xEAF5F4); block(parent, 27, 42, 18, 8, 0xEAF5F4);
+    block(parent, 175, 70, 45, 8, 0xEAF5F4); block(parent, 186, 64, 17, 8, 0xEAF5F4);
+    /* 像素树、花和小路 */
+    block(parent, 14, 118, 9, 48, 0x77513A); block(parent, 5, 102, 28, 25, 0x437A4A);
+    block(parent, 207, 128, 8, 42, 0x77513A); block(parent, 198, 111, 27, 25, 0x437A4A);
+    block(parent, 93, 232, 56, 88, 0xC7B47A); block(parent, 99, 232, 44, 88, 0xD9C993);
+    for (int x = 8; x < 232; x += 28) { block(parent, x, 207 + (x % 3) * 8, 4, 4, 0xF5DF6A); }
 }
 
 /* ============================================================
@@ -510,6 +521,8 @@ static void render_panel(void)
             lv_obj_set_style_bg_color(s_p_opts[i], lv_color_hex(0xFFD928), 0);
             lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(0x1B3A0F), 0);
             lv_obj_set_style_opa(s_p_cursor[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_outline_width(s_p_opts[i], 2, 0);
+        lv_obj_set_style_outline_color(s_p_opts[i], lv_color_hex(0xFFF3A0), 0);
         } else {
             /* 未选中：深绿底 + 亮字（学顶栏"攻"的深底亮字，笔画显实不发虚） */
             lv_obj_set_style_border_color(s_p_opts[i], lv_color_hex(C_ROWBRD), 0);
@@ -517,8 +530,11 @@ static void render_panel(void)
             lv_obj_set_style_bg_color(s_p_opts[i], lv_color_hex(C_ROW), 0);
             lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(C_ROWTXT), 0);
             lv_obj_set_style_opa(s_p_cursor[i], LV_OPA_TRANSP, 0);
+        lv_obj_set_style_outline_width(s_p_opts[i], 0, 0);
         }
     }
+    /* 强制让按键后的选框在这一帧更新。 */
+    lv_obj_invalidate(s_panel);
 }
 
 /* ============================================================
