@@ -334,7 +334,6 @@ static void draw_background(lv_obj_t *parent)
     /* 像素树、花和小路 */
     block(parent, 14, 118, 9, 48, 0x77513A); block(parent, 5, 102, 28, 25, 0x437A4A);
     block(parent, 207, 128, 8, 42, 0x77513A); block(parent, 198, 111, 27, 25, 0x437A4A);
-    block(parent, 93, 232, 56, 88, 0xC7B47A); block(parent, 99, 232, 44, 88, 0xD9C993);
     for (int x = 8; x < 232; x += 28) { if (x < PET_X || x >= PET_X + PET_SIZE) block(parent, x, 207 + (x % 3) * 8, 4, 4, 0xF5DF6A); }
 }
 
