@@ -56,15 +56,16 @@ static const egg_spot_t EGG_SPOTS[] = {
 };
 #define EGG_SPOT_N (sizeof(EGG_SPOTS)/sizeof(EGG_SPOTS[0]))
 
-/** v12：场景统一纯色绿豆 #C8DFA0 → RGB565 0xC6F4（蛋"长在场景里"） */
-#define PET_BG565 0xC6F4
+/* 与宠物场景的三层背景一致；蛋画布没有 alpha，须画出其下方真实颜色。 */
 static uint16_t bg_rgb565_at(int x, int y)
 {
-    (void)x; (void)y;
-    return PET_BG565;
+    (void)x;
+    if (y < 132) return 0xBEDD;
+    if (y < 180) return 0x95EE;
+    return 0x6CEB;
 }
 
-static void egg_paint(uint16_t *buf)
+static void egg_paint(uint16_t *buf, int screen_x, int screen_y)
 {
     const int W = EGG_W, H = EGG_H;
     const int cx = W / 2, cy = H / 2;
@@ -75,7 +76,7 @@ static void egg_paint(uint16_t *buf)
     /* 1. 底色：场景取色（无白块） */
     for (int y = 0; y < H; y++) {
         for (int x = 0; x < W; x++) {
-            buf[y * W + x] = bg_rgb565_at(x, y);
+            buf[y * W + x] = bg_rgb565_at(screen_x + x, screen_y + y);
         }
     }
 
@@ -146,7 +147,7 @@ lv_obj_t *ui_pixel_egg_create(lv_obj_t *parent, int x, int y)
     }
     lv_canvas_set_buffer(canvas, buf, EGG_W, EGG_H, LV_COLOR_FORMAT_RGB565);
     lv_obj_set_user_data(canvas, buf);   /* 销毁时取出并 free */
-    egg_paint(buf);
+    egg_paint(buf, x, y);
     return canvas;
 }
 
