@@ -1,0 +1,1806 @@
+// main/demo_koi.c —— 「锦鲤池」240x320 真机版（第一版：先在板上跑起来）
+//
+// 血统：这份代码是 240x320 网页版《锦鲤池》的**固件等效移植**。
+//   几何 / 运动 / 涟漪参数与网页版逐式对齐；改一边必须改另一边。
+//   网页版的渲染数学另有一份 Python 参考实现（工作区 _tools/koi_sim.py）：
+//   形状、配色、神态先在 PC 上出图验过，再逐式转写到这里 ——
+//   因为本机没有 ESP-IDF 工具链，云编译一趟几分钟，几何错误必须上板之前消灭。
+//
+// 关键取舍（都是被 C3 的现实逼出来的，别当成"简化"改回去）：
+//   · 帧缓冲 = LVGL canvas 240x320 RGB565，静态 153.6KB。
+//     ★ C3 无 PSRAM，这是本页最大的单项内存，已按 153,600 B 记账。
+//   · **只重画脏区**：每个会动的对象报自己的包围盒 → 合并成矩形表 →
+//     所有绘制裁到矩形里 → lv_obj_invalidate_area 只让这些像素走 blend + SPI。
+//     全屏重传是 30.7ms SPI（物理下限），只推 15~25% 才留得出 24fps 的余量。
+//   · 三角函数走 1024 项查表 + 线性插值：C3 是 RV32IMC，**没有 FPU**，
+//     一次 sinf 上千周期；波带每帧要上千次正弦，照抄网页版会直接掉到个位数帧率。
+//   · 光栅化 = 世界空间水平扫描线 + Q8 定点 + 2 条子扫描线 AA。
+//     仿射变换保直线，所以"局部形状 → 世界多边形"这一步是精确的。
+//   · 水面 = 每行渐变 + 径向中心光晕 + 静态波光点，烘成 (行, 光晕级) 二维表；
+//     逐像素只剩一次查表 + 一次写入（否则每像素一次开方，76800 次开方要十几毫秒）。
+//   · 波光点**不做逐帧呼吸**：44 个点散在全屏，逐帧标脏会把脏矩形彻底打散成整屏，
+//     脏区优化当场失效。这是与网页版的一处有意差异（网页版是 canvas 全量重画，
+//     这 44 个点本来就不进脏区账）。真机上它们作为水面的一部分常驻。
+//
+// 按键（沿用仓库约定；长按确定返回菜单由 main.c 统一拦截）：
+//   上   短按 = 投喂（14 颗饲料 + 8 滴雨点）
+//   下   短按 = 拍水（3 道同心涟漪 + 鱼受惊四散）
+//   确定 短按 = 昼夜切换（1 秒过渡）
+//
+// 已经做了的（第 25 轮补上荷叶与浮萍）：巡检 / 投喂抢食 / 拍水三圈同心涟漪 /
+//   昼夜两套端点配色 / **荷叶与伴生浮萍**。
+// 其余**故意没做**：首页整屏设计稿 / 开局三屏（选条数图章、分色）/
+//   成长与存档 / 夜间月相。别以为漏了，是排在后面。
+//
+// 与 docs/development/ai-guide.md 的一处**有意偏离**并说明理由：
+//   本页是全屏画面，没有套 ui_pixel 主题（天空底 + 标题牌 + 吉祥物）——
+//   那些会被 240x320 的画面整个盖住，留着只是每帧白画一遍。同理也没画右上角电量：
+//   本页画面来自王总给的整屏设计稿，里面没有电量，而"屏内保持干净"是硬口径。
+#include "demo.h"
+#include "bsp_display.h"
+#include "bsp_pins.h"
+#include "lvgl.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include <math.h>
+#include <string.h>
+#include <stdint.h>
+
+static const char *TAG = "koi";
+
+#define KW        BSP_LCD_W
+#define KH        BSP_LCD_H
+#define NPX       (KW * KH)
+#define FPS       24
+#define NSUB      2
+#define PXMAX     128
+#define NPTS      64
+
+#define KOI_PI    3.14159265358979f
+#define MAX_KOI   9
+#define MAX_RIP   24
+#define MAX_PEL   24
+#define MAX_FOOD  24
+/* 脏矩形表容量。加了 6 片荷叶之后每帧多 6 个框，而原有 koi×2 / 涟漪 / 饲料 /
+   波带本来就在竞争这 18 个位置 —— 表满会退化成整屏（s_full=1），那是 100% 脏区、
+   直接击穿 41.7ms 预算。多给 10 个位置只花 160 B DRAM，换"不会被静悄悄顶成全屏"。 */
+#define MAX_RECT  28
+/* 波带条表的容量：5 条波带，留 8 个位置够它们互相合并后的余量。 */
+#define MAX_BRECT  8
+#define MAX_XS    32
+
+/* ==========================================================================
+   1. 三角函数查表
+   ========================================================================== */
+static int16_t s_sin[1024];
+
+static void sin_init(void)
+{
+    for (int i = 0; i < 1024; i++)
+        s_sin[i] = (int16_t)lrintf(sinf(2.0f * KOI_PI * (float)i / 1024.0f) * 16384.0f);
+}
+
+static inline float fsin_t(float a)
+{
+    float t = a * (1024.0f / (2.0f * KOI_PI));
+    int   i0 = (int)floorf(t);
+    float fr = t - (float)i0;
+    i0 &= 1023;
+    int i1 = (i0 + 1) & 1023;
+    return ((float)s_sin[i0] + (float)(s_sin[i1] - s_sin[i0]) * fr) / 16384.0f;
+}
+static inline float fcos_t(float a) { return fsin_t(a + KOI_PI * 0.5f); }
+
+/* ==========================================================================
+   2. 调色板（抄网页版 DAY / NIGHT，按 night 连续插值）
+   ★ 稳态零重建：night 没变就立刻返回（网页版第 19 轮的教训，别退回每帧重建）
+   ========================================================================== */
+enum {
+    PI_WTOP, PI_WBOT, PI_GLOW, PI_SPARK, PI_BAND,
+    PI_KBODY, PI_KSPOT, PI_KGOLD, PI_KFIN, PI_KEDGE,
+    PI_RIPPLE, PI_PELLET,
+    PI_LILYFILL, PI_LILYEDGE, PI_LILYVEIN, PI_WEED, PI_WEEDPALE,
+    PI_NPAL
+};
+
+static const uint8_t DAY_PAL[PI_NPAL][3] = {
+    { 44, 126, 112}, { 17,  70,  70}, {138, 250, 210}, {220, 254, 240},
+    {190, 248, 228}, {250, 246, 238}, {232,  90,  38}, {253, 216, 124},
+    {252, 204, 176}, {158,  78,  38}, {232, 255, 248}, {246, 208, 138},
+    /* 荷叶 / 浮萍（网页版 DAY.lilyFill / lilyEdge / lilyVein / weed / weedPale） */
+    { 52, 156,  88}, { 22,  94,  54}, {104, 210, 140}, {116, 192,  96},
+    {164, 226, 118},
+};
+static const uint8_t NIGHT_PAL[PI_NPAL][3] = {
+    { 16,  44,  72}, {  6,  20,  36}, {104, 148, 214}, {188, 220, 255},
+    {158, 196, 244}, {190, 198, 212}, {156,  78,  40}, {198, 164,  88},
+    {166, 132, 114}, { 84,  50,  32}, {190, 222, 255}, {212, 180, 120},
+    /* ★ 浮萍夜里必须跟着暗下来 —— 这就是为什么它只能进调色板，不能写死色号
+       （写死的话夜里一屏亮绿点，像屏坏了。王总第 21 轮踩过。） */
+    { 24,  72,  50}, { 10,  40,  26}, { 44, 110,  72}, { 44,  84,  50},
+    { 76, 120,  82},
+};
+#define DAY_GLOW_A    76      // 0.30 × 256
+#define NIGHT_GLOW_A  38      // 0.15 × 256
+
+static uint8_t s_pal[PI_NPAL][3];
+static uint8_t s_glow_a = DAY_GLOW_A;
+static int     s_pal_night = -1;    // 已建立对应的 night×255；-1 = 还没建过
+
+/* ==========================================================================
+   3. 帧缓冲与像素混合（RGB565）
+   ========================================================================== */
+static uint16_t s_fb[NPX];
+static uint8_t  s_e5[32], s_e6[64];
+
+static void expand_init(void)
+{
+    for (int i = 0; i < 32; i++) s_e5[i] = (uint8_t)((i * 255 + 15) / 31);
+    for (int i = 0; i < 64; i++) s_e6[i] = (uint8_t)((i * 255 + 31) / 63);
+}
+
+static inline uint16_t pack565(int r, int g, int b)
+{
+    return (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+
+static int s_cx0, s_cy0, s_cx1, s_cy1;      // 当前裁剪框（含端点）
+
+static inline void set_clip(int x0, int y0, int x1, int y1)
+{
+    s_cx0 = x0 < 0 ? 0 : x0;
+    s_cy0 = y0 < 0 ? 0 : y0;
+    s_cx1 = x1 > KW - 1 ? KW - 1 : x1;
+    s_cy1 = y1 > KH - 1 ? KH - 1 : y1;
+}
+
+/* alpha 0..256；a=256 时精确等于 src */
+static inline void px_blend(int x, int y, int r, int g, int b, int a)
+{
+    if (a <= 0 || x < s_cx0 || x > s_cx1 || y < s_cy0 || y > s_cy1) return;
+    uint16_t d = s_fb[y * KW + x];
+    int dr = s_e5[(d >> 11) & 31];
+    int dg = s_e6[(d >> 5) & 63];
+    int db = s_e5[d & 31];
+    dr += ((r - dr) * a) >> 8;
+    dg += ((g - dg) * a) >> 8;
+    db += ((b - db) * a) >> 8;
+    s_fb[y * KW + x] = pack565(dr, dg, db);
+}
+
+static inline void px_set(int x, int y, int r, int g, int b)
+{
+    if (x < s_cx0 || x > s_cx1 || y < s_cy0 || y > s_cy1) return;
+    s_fb[y * KW + x] = pack565(r, g, b);
+}
+
+/* ==========================================================================
+   4. 光栅化：世界空间水平扫描线（Q8 定点）+ 子扫描线 AA
+   ========================================================================== */
+typedef struct { int32_t x, y; } ipt_t;          // 世界坐标 Q8（像素 × 256）
+
+/* 明度渐变：alpha 是"世界坐标在方向 u 上的投影 s"的分段线性函数。
+   对应网页版的 createLinearGradient —— 尾鳍根部盖住接缝那一段全靠它。 */
+typedef struct {
+    int32_t ux, uy, cx, cy;      // 单位方向 ×256 / 投影原点（均 Q8）
+    int32_t s0, s1, s2, s3;      // 断点（Q8 px）
+    int     a0, a1, a2, a3;      // 对应 alpha（0..256）
+} grad_t;
+
+static inline int grad_alpha(const grad_t *g, int32_t s)
+{
+    if (s <= g->s0) return g->a0;
+    if (s >= g->s3) return g->a3;
+    if (s < g->s1)  return g->a0 + (int)(((int32_t)(g->a1 - g->a0) * (s - g->s0)) / (g->s1 - g->s0));
+    if (s < g->s2)  return g->a1 + (int)(((int32_t)(g->a2 - g->a1) * (s - g->s1)) / (g->s2 - g->s1));
+    return g->a2 + (int)(((int32_t)(g->a3 - g->a2) * (s - g->s2)) / (g->s3 - g->s2));
+}
+
+static void span_draw(int32_t xa, int32_t xb, int32_t ly,
+                      const uint8_t *col, const grad_t *gr, int a_sub)
+{
+    if (xb <= xa || a_sub <= 0) return;
+    int y = ly >> 8;
+    if (y < s_cy0 || y > s_cy1) return;
+    int pxa = xa >> 8;
+    int pxb = (xb - 1) >> 8;
+    if (pxa < s_cx0) pxa = s_cx0;
+    if (pxb > s_cx1) pxb = s_cx1;
+    if (pxa > pxb) return;
+    int r = col[0], g = col[1], b = col[2];
+    for (int x = pxa; x <= pxb; x++) {
+        int cov;
+        if (pxa == pxb)    cov = (int)(xb - xa);
+        else if (x == pxa) cov = (int)(((int32_t)(x + 1) << 8) - xa);
+        else if (x == pxb) cov = (int)(xb - ((int32_t)x << 8));
+        else               cov = 256;
+        if (cov <= 0) continue;
+        int a;
+        if (!gr) {
+            a = (a_sub * cov) >> 8;
+        } else {
+            int32_t px = ((int32_t)x << 8) + 128;
+            int32_t s = ((px - gr->cx) * gr->ux + (ly - gr->cy) * gr->uy) >> 8;
+            a = (grad_alpha(gr, s) * cov) >> 8;
+            a = (a * a_sub) >> 8;
+        }
+        px_blend(x, y, r, g, b, a);
+    }
+}
+
+/* 世界空间多边形填充。a_flat = 总 alpha（0..256），内部切成 NSUB 份做超采样。 */
+static int32_t s_ex[PXMAX], s_esl[PXMAX], s_ey0[PXMAX], s_ey1[PXMAX];
+static int32_t s_xs[MAX_XS];
+
+static void fill_poly(const ipt_t *p, int n, const uint8_t *col,
+                      const grad_t *gr, int a_flat)
+{
+    if (n < 3 || a_flat <= 0) return;
+    int a_sub = a_flat / NSUB;
+    if (a_sub <= 0) return;
+
+    int32_t ymin = p[0].y, ymax = p[0].y;
+    for (int i = 1; i < n; i++) {
+        if (p[i].y < ymin) ymin = p[i].y;
+        if (p[i].y > ymax) ymax = p[i].y;
+    }
+    int iy0 = ymin >> 8;                 // 算术右移 = floor（负数也对）
+    int iy1 = (ymax - 1) >> 8;
+    if (iy0 < s_cy0) iy0 = s_cy0;
+    if (iy1 > s_cy1) iy1 = s_cy1;
+    if (iy0 > iy1) return;
+
+    /* 每条边预计算：起点 x + 斜率（dx / 每 Q8 行），内层不做 64 位除法。
+       斜率乘数天然有界：只处理 ly ∈ [ey0, ey1)，故 (ly−ey0) < den，
+       积 < |dxs|·256 ≤ 61440·256，稳在 int32 内。 */
+    int ne = 0;
+    for (int i = 0; i < n; i++) {
+        int32_t ax = p[i].x, ay = p[i].y;
+        int32_t bx = p[(i + 1) % n].x, by = p[(i + 1) % n].y;
+        if (ay == by) continue;
+        s_ex[ne]  = ax;
+        /* ★ 这里必须用乘法，不能写 (bx-ax) << 8：bx-ax 为负时左移是未定义行为
+           （主机台架带 UB 检查，一跑就抛 "left shift of negative value"）。
+           有符号除法本身向下取整，配 s_ey0 取较小 y 用，方向是对的。 */
+        s_esl[ne] = (int32_t)(((int64_t)(bx - ax) * 256) / (by - ay));
+        s_ey0[ne] = ay < by ? ay : by;
+        s_ey1[ne] = ay < by ? by : ay;
+        ne++;
+    }
+    if (ne < 2) return;
+
+    for (int iy = iy0; iy <= iy1; iy++) {
+        for (int s = 0; s < NSUB; s++) {
+            int32_t ly = ((int32_t)iy << 8) + (int32_t)(((2 * s + 1) * 128) / NSUB);
+            int nx = 0;
+            for (int e = 0; e < ne; e++) {
+                if (ly < s_ey0[e] || ly >= s_ey1[e]) continue;
+                int32_t x = s_ex[e] + (int32_t)(((int64_t)(ly - s_ey0[e]) * s_esl[e]) >> 8);
+                if (nx < MAX_XS) s_xs[nx++] = x;
+            }
+            if (nx < 2) continue;
+            for (int a = 1; a < nx; a++) {          // 交点极少，插入排序
+                int32_t v = s_xs[a];
+                int b = a - 1;
+                while (b >= 0 && s_xs[b] > v) { s_xs[b + 1] = s_xs[b]; b--; }
+                s_xs[b + 1] = v;
+            }
+            for (int k = 0; k + 1 < nx; k += 2)
+                span_draw(s_xs[k], s_xs[k + 1], ly, col, gr, a_sub);
+        }
+    }
+}
+
+/* 折线描边：每段摊一个四边形；够粗时补圆接头，否则拐角缺口肉眼可见 */
+static ipt_t s_quad[4];
+
+static void stroke_line(float x0, float y0, float x1, float y1,
+                        float halfw, const uint8_t *col, int a_flat)
+{
+    float dx = x1 - x0, dy = y1 - y0;
+    float d = sqrtf(dx * dx + dy * dy);
+    if (d < 1e-4f) return;
+    float nx = -dy / d * halfw, ny = dx / d * halfw;
+    s_quad[0].x = (int32_t)lrintf((x0 + nx) * 256.0f); s_quad[0].y = (int32_t)lrintf((y0 + ny) * 256.0f);
+    s_quad[1].x = (int32_t)lrintf((x1 + nx) * 256.0f); s_quad[1].y = (int32_t)lrintf((y1 + ny) * 256.0f);
+    s_quad[2].x = (int32_t)lrintf((x1 - nx) * 256.0f); s_quad[2].y = (int32_t)lrintf((y1 - ny) * 256.0f);
+    s_quad[3].x = (int32_t)lrintf((x0 - nx) * 256.0f); s_quad[3].y = (int32_t)lrintf((y0 - ny) * 256.0f);
+    fill_poly(s_quad, 4, col, NULL, a_flat);
+}
+
+static void stroke_pts(const float *xy, int n, int closed, float width,
+                       const uint8_t *col, int a_flat)
+{
+    float hw = width * 0.5f;
+    if (hw < 0.35f) hw = 0.35f;
+    for (int i = 0; i + 1 < n; i++)
+        stroke_line(xy[i * 2], xy[i * 2 + 1], xy[i * 2 + 2], xy[i * 2 + 3], hw, col, a_flat);
+    if (closed && n > 2)
+        stroke_line(xy[(n - 1) * 2], xy[(n - 1) * 2 + 1], xy[0], xy[1], hw, col, a_flat);
+    if (hw >= 1.2f) {
+        ipt_t disc[10];
+        for (int i = 0; i < n; i++) {
+            for (int k = 0; k < 10; k++) {
+                float t = 2.0f * KOI_PI * (float)k / 10.0f;
+                disc[k].x = (int32_t)lrintf((xy[i * 2] + fcos_t(t) * hw) * 256.0f);
+                disc[k].y = (int32_t)lrintf((xy[i * 2 + 1] + fsin_t(t) * hw) * 256.0f);
+            }
+            fill_poly(disc, 10, col, NULL, a_flat);
+        }
+    }
+}
+
+/* --------------------------------------------------------------------------
+   4b. 通用点列工具 + 小工具（第 7b 节的荷叶也要用，故从第 8 节上提到这里）
+   -------------------------------------------------------------------------- */
+static inline float clampf(float v, float a, float b) { return v < a ? a : (v > b ? b : v); }
+
+/* 角度差，归到 (-π, π] */
+static inline float angdiff(float a, float b)
+{
+    float d = a - b;
+    while (d >  KOI_PI) d -= 2.0f * KOI_PI;
+    while (d < -KOI_PI) d += 2.0f * KOI_PI;
+    return d;
+}
+
+/* 通用 float 点列 → 世界 Q8 多边形（静态，避免大数组上 LVGL 任务栈） */
+static float s_pts[NPTS * 2];
+static int   s_npts;
+
+static inline void pt_push(float x, float y)
+{
+    if (s_npts < NPTS) { s_pts[s_npts * 2] = x; s_pts[s_npts * 2 + 1] = y; s_npts++; }
+}
+
+static void pt_quad(float x0, float y0, float cx, float cy, float x1, float y1)
+{
+    for (int j = 1; j <= 4; j++) {
+        float t = (float)j * 0.25f, mt = 1.0f - t;
+        pt_push(mt * mt * x0 + 2.0f * mt * t * cx + t * t * x1,
+                mt * mt * y0 + 2.0f * mt * t * cy + t * t * y1);
+    }
+}
+
+static ipt_t s_poly[NPTS];
+
+static void to_q8(int n, float dx, float dy)
+{
+    for (int i = 0; i < n; i++) {
+        s_poly[i].x = (int32_t)lrintf((s_pts[i * 2] + dx) * 256.0f);
+        s_poly[i].y = (int32_t)lrintf((s_pts[i * 2 + 1] + dy) * 256.0f);
+    }
+}
+
+/* ==========================================================================
+   5. 场景状态（先声明：第 6 节的水面要用到波光点、时间与脏区表）
+   ========================================================================== */
+#define GLOW_CX  120.0f
+#define GLOW_CY  121.6f           // 320 * 0.38
+#define GLOW_R0  8.0f
+#define GLOW_R1  178.0f
+
+typedef struct { float x, y, amp, w, ph, a, sp, lw; } band_t;
+typedef struct { float x, y, phase; int size; } spark_t;
+
+static band_t  s_band[5];
+static spark_t s_spark[44];
+static int     s_dx2[KW];         // 每个 x 的 dx²（1/4 像素²），只依赖几何，开机算一次
+
+static float   s_time, s_night, s_nightTarget;   // 波带漂移要用 s_time，故先于第 6 节声明
+
+// 脏区表定义在第 7 节，但第 6 节的波带要标脏 —— 先把原型摆出来。
+// （漏了它就是 ISO C99 的隐式声明；在 -Werror 下直接编不过）
+static void dirty_add_ext(int x0, int y0, int x1, int y1);
+/* 波带条走**另一条**通路，不跟对象矩形合并 —— 理由见第 7 节 band_dirty_add。 */
+static void band_dirty_add(int y0, int y1);
+
+
+/* ==========================================================================
+   6. 水面
+   ========================================================================== */
+#define GLLV   32
+#define GIDXN  160
+static uint16_t s_water_lut[KH][GLLV];
+static uint8_t  s_glow_lvl[GIDXN];
+
+static void water_lut_build(void)
+{
+    for (int i = 0; i < GIDXN; i++) {
+        float d = sqrtf((float)(i << 10)) * 0.5f;
+        if (d <= GLOW_R0)      s_glow_lvl[i] = GLLV - 1;
+        else if (d >= GLOW_R1) s_glow_lvl[i] = 0;
+        else s_glow_lvl[i] = (uint8_t)((GLOW_R1 - d) / (GLOW_R1 - GLOW_R0) * (GLLV - 1));
+    }
+    const uint8_t *wt = s_pal[PI_WTOP], *wb = s_pal[PI_WBOT], *gc = s_pal[PI_GLOW];
+    for (int y = 0; y < KH; y++) {
+        float u = (float)y / (float)(KH - 1);
+        int rr = (int)(wt[0] + (wb[0] - wt[0]) * u);
+        int gg = (int)(wt[1] + (wb[1] - wt[1]) * u);
+        int bb = (int)(wt[2] + (wb[2] - wt[2]) * u);
+        for (int lv = 0; lv < GLLV; lv++) {
+            int a = ((int)s_glow_a * lv) / (GLLV - 1);
+            s_water_lut[y][lv] = pack565(rr + (((gc[0] - rr) * a) >> 8),
+                                         gg + (((gc[1] - gg) * a) >> 8),
+                                         bb + (((gc[2] - bb) * a) >> 8));
+        }
+    }
+}
+
+static void dx2_init(void)
+{
+    int c = (int)(GLOW_CX * 2.0f);
+    for (int x = 0; x < KW; x++) {
+        int d = (2 * x + 1) - c;
+        s_dx2[x] = d * d;
+    }
+}
+
+static void build_palette(float night)
+{
+    int n8 = (int)lrintf(night * 255.0f);
+    if (n8 == s_pal_night) return;            // ★ 稳态复用，零重建
+    s_pal_night = n8;
+    for (int i = 0; i < PI_NPAL; i++)
+        for (int c = 0; c < 3; c++)
+            s_pal[i][c] = (uint8_t)(DAY_PAL[i][c] + (((int)NIGHT_PAL[i][c] - DAY_PAL[i][c]) * n8 >> 8));
+    s_glow_a = (uint8_t)(DAY_GLOW_A + (((int)NIGHT_GLOW_A - DAY_GLOW_A) * n8 >> 8));
+    water_lut_build();
+}
+
+/* 水面（含常驻波光点）填一个矩形 */
+static void water_rect(int x0, int y0, int x1, int y1)
+{
+    int cy = (int)(GLOW_CY * 2.0f);
+    for (int y = y0; y <= y1; y++) {
+        const uint16_t *row = s_water_lut[y];
+        int dyh = (2 * y + 1) - cy;
+        int dy2 = dyh * dyh;
+        uint16_t *o = &s_fb[y * KW];
+        for (int x = x0; x <= x1; x++) {
+            int idx = (s_dx2[x] + dy2) >> 10;
+            int lv = (idx < GIDXN) ? s_glow_lvl[idx] : 0;
+            o[x] = row[lv];
+        }
+    }
+    const uint8_t *sp = s_pal[PI_SPARK];
+    for (int i = 0; i < 44; i++) {            // 波光点：44 个，按矩形过滤，代价可忽略
+        int px = (int)s_spark[i].x, py = (int)s_spark[i].y;
+        for (int dy = 0; dy < s_spark[i].size; dy++)
+            for (int dx = 0; dx < s_spark[i].size; dx++) {
+                int x = px + dx, y = py + dy;
+                if (x >= x0 && x <= x1 && y >= y0 && y <= y1)
+                    px_blend(x, y, sp[0], sp[1], sp[2], 118);   // 0.46 × 256
+            }
+    }
+}
+
+/* 水面波带（缓慢漂移的水下光折射） */
+static void bands_mark_dirty(void)
+{
+    for (int b = 0; b < 5; b++) {
+        const band_t *bd = &s_band[b];
+        band_dirty_add((int)floorf(bd->y - bd->amp - bd->lw),
+                       (int)ceilf(bd->y + bd->amp + bd->lw));
+    }
+}
+
+static void bands_draw(void)
+{
+    const uint8_t *col = s_pal[PI_BAND];
+    for (int b = 0; b < 5; b++) {
+        const band_t *bd = &s_band[b];
+        float off = fmodf(s_time * bd->sp, (float)(KW + 60)) - 30.0f;
+        int lw = (int)lrintf(bd->lw);
+        if (lw < 1) lw = 1;
+        for (int x = s_cx0; x <= s_cx1; x++) {
+            float u = (float)x / (float)(KW - 1);
+            float g = (u < 0.20f) ? (0.75f * (u / 0.20f))
+                    : (u < 0.55f) ? (0.75f + 0.25f * ((u - 0.20f) / 0.35f))
+                                  : (1.0f - ((u - 0.55f) / 0.45f));
+            int a = (int)(bd->a * 256.0f * g);
+            if (a <= 0) continue;
+            int iy = (int)lrintf(bd->y + fsin_t(((float)x + off) * bd->w + bd->ph) * bd->amp);
+            for (int k = 0; k < lw; k++) px_blend(x, iy + k - lw / 2, col[0], col[1], col[2], a);
+        }
+    }
+}
+
+/* ==========================================================================
+   7. 脏区矩形表
+   ========================================================================== */
+static int s_nrect;
+static struct { int x0, y0, x1, y1; } s_rc[MAX_RECT];
+static int s_full;
+
+/* 合并值不值？ —— 判据一：**并集面积相对"两块各自面积之和"的膨胀率**。
+   合并本身是必要的：LVGL 每帧的失效区个数有上限（LV_INV_BUF_SIZE），
+   而且小矩形（饲料 8x8、涟漪）本来就该并起来。
+   但"碰一下就并"会把散落的鱼 / 荷叶一路粘成一个包围盒 ——
+   实测夜态 4 个框粘成 1 个 202x257（= 全屏 68% 脏区），而真正变化的像素只有 6%。
+   所以只在「几乎不膨胀」或「本来就大面积重叠」时才并。 */
+static int merge_worth(int i, int x0, int y0, int x1, int y1)
+{
+    int ux0 = s_rc[i].x0 < x0 ? s_rc[i].x0 : x0;
+    int uy0 = s_rc[i].y0 < y0 ? s_rc[i].y0 : y0;
+    int ux1 = s_rc[i].x1 > x1 ? s_rc[i].x1 : x1;
+    int uy1 = s_rc[i].y1 > y1 ? s_rc[i].y1 : y1;
+    long sa = (long)(s_rc[i].x1 - s_rc[i].x0 + 1) * (s_rc[i].y1 - s_rc[i].y0 + 1);
+    long sb = (long)(x1 - x0 + 1) * (y1 - y0 + 1);
+    long su = (long)(ux1 - ux0 + 1) * (uy1 - uy0 + 1);
+    if (su * 100 <= (sa + sb) * 115) return 1;          /* 膨胀 ≤ 15% → 值得并 */
+
+    int ox0 = s_rc[i].x0 > x0 ? s_rc[i].x0 : x0;
+    int oy0 = s_rc[i].y0 > y0 ? s_rc[i].y0 : y0;
+    int ox1 = s_rc[i].x1 < x1 ? s_rc[i].x1 : x1;
+    int oy1 = s_rc[i].y1 < y1 ? s_rc[i].y1 : y1;
+    if (ox1 >= ox0 && oy1 >= oy0) {
+        long sm = sa < sb ? sa : sb;
+        long ov = (long)(ox1 - ox0 + 1) * (oy1 - oy0 + 1);
+        if (ov * 100 >= sm * 40) return 1;              /* 重叠 ≥ 40% → 值得并 */
+    }
+    return 0;
+}
+
+static void dirty_add_ext(int x0, int y0, int x1, int y1)
+{
+    if (s_full) return;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > KW - 1) x1 = KW - 1;
+    if (y1 > KH - 1) y1 = KH - 1;
+    if (x0 > x1 || y0 > y1) return;
+    for (int i = 0; i < s_nrect; i++) {
+        if (!merge_worth(i, x0, y0, x1, y1)) continue;
+        if (x0 < s_rc[i].x0) s_rc[i].x0 = x0;
+        if (y0 < s_rc[i].y0) s_rc[i].y0 = y0;
+        if (x1 > s_rc[i].x1) s_rc[i].x1 = x1;
+        if (y1 > s_rc[i].y1) s_rc[i].y1 = y1;
+        for (int again = 0; again < 4; again++) {                  // 合并后可能又与别的值得并
+            int merged = 0;
+            for (int k = 0; k < s_nrect; k++) {
+                if (k == i) continue;
+                if (!merge_worth(i, s_rc[k].x0, s_rc[k].y0, s_rc[k].x1, s_rc[k].y1)) continue;
+                if (s_rc[k].x0 < s_rc[i].x0) s_rc[i].x0 = s_rc[k].x0;
+                if (s_rc[k].y0 < s_rc[i].y0) s_rc[i].y0 = s_rc[k].y0;
+                if (s_rc[k].x1 > s_rc[i].x1) s_rc[i].x1 = s_rc[k].x1;
+                if (s_rc[k].y1 > s_rc[i].y1) s_rc[i].y1 = s_rc[k].y1;
+                s_rc[k] = s_rc[--s_nrect];
+                merged = 1;
+                break;
+            }
+            if (!merged) break;
+        }
+        return;
+    }
+    if (s_nrect >= MAX_RECT) { s_full = 1; return; }   // 表满 → 退化成整屏，宁可慢也别漏画
+    s_rc[s_nrect].x0 = x0; s_rc[s_nrect].y0 = y0;
+    s_rc[s_nrect].x1 = x1; s_rc[s_nrect].y1 = y1;
+    s_nrect++;
+}
+
+/* ---- 波带条：**单独一张表，绝不跟对象矩形合并** ----
+   波带是整屏宽（x 恒为 0..KW-1）的横条。一旦允许它进上面那张表合并，它就成了胶水：
+   只要它碰到任何一个对象矩形，结果立刻变成"整屏宽"；再顺着 y 方向把别的波带和对象
+   一个个粘起来 → 最后剩 1~2 个 (0,0)-(239,319) 的大包围盒。
+   实测代价：真正变化的像素只有 8.7%，上报却是 95%（5 条波带全屏宽、共 301 行）。
+
+   分开之后，波带条只跟波带条合并（两条都整屏宽，合并是**精确**的并集，不会虚高），
+   对象矩形照旧互相合并。由主机台架验证"脏区覆盖一帧不漏"。
+   （这是 25 轮里最典型的一件"读数虚高"：不对着明细看，只会以为是画面真的动了那么多。） */
+static int s_nbrc;
+static struct { int y0, y1; } s_brc[MAX_BRECT];
+
+static void band_dirty_add(int y0, int y1)
+{
+    if (s_full) return;
+    if (y0 < 0) y0 = 0;
+    if (y1 > KH - 1) y1 = KH - 1;
+    if (y0 > y1) return;
+    for (int i = 0; i < s_nbrc; i++) {
+        if (y0 > s_brc[i].y1 + 1 || y1 < s_brc[i].y0 - 1) continue;
+        if (y0 < s_brc[i].y0) s_brc[i].y0 = y0;
+        if (y1 > s_brc[i].y1) s_brc[i].y1 = y1;
+        return;
+    }
+    if (s_nbrc >= MAX_BRECT) { s_full = 1; return; }
+    s_brc[s_nbrc].y0 = y0; s_brc[s_nbrc].y1 = y1;
+    s_nbrc++;
+}
+
+/* ==========================================================================
+   7b. 荷叶与浮萍
+   --------------------------------------------------------------------------
+   逐式对移植自网页版的 paintLily / paintWeedPad / buildWeeds / drawLily。
+     · 荷叶：环形散布最多 6 片（最小间距 r+6 检查），缓慢自转 + 上下呼吸。
+     · 浮萍：**荷叶的伴生**（第 22 轮口径）—— 长在叶缘外一圈，跟荷叶一起生成、
+       一起绘制、落进荷叶本来报的那个脏框，不额外报脏区。绝不烘进共用底图，
+       否则"选数字 / 选颜色"那两屏也长浮萍（王总原话"在选数字和颜色时候就出来了"）。
+     · 浮萍档位：WEED_LV 作下标进 WEED_PER[] ——
+       0 = 关 / 1 / 2 / **3 = 中档（王总第 25 轮定档）** / 4
+
+   ★ 这里**不做精灵位图缓存**（网页版有，是为了省浏览器里重复的矢量绘制）。
+     固件是逐帧矢量画：6 片荷叶约 100 个小多边形 —— 主机台架实测成本在预算内，
+     而改成位图要多占 20KB 以上的 DRAM 存精灵表（C3 无 PSRAM，不值当）。
+   ★ 浮萍的随机数用**独立种子**的 LCG，绝不能借全局 rnd()：
+     全局序列是给鱼 / 荷叶 / 波光用的，借一脚会让它们整体平移。
+   ========================================================================== */
+#define MAX_LILY   6
+#define MAX_WEED   56
+#define LILY_ARC_N 46
+/* 脏框外扩量。网页版写 WEED_PAD = 9，但它 markDirty 用 floor/ceil 外扩，
+   实际生效约 10；而最坏情形（叶缘 4.6 + 簇内 2.2 + 浮萍含根影半径 1.64r=3.6）
+   ≈ 10.4，本来就压线。固件直接取 11 —— 每边多 1px 的代价约 0.1% 脏区，换"绝不漏"。 */
+#define WEED_PAD   11.0f
+#define WEED_LV    3        /* ★ 定档「中档」 */
+static const int WEED_PER[5] = {0, 1, 2, 3, 4};
+
+typedef struct { float x, y, r, t; } weed_t;
+
+typedef struct {
+    float x, y, r, rot, spin, bob, gap;
+    int   ws0, wsn;               /* 伴生浮萍在 s_weed 里的区间 [ws0, ws0+wsn) */
+} lily_t;
+
+static lily_t s_lily[MAX_LILY];
+static int    s_nlily;
+static weed_t s_weed[MAX_WEED];
+static int    s_nweed;
+
+/* 当前荷叶的 局部→世界 变换（旋转 + 平移），供 lily_xf / pt_xf_f / weed_paint 共用 */
+static float s_lrx, s_lry, s_lca, s_lsa;
+
+static inline void lily_xf(int n)            /* s_pts(局部 float) → s_poly(世界 Q8) */
+{
+    for (int i = 0; i < n; i++) {
+        float px = s_pts[i * 2], py = s_pts[i * 2 + 1];
+        s_poly[i].x = (int32_t)lrintf((s_lrx + px * s_lca - py * s_lsa) * 256.0f);
+        s_poly[i].y = (int32_t)lrintf((s_lry + px * s_lsa + py * s_lca) * 256.0f);
+    }
+}
+
+static float s_wf[NPTS * 2];
+static void pt_xf_f(int n)                   /* s_pts(局部) → s_wf(世界 float)，给 stroke_pts 用 */
+{
+    for (int i = 0; i < n; i++) {
+        float px = s_pts[i * 2], py = s_pts[i * 2 + 1];
+        s_wf[i * 2]     = s_lrx + px * s_lca - py * s_lsa;
+        s_wf[i * 2 + 1] = s_lry + px * s_lsa + py * s_lca;
+    }
+}
+
+/* 荷叶局部坐标里画椭圆（tilt 是这个椭圆自身的倾角，与荷叶自转无关） */
+static void lily_ellipse(float cx, float cy, float rx, float ry, float tilt, int n)
+{
+    s_npts = 0;
+    float ct = fcos_t(tilt), st = fsin_t(tilt);
+    for (int i = 0; i < n; i++) {
+        float t = 2.0f * KOI_PI * (float)i / (float)n;
+        float ex = fcos_t(t) * rx, ey = fsin_t(t) * ry;
+        pt_push(cx + ex * ct - ey * st, cy + ex * st + ey * ct);
+    }
+}
+
+/* 叶身：圆心 → 绕过缺口一圈 → 回到圆心。缺口朝局部 +y（与网页版 arc 的起止角一致） */
+static void lily_body_pts(float r, float gap)
+{
+    s_npts = 0;
+    pt_push(0.0f, 0.0f);
+    float a1 = KOI_PI * 0.5f + gap;
+    float a0 = KOI_PI * 0.5f - gap;
+    float sweep = a0 + 2.0f * KOI_PI - a1;                 /* = 2π − 2·gap */
+    for (int i = 0; i <= LILY_ARC_N; i++) {
+        float a = a1 + sweep * (float)i / (float)LILY_ARC_N;
+        pt_push(fcos_t(a) * r, fsin_t(a) * r);
+    }
+}
+
+/* 局部圆弧点列（叶缘内侧反光用） */
+static void lily_arc_pts(float r, float a_from, float a_to, int n)
+{
+    s_npts = 0;
+    for (int i = 0; i <= n; i++) {
+        float a = a_from + (a_to - a_from) * (float)i / (float)n;
+        pt_push(fcos_t(a) * r, fsin_t(a) * r);
+    }
+}
+
+static void lily_paint(const lily_t *L, float th)
+{
+    static const uint8_t c_shadow[3] = {1, 9, 6};       /* 网页版 '#010906' */
+    static const uint8_t c_rim[3]    = {223, 248, 232}; /* 网页版 '#dff8e8'（固定色，不进调色板） */
+    const uint8_t *fill = s_pal[PI_LILYFILL];
+    const uint8_t *edge = s_pal[PI_LILYEDGE];
+    const uint8_t *vein = s_pal[PI_LILYVEIN];
+    float r = L->r;
+
+    s_lrx = L->x; s_lry = L->y;
+    s_lca = fcos_t(th); s_lsa = fsin_t(th);
+
+    /* ① 水下根影（偏右下 1.5 / 2.5） */
+    lily_ellipse(1.5f, 2.5f, r * 0.98f, r * 0.98f, 0.0f, 16);
+    lily_xf(s_npts);
+    fill_poly(s_poly, s_npts, c_shadow, NULL, 56);              /* 0.22 */
+
+    /* ② 叶身 + 1px 深色描边 */
+    lily_body_pts(r, L->gap);
+    pt_xf_f(s_npts);
+    lily_xf(s_npts);
+    fill_poly(s_poly, s_npts, fill, NULL, 256);
+    stroke_pts(s_wf, s_npts, 1, 1.0f, edge, 256);
+
+    /* ②b 缺口尖角补一个小圆点：stroke_pts 在半个线宽 < 1.2px 时不补接头，
+       而缺口顶点那里转角约 152°，会露出一条约 1px 的缝（网页版靠 canvas 的
+       miter 接头自动填掉，我们得自己补上）。 */
+    {
+        ipt_t d[8];
+        for (int k = 0; k < 8; k++) {
+            float t = 2.0f * KOI_PI * (float)k / 8.0f;
+            d[k].x = (int32_t)lrintf((s_lrx + fcos_t(t) * 0.5f) * 256.0f);
+            d[k].y = (int32_t)lrintf((s_lry + fsin_t(t) * 0.5f) * 256.0f);
+        }
+        fill_poly(d, 8, edge, NULL, 256);
+    }
+
+    /* ③ 叶脉 11 条：跳过缺口那一扇区；只到 0.94r，天然落在叶身内，不必裁剪 */
+    for (int i = 0; i < 11; i++) {
+        float a = (float)i / 11.0f * 6.2832f + 0.22f;
+        if (fabsf(angdiff(a, KOI_PI * 0.5f)) < L->gap + 0.10f) continue;
+        float ex = fcos_t(a) * r * 0.94f, ey = fsin_t(a) * r * 0.94f;
+        stroke_line(s_lrx, s_lry,
+                    s_lrx + ex * s_lca - ey * s_lsa,
+                    s_lry + ex * s_lsa + ey * s_lca,
+                    0.35f, vein, 153);                              /* 0.60 */
+    }
+    /* 叶芯 */
+    {
+        float cr = r * 0.13f;
+        if (cr < 1.4f) cr = 1.4f;
+        lily_ellipse(0.0f, 0.0f, cr, cr, 0.0f, 12);
+        lily_xf(s_npts);
+        fill_poly(s_poly, s_npts, edge, NULL, 108);                 /* 0.42 */
+    }
+    /* 老叶斑 2 块（叶面深浅不均） */
+    lily_ellipse(r * 0.36f, -r * 0.30f, r * 0.40f, r * 0.30f, -0.5f, 12);
+    lily_xf(s_npts);
+    fill_poly(s_poly, s_npts, edge, NULL, 46);                      /* 0.18 */
+    lily_ellipse(-r * 0.42f, r * 0.34f, r * 0.34f, r * 0.26f, 0.6f, 12);
+    lily_xf(s_npts);
+    fill_poly(s_poly, s_npts, edge, NULL, 46);
+
+    /* ④ 叶缘内侧反光（弧 2.30~4.10 rad，恰好避开缺口） */
+    lily_arc_pts(r * 0.84f, 2.30f, 4.10f, 14);
+    pt_xf_f(s_npts);
+    stroke_pts(s_wf, s_npts, 0, 1.4f, c_rim, 33);                   /* 0.13 */
+}
+
+/* 浮萍：三笔 —— 偏右下的水下根影、略压扁的叶身、偏左上的亮芯。
+   少了这三笔它就只是"屏上一个小色块"，读不出"浮在水面上"（王总说的"没有透视"）。 */
+static void weed_paint(const weed_t *w, float dy)
+{
+    static const uint8_t c_shadow[3] = {1, 9, 6};
+    const uint8_t *body = (w->t < 0.62f) ? s_pal[PI_WEEDPALE] : s_pal[PI_WEED];
+    const uint8_t *pale = s_pal[PI_WEEDPALE];
+    float r = w->r;
+
+    /* 复用荷叶那套 局部→世界 变换，这里只做平移（浮萍不跟着荷叶自转） */
+    s_lrx = w->x; s_lry = w->y + dy; s_lca = 1.0f; s_lsa = 0.0f;
+
+    lily_ellipse(r * 0.36f, r * 0.58f, r * 0.96f, r * 0.74f, 0.0f, 12);
+    lily_xf(s_npts);
+    fill_poly(s_poly, s_npts, c_shadow, NULL, 66);                  /* 0.26 */
+    lily_ellipse(0.0f, 0.0f, r, r * 0.86f, 0.0f, 12);
+    lily_xf(s_npts);
+    fill_poly(s_poly, s_npts, body, NULL, 246);                     /* 0.96 */
+    lily_ellipse(-r * 0.26f, -r * 0.32f, r * 0.36f, r * 0.30f, 0.0f, 10);
+    lily_xf(s_npts);
+    fill_poly(s_poly, s_npts, pale, NULL, 108);                     /* 0.42 */
+}
+
+/* 浮萍生成器的随机数：独立 LCG，等价于 JS 的
+   Math.imul(s,1103515245) + 12345 再 & 0x7fffffff */
+static inline float weed_wr(uint32_t *s, float a, float b)
+{
+    *s = (*s * 1103515245u + 12345u) & 0x7fffffffu;
+    return a + ((float)(*s) / 2147483647.0f) * (b - a);
+}
+
+static void build_weeds(void)
+{
+    s_nweed = 0;
+    for (int i = 0; i < s_nlily; i++) { s_lily[i].ws0 = 0; s_lily[i].wsn = 0; }
+    int maxN = WEED_PER[WEED_LV];
+    if (maxN <= 0 || s_nlily == 0) return;        /* 0 档 = 完全关，留作回归基线 */
+
+    uint32_t sg = 20260919u;
+    for (int li = 0; li < s_nlily; li++) {
+        lily_t *L = &s_lily[li];
+        /* 每片叶子 0~maxN 撮 —— 有疏有密才自然，别均匀撒盐 */
+        int n = (int)floorf(weed_wr(&sg, 0.0f, (float)maxN + 0.999f));
+        if (!n) continue;
+        int first = s_nweed;
+        for (int h = 0; h < n; h++) {
+            float a0 = weed_wr(&sg, 0.0f, 6.2832f);
+            /* 离叶缘留 1.6~4.6 的水面缝隙：贴着长放大看像"荷叶掉下来的碎片" */
+            float d0 = L->r + weed_wr(&sg, 1.6f, 4.6f);
+            float lx = fcos_t(a0) * d0, ly = fsin_t(a0) * d0;
+            float u = weed_wr(&sg, 0.0f, 1.0f);
+            int leafN = (u < 0.45f) ? 1 : (u < 0.80f ? 2 : 3);      /* 独叶居多，小簇点缀 */
+            for (int j = 0; j < leafN && s_nweed < MAX_WEED; j++) {
+                float wa = weed_wr(&sg, 0.0f, 6.2832f);
+                float wd2 = (j == 0) ? 0.0f : weed_wr(&sg, 1.0f, 2.2f);
+                weed_t *w = &s_weed[s_nweed++];
+                w->x = clampf(L->x + lx + fcos_t(wa) * wd2, 4.0f, (float)KW - 4.0f);
+                w->y = clampf(L->y + ly + fsin_t(wa) * wd2, 4.0f, (float)KH - 4.0f);
+                w->r = (j == 0) ? weed_wr(&sg, 2.2f, 3.2f) : weed_wr(&sg, 1.5f, 2.2f);
+                w->t = weed_wr(&sg, 0.0f, 1.0f);
+                /* 网页版这里还算了个 hi（只有大叶才点亮芯），但 paintWeedPad 根本没用它 ——
+                   它只影响随机数序号，所以这一脚必须照样抽掉，否则后面每片浮萍全都错位。 */
+                if (j == 0) (void)weed_wr(&sg, 0.0f, 1.0f);
+            }
+        }
+        L->ws0 = first; L->wsn = s_nweed - first;
+    }
+}
+
+/* 荷叶这一帧的上下呼吸量（浮萍跟着一起呼吸，但不跟着自转） */
+static inline float lily_bob(const lily_t *L)
+{
+    return fsin_t(s_time * 0.55f + L->bob) * 0.9f;
+}
+
+/* 落点先躲开荷叶：涟漪与饲料都画在荷叶之下，落在叶面上等于白扔 ——
+   玩家看到的是"撒了食水面没反应"，鱼也吃不到。
+   （网页版 safeSpot；纯几何，不动随机数序列） */
+static float s_spotX, s_spotY;
+static void safe_spot(float x, float y)
+{
+    for (int q = 0; q < s_nlily; q++) {
+        const lily_t *L = &s_lily[q];
+        float d = hypotf(L->x - x, L->y - y);
+        if (d < L->r + 4.0f) {
+            float ax = (d < 0.5f) ? 1.0f : (x - L->x) / d;
+            float ay = (d < 0.5f) ? 0.0f : (y - L->y) / d;
+            x = clampf(L->x + ax * (L->r + 7.0f), 16.0f, (float)KW - 16.0f);
+            y = clampf(L->y + ay * (L->r + 7.0f), 20.0f, (float)KH - 28.0f);
+        }
+    }
+    s_spotX = x; s_spotY = y;
+}
+
+/* ==========================================================================
+   8. 锦鲤
+   ========================================================================== */
+#define KSEG     5
+static const float KBEND[KSEG] = {0.14f, 0.24f, 0.23f, 0.21f, 0.18f};
+static const float KAMP[KSEG]  = {0.045f, 0.197f, 0.392f, 0.618f, 0.867f};
+#define KPHASE   0.92f
+static const float KDEPTH[KSEG + 1] = {0.46f, 0.88f, 1.00f, 0.80f, 0.56f, 0.30f};
+#define KOI_SCALE       2.0f
+#define GROW_MAX        1.35f
+#define GROW_PER_PELLET 0.018f
+#define KMOUTH  (0.175f * 0.46f * 0.875f)
+#define BITE_T    0.42f
+#define BITE_SLOW 0.10f
+/* 尾鳍立度：王总第 25 轮定档「25°」= TAIL_LV[1] */
+#define TK_TL 0.93f
+#define TK_TO 1.04f
+#define TK_TW 1.07f
+#define TK_FK 0.86f
+/* 尾鳍衔接：定档「松」= TAIL_JOIN[2] */
+#define TJ_SINK 0.34f
+#define TJ_FLAP 1.32f
+#define TJ_OP   0.15f
+#define TJ_SHAD 0.05f
+static const int TJ_GA[3] = {256, 179, 108};    // 红白：1.00 / 0.70 / 0.42
+static const int TJ_GG[3] = {236, 159,  82};    // 黄金：0.92 / 0.62 / 0.32
+
+typedef struct {
+    float x, y, headA, phase, L, grow, curv, v, hz, waveAmp;
+    float gaitTime, wanderT, wx, wy, eat, biteT;
+    int   turnSide, seek, burst;
+    uint8_t pat;                         // 0 kohaku / 1 gold / 2 sanke
+    int   ns;
+    float sp[4][5];                      // 红斑 [段, 段内 t, 半长, 半宽, 横向偏移]
+    float bx0, by0, bx1, by1;            // 上一帧 / 本帧包围盒
+} koi_t;
+
+static koi_t s_koi[MAX_KOI];
+static int   s_nkoi = 5;
+
+static uint32_t s_rnd = 20260919u;
+static inline uint32_t rnd_u(void) { s_rnd = s_rnd * 1664525u + 1013904223u; return s_rnd; }
+static inline float rnd_f(float a, float b)
+{ return a + (b - a) * ((float)(rnd_u() >> 8) / 16777216.0f); }
+static inline int rnd_i(int n) { return (int)((rnd_u() >> 8) % (uint32_t)(n > 0 ? n : 1)); }
+static float _spx[KSEG + 1], _spy[KSEG + 1], _spa[KSEG + 1];
+static float _lx[KSEG + 1], _ly[KSEG + 1], _rx[KSEG + 1], _ry[KSEG + 1];
+/* clampf / angdiff / s_pts / s_npts / pt_push / pt_quad / s_poly / to_q8
+   已上提到第 4b 节 —— 第 7b 节的荷叶浮萍也要用，放在这里就来不及了。 */
+
+static void make_spots(koi_t *k)
+{
+    if (k->pat == 1) { k->ns = 0; return; }               // 黄金鲤不该有红斑
+    int n = (k->pat == 2) ? (3 + (rnd_f(0, 1) < 0.5f ? 0 : 1))
+                          : (2 + (rnd_f(0, 1) < 0.75f ? 1 : 0));
+    float head = rnd_f(0, 0.6f);
+    k->ns = n;
+    for (int i = 0; i < n; i++) {
+        int big = (i % 2 == 0);
+        int sg = (int)(head + ((float)i / (float)n) * (KSEG - 0.4f));
+        if (sg > KSEG - 1) sg = KSEG - 1;
+        if (sg < 0) sg = 0;
+        float tt = clampf(rnd_f(0.18f, 0.82f), 0.10f, 0.90f);
+        float sl = big ? rnd_f(0.098f, 0.128f) : rnd_f(0.052f, 0.072f);
+        float so = rnd_f(-0.13f, 0.13f);
+        float hw = KDEPTH[sg] + (KDEPTH[sg + 1] - KDEPTH[sg]) * tt;
+        float lim = hw - 0.06f - fabsf(so);
+        if (lim < 0.30f) lim = 0.30f;
+        float sw = big ? rnd_f(0.50f, 0.62f) : rnd_f(0.30f, 0.42f);
+        if (sw > lim) sw = lim;
+        k->sp[i][0] = (float)sg; k->sp[i][1] = tt;
+        k->sp[i][2] = sl;        k->sp[i][3] = sw; k->sp[i][4] = so;
+    }
+}
+
+static void make_koi(koi_t *k, float x, float y, float g0, uint8_t pat)
+{
+    memset(k, 0, sizeof(*k));
+    k->x = x; k->y = y;
+    k->headA = rnd_f(0, 6.2832f);
+    k->phase = rnd_f(0, 6.28f);
+    k->L = rnd_f(17.0f, 23.0f) * KOI_SCALE;
+    k->grow = g0;
+    k->hz = rnd_f(1.5f, 2.4f);
+    k->waveAmp = 0.26f;
+    k->burst = 1;
+    k->gaitTime = rnd_f(0.3f, 1.0f);
+    k->wanderT = rnd_f(0, 1.2f);
+    k->wx = x; k->wy = y;
+    k->pat = pat;
+    make_spots(k);
+    k->bx0 = k->bx1 = x; k->by0 = k->by1 = y;
+}
+
+static void pond_init(void)
+{
+    s_rnd = 20260919u;
+    s_nlily = 0;
+    static const uint8_t pats[5] = {0, 1, 0, 2, 0};
+    for (int i = 0; i < s_nkoi; i++) {
+        float ia = rnd_f(0, 6.2832f), ir = rnd_f(0.10f, 0.68f);
+        make_koi(&s_koi[i],
+                 (float)KW * 0.5f + cosf(ia) * ((float)KW * 0.5f - 46.0f) * ir,
+                 (float)KH * 0.5f + sinf(ia) * ((float)KH * 0.5f - 64.0f) * ir,
+                 rnd_f(0.52f, 0.72f), pats[i % 5]);
+    }
+
+    /* 荷叶：环形散布 + 最小间距检查，避免叠成一片。
+       ★ 位置必须夹在「鱼」与「波带」之间 —— 全局 rnd 是一条序列，
+         插错地方会让波带和波光点整体平移（网页版 initPond 也是这个次序）。 */
+    {
+        int guard = 0;
+        while (s_nlily < MAX_LILY && guard++ < 900) {
+            float ang = rnd_f(0, 6.2832f), rad = rnd_f(0.30f, 0.96f);
+            float x = clampf((float)KW * 0.5f + fcos_t(ang) * 116.0f * rad,
+                             20.0f, (float)KW - 20.0f);
+            float y = clampf((float)KH * 0.5f + fsin_t(ang) * 152.0f * rad,
+                             24.0f, (float)KH - 24.0f);
+            float r = rnd_f(13.0f, 21.0f);
+            int ok = 1;
+            for (int q = 0; q < s_nlily; q++) {
+                if (hypotf(s_lily[q].x - x, s_lily[q].y - y) <
+                    s_lily[q].r + r + 6.0f) { ok = 0; break; }
+            }
+            if (!ok) continue;
+            lily_t *L = &s_lily[s_nlily++];
+            L->x = x; L->y = y; L->r = r;
+            L->rot  = rnd_f(0, 6.28f);
+            L->spin = rnd_f(-0.07f, 0.07f);
+            L->bob  = rnd_f(0, 6.28f);
+            L->gap  = rnd_f(0.13f, 0.25f);
+            L->ws0 = 0; L->wsn = 0;
+        }
+    }
+    build_weeds();                      /* 浮萍是荷叶的伴生，必须跟在荷叶之后 */
+
+    for (int b = 0; b < 5; b++) {
+        s_band[b].y = rnd_f(24, KH - 24);  s_band[b].amp = rnd_f(4, 11);
+        s_band[b].w = rnd_f(0.010f, 0.020f); s_band[b].ph = rnd_f(0, 6.28f);
+        s_band[b].a = rnd_f(0.035f, 0.068f); s_band[b].sp = rnd_f(7, 18);
+        s_band[b].lw = rnd_f(2, 5);
+    }
+    for (int i = 0; i < 44; i++) {
+        s_spark[i].x = rnd_f(0, KW - 3);
+        s_spark[i].y = rnd_f(0, KH - 3);
+        s_spark[i].phase = rnd_f(0, 6.28f);
+        s_spark[i].size = (rnd_f(0.7f, 1.7f) + 0.5f >= 2.0f) ? 2 : 1;
+    }
+}
+
+static void koi_spine(const koi_t *k)
+{
+    float seg = (k->L * k->grow) / (float)KSEG * 0.98f;
+    float px = k->x, py = k->y, a = k->headA;
+    _spx[0] = px; _spy[0] = py; _spa[0] = a;
+    for (int i = 0; i < KSEG; i++) {
+        a += k->curv * KBEND[i] + k->waveAmp * KAMP[i] * fsin_t(k->phase - (float)i * KPHASE);
+        px -= fcos_t(a) * seg;
+        py -= fsin_t(a) * seg;
+        _spx[i + 1] = px; _spy[i + 1] = py; _spa[i + 1] = a;
+    }
+}
+
+/* 身体轮廓：头圆帽（必须单独绕一段二次曲线，否则头是尖的）→ 右缘 → 尾柄 → 左缘 */
+static void body_pts(void)
+{
+    s_npts = 0;
+    float ha = _spa[0];
+    float hw = sqrtf((_lx[0] - _spx[0]) * (_lx[0] - _spx[0]) +
+                     (_ly[0] - _spy[0]) * (_ly[0] - _spy[0]));
+    pt_push(_lx[0], _ly[0]);
+    pt_quad(_lx[0], _ly[0],
+            _spx[0] + fcos_t(ha) * hw * 1.75f, _spy[0] + fsin_t(ha) * hw * 1.75f,
+            _rx[0], _ry[0]);
+    for (int i = 0; i < KSEG; i++) {
+        pt_quad(s_pts[(s_npts - 1) * 2], s_pts[(s_npts - 1) * 2 + 1],
+                _rx[i], _ry[i],
+                (_rx[i] + _rx[i + 1]) * 0.5f, (_ry[i] + _ry[i + 1]) * 0.5f);
+    }
+    pt_quad(s_pts[(s_npts - 1) * 2], s_pts[(s_npts - 1) * 2 + 1],
+            _rx[KSEG], _ry[KSEG], _lx[KSEG], _ly[KSEG]);
+    for (int i = KSEG; i > 0; i--) {
+        pt_quad(s_pts[(s_npts - 1) * 2], s_pts[(s_npts - 1) * 2 + 1],
+                _lx[i], _ly[i],
+                (_lx[i] + _lx[i - 1]) * 0.5f, (_ly[i] + _ly[i - 1]) * 0.5f);
+    }
+}
+
+static void ellipse_pts(float cx, float cy, float rx, float ry, float rot, int n)
+{
+    s_npts = 0;
+    for (int i = 0; i < n; i++) {
+        float t = 2.0f * KOI_PI * (float)i / (float)n;
+        float ex = fcos_t(t) * rx, ey = fsin_t(t) * ry;
+        pt_push(cx + ex * fcos_t(rot) - ey * fsin_t(rot),
+                cy + ex * fsin_t(rot) + ey * fcos_t(rot));
+    }
+}
+
+/* 尾鳍局部点列：rx0 = 根部起笔的局部 x（填充传 0 = 落在身体内部；描边传 sink） */
+static void tail_local(float rx0, float tl, float to, float tw, float fk, float flap)
+{
+    s_npts = 0;
+    pt_push(rx0, -to);
+    pt_quad(rx0, -to, tl * 0.40f, -to * 0.82f + flap * 0.30f, tl * 0.84f, -tw + flap);
+    pt_quad(s_pts[(s_npts - 1) * 2], s_pts[(s_npts - 1) * 2 + 1],
+            tl * 1.10f, -tw * 0.30f + flap, tl * 0.82f * fk, flap * 0.46f);
+    pt_quad(s_pts[(s_npts - 1) * 2], s_pts[(s_npts - 1) * 2 + 1],
+            tl * 1.10f, tw * 0.30f + flap, tl * 0.84f, tw + flap);
+    pt_quad(s_pts[(s_npts - 1) * 2], s_pts[(s_npts - 1) * 2 + 1],
+            tl * 0.40f, to * 0.82f + flap * 0.30f, rx0, to);
+    pt_push(rx0 - tl * 0.05f, 0.0f);
+}
+
+/* 局部 → 世界（绕原点旋转 + 平移） */
+static void tail_to_world(int n, float bx, float by, float ca, float sa)
+{
+    for (int i = 0; i < n; i++) {
+        float px = s_pts[i * 2], py = s_pts[i * 2 + 1];
+        s_pts[i * 2]     = bx + px * ca - py * sa;
+        s_pts[i * 2 + 1] = by + px * sa + py * ca;
+    }
+}
+
+static void koi_draw(const koi_t *k)
+{
+    koi_spine(k);
+    float L = k->L * k->grow * (1.0f + 0.09f * (k->eat > 0 ? k->eat / 0.6f : 0.0f));
+    float Wd = L * 0.175f;
+    int fine = (k->grow > 0.56f);
+    int isGold = (k->pat == 1);
+    const uint8_t *bodyCol = isGold ? s_pal[PI_KGOLD] : s_pal[PI_KBODY];
+
+    for (int i = 0; i <= KSEG; i++) {
+        float w = Wd * KDEPTH[i];
+        float nx = -fsin_t(_spa[i]), ny = fcos_t(_spa[i]);
+        _lx[i] = _spx[i] + nx * w; _ly[i] = _spy[i] + ny * w;
+        _rx[i] = _spx[i] - nx * w; _ry[i] = _spy[i] - ny * w;
+    }
+
+    /* ① 水下投影：整条鱼偏移一点再画一遍暗色（顶视最有效的深度感） */
+    {
+        static const uint8_t shcol[3] = {1, 9, 7};
+        body_pts();
+        to_q8(s_npts, 1.8f, 2.6f);
+        fill_poly(s_poly, s_npts, shcol, NULL, 56);          // 0.22
+    }
+
+    /* ② 鱼身 + 体缘暗线 */
+    body_pts();
+    to_q8(s_npts, 0.0f, 0.0f);
+    fill_poly(s_poly, s_npts, bodyCol, NULL, 256);
+    {
+        float save[NPTS * 2];
+        int n = s_npts;
+        for (int i = 0; i < n * 2; i++) save[i] = s_pts[i];
+        stroke_pts(save, n, 1, 0.7f, s_pal[PI_KEDGE], 133);  // 0.52
+    }
+
+    /* ③ 红斑（黄金鲤没有；大正三色另加墨斑） */
+    for (int s = 0; s < k->ns; s++) {
+        int sg = (int)k->sp[s][0];
+        float tt = k->sp[s][1];
+        float aa = _spa[sg];
+        float ax = _spx[sg] + (_spx[sg + 1] - _spx[sg]) * tt;
+        float ay = _spy[sg] + (_spy[sg + 1] - _spy[sg]) * tt;
+        float off = k->sp[s][4] * Wd;
+        ellipse_pts(ax - fsin_t(aa) * off, ay + fcos_t(aa) * off,
+                    L * k->sp[s][2], Wd * k->sp[s][3], aa, 14);
+        to_q8(s_npts, 0.0f, 0.0f);
+        fill_poly(s_poly, s_npts, s_pal[PI_KSPOT], NULL, 236);   // 0.92
+    }
+    if (k->pat == 2) {
+        static const uint8_t ink[3] = {26, 24, 30};
+        ellipse_pts(_spx[2], _spy[2], L * 0.055f, Wd * 0.20f, _spa[2], 12);
+        to_q8(s_npts, 0.0f, 0.0f);
+        fill_poly(s_poly, s_npts, ink, NULL, 159);
+    }
+
+    /* ④ 脊背高光：只填纯色就是纸片，一条亮带才有圆柱体积感 */
+    if (fine) {
+        static const uint8_t wht[3] = {255, 255, 255};
+        float hi[KSEG * 2];
+        hi[0] = _spx[0] + (_spx[1] - _spx[0]) * 0.30f;
+        hi[1] = _spy[0] + (_spy[1] - _spy[0]) * 0.30f;
+        for (int i = 1; i < KSEG; i++) { hi[i * 2] = _spx[i]; hi[i * 2 + 1] = _spy[i]; }
+        float lw = Wd * 0.55f;
+        if (lw < 0.8f) lw = 0.8f;
+        stroke_pts(hi, KSEG, 0, lw, wht, 77);                // 0.30
+    }
+
+    /* ⑤ 尾鳍：根部一律埋进身体（局部 x=0 起笔）盖住身体尾端那道横截面；
+       描边才从"露出身体那一点"（sink）起笔 —— 第 24 轮定死的口径。 */
+    {
+        float tpx = _spx[KSEG], tpy = _spy[KSEG];
+        float segLen = sqrtf((tpx - _spx[KSEG - 1]) * (tpx - _spx[KSEG - 1]) +
+                             (tpy - _spy[KSEG - 1]) * (tpy - _spy[KSEG - 1]));
+        float sink = segLen * TJ_SINK;
+        float flap = fsin_t(k->phase - (float)KSEG * KPHASE - 0.85f) *
+                     (0.16f + k->waveAmp * 0.95f) * L * 0.20f * TJ_FLAP;
+        float tl = L * 0.238f * TK_TL + sink;
+        float to = Wd * KDEPTH[KSEG] * 1.10f * TK_TO;
+        float tw = L * 0.094f * TK_TW;
+        float bx = tpx + fcos_t(_spa[KSEG]) * sink;
+        float by = tpy + fsin_t(_spa[KSEG]) * sink;
+        float ca = fcos_t(_spa[KSEG] + KOI_PI), sa = fsin_t(_spa[KSEG] + KOI_PI);
+
+        if (TJ_SHAD > 0.0f) {                                 // ⑤a 水下投影（与身体同偏移）
+            static const uint8_t shcol[3] = {1, 9, 7};
+            tail_local(0.0f, tl, to, tw, TK_FK, flap);
+            tail_to_world(s_npts, bx + 1.8f, by + 2.6f, ca, sa);
+            to_q8(s_npts, 0.0f, 0.0f);
+            fill_poly(s_poly, s_npts, shcol, NULL, (int)(TJ_SHAD * 256.0f));
+        }
+
+        tail_local(0.0f, tl, to, tw, TK_FK, flap);            // ⑤b 鳍身
+        tail_to_world(s_npts, bx, by, ca, sa);
+        {
+            float save[NPTS * 2];
+            int n = s_npts;
+            for (int i = 0; i < n * 2; i++) save[i] = s_pts[i];
+            to_q8(n, 0.0f, 0.0f);
+            int nend = (int)ceilf(sink) + 3;
+            if (nend < (int)lrintf(tl)) nend = (int)lrintf(tl);
+            int hold = (int)ceilf(sink) + 1;
+            if (hold > nend - 1) hold = nend - 1;
+            int mid = hold + (int)((float)(nend - hold) * TJ_OP);
+            if (mid < hold + 1) mid = hold + 1;
+            const int *A = isGold ? TJ_GG : TJ_GA;
+            grad_t g;
+            g.ux = (int32_t)lrintf(ca * 256.0f);
+            g.uy = (int32_t)lrintf(sa * 256.0f);
+            g.cx = (int32_t)lrintf(bx * 256.0f);
+            g.cy = (int32_t)lrintf(by * 256.0f);
+            g.s0 = 0;          g.a0 = A[0];
+            g.s1 = hold * 256; g.a1 = A[0];
+            g.s2 = mid * 256;  g.a2 = A[1];
+            g.s3 = nend * 256; g.a3 = A[2];
+            if (fine) fill_poly(s_poly, n, bodyCol, &g, 256);
+            else      fill_poly(s_poly, n, bodyCol, NULL, A[1]);
+
+            if (fine) {                                       // 描边：只在"露出来"那一段
+                tail_local(sink, tl, to, tw, TK_FK, flap);
+                tail_to_world(s_npts, bx, by, ca, sa);
+                stroke_pts(s_pts, s_npts, 0, 0.8f, s_pal[PI_KFIN], 128);   // 0.50
+            }
+            (void)save;
+        }
+    }
+
+    /* ⑥ 胸鳍（左右交替划水） */
+    if (fine) {
+        float px0 = _spx[1] + (_spx[2] - _spx[1]) * 0.28f;
+        float py0 = _spy[1] + (_spy[2] - _spy[1]) * 0.28f;
+        float fca = fcos_t(_spa[1]), fsa = fsin_t(_spa[1]);
+        for (int si = 0; si < 2; si++) {
+            float sd = (si == 0) ? -1.0f : 1.0f;
+            float pad = 0.5f + 0.5f * fsin_t(k->phase * 0.62f + (sd > 0 ? 0.0f : KOI_PI));
+            float pw = Wd * (1.00f + 0.50f * pad);
+            float pl = L * (0.15f + 0.09f * pad);
+            float r0 = Wd * KDEPTH[1] * 0.66f;
+            s_npts = 0;
+            pt_push(0.0f, sd * r0);
+            pt_quad(0.0f, sd * r0, -pl * 0.34f, sd * (r0 + pw * 0.94f),
+                    -pl * 0.58f, sd * (r0 + pw * 0.90f));
+            pt_quad(s_pts[(s_npts - 1) * 2], s_pts[(s_npts - 1) * 2 + 1],
+                    -pl * 0.86f, sd * (r0 + pw * 0.62f), -pl * 0.78f, sd * (r0 + pw * 0.28f));
+            pt_quad(s_pts[(s_npts - 1) * 2], s_pts[(s_npts - 1) * 2 + 1],
+                    -pl * 0.70f, sd * (r0 + pw * 0.05f), -pl * 0.38f, sd * r0 * 1.06f);
+            pt_quad(s_pts[(s_npts - 1) * 2], s_pts[(s_npts - 1) * 2 + 1],
+                    -pl * 0.16f, sd * r0 * 1.04f, -pl * 0.05f, sd * r0 * 0.96f);
+            tail_to_world(s_npts, px0, py0, fca, fsa);
+            to_q8(s_npts, 0.0f, 0.0f);
+            fill_poly(s_poly, s_npts, bodyCol, NULL, 159);    // 0.62
+        }
+    }
+}
+
+/* ==========================================================================
+   9. 涟漪（整数定点环带，与 koi_sim.py 同名函数同式）
+   ========================================================================== */
+#define RING_GAP_V  13.0f
+#define RING_LIFE_V 0.82f
+#define RING_R0_V   3.0f
+#define RING_RMAX_V 46.0f
+#define RING_F0_V   0.109f
+#define RING_F1_V   0.326f
+#define RING_N_V    3
+#define SPLASH_MIN_V 26.0f
+
+typedef struct {
+    float x, y, r0, rMax, life, age, a0, cg;
+    int   kind;                     // 0 tap / 1 drop / 2 eat
+    int   cn;
+} rip_t;
+
+static rip_t s_rip[MAX_RIP];
+static int   s_nrip;
+
+static void ripple_draw(const rip_t *rp)
+{
+    float p = rp->age / rp->life;
+    if (p <= 0.0f || p >= 1.0f) return;
+    float R = rp->r0 + (rp->rMax - rp->r0) * powf(p, 0.82f);
+    float A = powf(1.0f - p, 0.85f) * 0.88f * rp->a0;
+    if (A <= 0.016f || R < 0.5f) return;
+    const uint8_t *col = s_pal[PI_RIPPLE];
+    float f0 = rp->rMax * RING_F0_V, f1 = rp->rMax * RING_F1_V;
+    int cx8 = (int)lrintf(rp->x * 8.0f) - 4;
+    int cy8 = (int)lrintf(rp->y * 8.0f) - 4;
+    for (int ki = 0; ki < rp->cn; ki++) {
+        float rk = R - (float)ki * rp->cg;
+        if (rk < 0.5f) break;
+        float ak = A * clampf((rk - f0) / f1, 0.0f, 1.0f);
+        if (ak <= 0.016f) continue;
+        int a_core = (int)(ak * 256.0f);
+        int a_halo = (int)(ak * 256.0f * 0.30f);
+        int R8 = (int)lrintf(rk * 8.0f);
+        int w_core = (int)lrintf((0.85f + rk * 0.005f) * 0.5f * 8.0f);
+        int w_halo = (int)lrintf((1.7f + rk * 0.016f) * 0.5f * 8.0f);
+        if (w_core < 1) w_core = 1;
+        if (w_halo < 1) w_halo = 1;
+        int lo1 = (R8 - w_core) * (R8 - w_core), hi1 = (R8 + w_core) * (R8 + w_core);
+        int lo2 = (R8 - w_core - w_halo) * (R8 - w_core - w_halo);
+        int hi2 = (R8 + w_core + w_halo) * (R8 + w_core + w_halo);
+        int rad = (R8 + w_core + w_halo) / 8 + 2;
+        int cxi = (int)rp->x, cyi = (int)rp->y;
+        int y0 = cyi - rad, y1 = cyi + rad;
+        if (y0 < s_cy0) y0 = s_cy0;
+        if (y1 > s_cy1) y1 = s_cy1;
+        for (int yy = y0; yy <= y1; yy++) {
+            int dy8 = yy * 8 + 4 - cy8;
+            int dy2 = dy8 * dy8;
+            if (dy2 > hi2) continue;
+            int x0 = cxi - rad, x1 = cxi + rad;
+            if (x0 < s_cx0) x0 = s_cx0;
+            if (x1 > s_cx1) x1 = s_cx1;
+            for (int xx = x0; xx <= x1; xx++) {
+                int dx8 = xx * 8 + 4 - cx8;
+                int d2 = dx8 * dx8 + dy2;
+                if (d2 >= lo1 && d2 <= hi1)      px_blend(xx, yy, col[0], col[1], col[2], a_core);
+                else if (d2 >= lo2 && d2 <= hi2) px_blend(xx, yy, col[0], col[1], col[2], a_halo);
+            }
+        }
+    }
+}
+
+/* ==========================================================================
+   10. 饲料
+   ========================================================================== */
+typedef struct { float x, y, sx, sy, tx, ty, t, dur, delay; int food; } pel_t;
+static pel_t s_pel[MAX_PEL];
+static int   s_npel;
+static float s_food_x[MAX_FOOD], s_food_y[MAX_FOOD];
+static int   s_nfood;
+
+static void pellets_draw(void)
+{
+    const uint8_t *col = s_pal[PI_PELLET];
+    for (int i = 0; i < s_npel; i++) {
+        const pel_t *pe = &s_pel[i];
+        if (pe->delay > 0) continue;
+        int a = (int)((0.45f + 0.55f * pe->t) * 256.0f);
+        float pr = 1.5f * (0.6f + 0.4f * pe->t);
+        ellipse_pts(pe->x, pe->y, pr, pr, 0.0f, 8);
+        to_q8(s_npts, 0.0f, 0.0f);
+        fill_poly(s_poly, s_npts, col, NULL, a);
+    }
+    for (int i = 0; i < s_nfood; i++) {                    // 已落定的食物
+        ellipse_pts(s_food_x[i], s_food_y[i], 1.6f, 1.6f, 0.0f, 8);
+        to_q8(s_npts, 0.0f, 0.0f);
+        fill_poly(s_poly, s_npts, col, NULL, 256);
+    }
+}
+
+/* ==========================================================================
+   11. 动作
+   ========================================================================== */
+static void ripple_add(float x, float y, float r0, float rMax, float life,
+                       float a0, int kind, int cn, float cg)
+{
+    if (s_nrip >= MAX_RIP) {
+        memmove(&s_rip[0], &s_rip[1], sizeof(rip_t) * (MAX_RIP - 1));
+        s_nrip = MAX_RIP - 1;
+    }
+    rip_t *r = &s_rip[s_nrip++];
+    r->x = x; r->y = y; r->r0 = r0; r->rMax = rMax; r->life = life;
+    r->age = 0; r->a0 = a0; r->kind = kind; r->cn = cn; r->cg = cg;
+}
+
+/* 小圆总量管制（分类记账 + 近邻去重），照抄网页版 splashOK */
+static int splash_ok(int kind, float x, float y, int cap)
+{
+    int n = 0;
+    for (int i = 0; i < s_nrip; i++) {
+        if (s_rip[i].kind != kind) continue;
+        if (s_rip[i].age >= s_rip[i].life) continue;
+        n++;
+        if (hypotf(s_rip[i].x - x, s_rip[i].y - y) < SPLASH_MIN_V) return 0;
+    }
+    return n < cap;
+}
+
+static float s_shakeT, s_shakeX, s_shakeY;
+static float s_satiety = 0.5f;
+
+static void do_tap(void)
+{
+    s_shakeX = rnd_f(60.0f, 180.0f);
+    s_shakeY = rnd_f(80.0f, 240.0f);
+    s_shakeT = 1.2f;
+    for (int q = s_nrip - 1; q >= 0; q--)           // 连按不叠加：清掉上一次拍水
+        if (s_rip[q].kind == 0) s_rip[q] = s_rip[--s_nrip];
+    ripple_add(s_shakeX, s_shakeY, RING_R0_V, RING_RMAX_V, RING_LIFE_V, 1.0f,
+               0, RING_N_V, RING_GAP_V);
+}
+
+static void do_feed(void)
+{
+    for (int i = 0; i < 14; i++) {
+        if (s_npel >= MAX_PEL) break;
+        const koi_t *near = s_nkoi ? &s_koi[rnd_i(s_nkoi)] : NULL;
+        float tx = near ? clampf(near->x + rnd_f(-40, 40), 16, KW - 16) : rnd_f(16, KW - 16);
+        float ty = near ? clampf(near->y + rnd_f(-40, 40), 20, KH - 28) : rnd_f(20, KH - 28);
+        safe_spot(tx, ty); tx = s_spotX; ty = s_spotY;    // 别撒到荷叶上（撒了看不见也吃不到）
+        pel_t *pe = &s_pel[s_npel++];
+        pe->sx = tx + rnd_f(-14, 14); pe->sy = ty - rnd_f(46, 80);
+        pe->tx = tx; pe->ty = ty;
+        pe->x = pe->sx; pe->y = pe->sy;
+        pe->t = 0; pe->dur = rnd_f(0.34f, 0.52f); pe->delay = rnd_f(0, 0.55f);
+        pe->food = 1;
+    }
+    for (int k = 0; k < 8; k++) {                   // 只出涟漪、不产食物的"雨点"
+        if (s_npel >= MAX_PEL) break;
+        pel_t *pe = &s_pel[s_npel++];
+        pe->sx = 0; pe->sy = 0;
+        safe_spot(rnd_f(10, KW - 10), rnd_f(16, KH - 22));
+        pe->tx = s_spotX; pe->ty = s_spotY;
+        pe->x = pe->tx; pe->y = pe->ty;
+        pe->t = 0; pe->dur = 0.36f; pe->delay = rnd_f(0, 0.9f);
+        pe->food = 0;
+    }
+}
+
+/* ==========================================================================
+   12. 推进
+   ========================================================================== */
+static void koi_step(koi_t *k, float dt)
+{
+    float kh = k->L * k->grow * 0.55f;
+
+    float tx = 0, ty = 0;
+    int ti = -1;
+    float best = 1e9f;
+    for (int m = 0; m < s_nfood; m++) {
+        float dd = (s_food_x[m] - k->x) * (s_food_x[m] - k->x) +
+                   (s_food_y[m] - k->y) * (s_food_y[m] - k->y);
+        if (dd < best) { best = dd; ti = m; tx = s_food_x[m]; ty = s_food_y[m]; }
+    }
+    if (ti >= 0 && best > 340.0f * 340.0f) ti = -1;      // 感知半径 ≈ 全屏
+    k->seek = (ti >= 0);
+
+    float vx = fcos_t(k->headA), vy = fsin_t(k->headA);  // 前进惯性项，不能省
+    if (ti >= 0) {
+        float d = hypotf(tx - k->x, ty - k->y);
+        if (d < 1.0f) d = 1.0f;
+        vx += (tx - k->x) / d * 2.2f;
+        vy += (ty - k->y) / d * 2.2f;
+    } else {
+        k->wanderT -= dt;
+        if (k->wanderT <= 0) {
+            k->wanderT = rnd_f(3.4f, 6.4f);
+            for (int tr = 0; tr < 8; tr++) {
+                float wa = rnd_f(0, 6.2832f), wr = sqrtf(rnd_f(0.10f, 1.0f));
+                k->wx = (float)KW * 0.5f + fcos_t(wa) * ((float)KW * 0.5f - 44.0f - kh) * wr;
+                k->wy = (float)KH * 0.5f + fsin_t(wa) * ((float)KH * 0.5f - 54.0f - kh) * wr;
+                if (hypotf(k->wx - k->x, k->wy - k->y) >= 48.0f &&
+                    fabsf(angdiff(atan2f(k->wy - k->y, k->wx - k->x), k->headA)) <= 1.92f) break;
+            }
+        }
+        float wdx = k->wx - k->x, wdy = k->wy - k->y;
+        float wdd = hypotf(wdx, wdy);
+        if (wdd < 36.0f) k->wanderT = 0.0f;              // 到点换目标，别在原点绕圈
+        if (wdd < 0.6f) { wdx = 1.0f; wdy = 0.0f; wdd = 1.0f; }
+        vx += wdx / wdd * 1.05f;
+        vy += wdy / wdd * 1.05f;
+    }
+
+    if (s_shakeT > 0) {                                   // 受惊四散
+        float sd = hypotf(k->x - s_shakeX, k->y - s_shakeY);
+        if (sd < 1.0f) sd = 1.0f;
+        vx += (k->x - s_shakeX) / sd * 3.0f;
+        vy += (k->y - s_shakeY) / sd * 3.0f;
+    }
+
+    float m2 = 26.0f + kh;                                // 边界回避带（随体量缩放）
+    if (k->x < m2)              vx += (m2 - k->x) / m2 * 3.2f;
+    if (k->x > KW - m2)         vx -= (k->x - (KW - m2)) / m2 * 3.2f;
+    if (k->y < m2 + 6.0f)       vy += (m2 + 6.0f - k->y) / m2 * 3.2f;
+    if (k->y > KH - m2 - 20.0f) vy -= (k->y - (KH - m2 - 20.0f)) / m2 * 3.2f;
+
+    float sepW = k->seek ? 0.34f : 0.85f;                 // 抢食时别互推
+    for (int o = 0; o < s_nkoi; o++) {
+        if (&s_koi[o] == k) continue;
+        float ox = k->x - s_koi[o].x, oy = k->y - s_koi[o].y;
+        float od = hypotf(ox, oy);
+        if (od < 26.0f * KOI_SCALE && od > 0.1f) { vx += ox / od * sepW; vy += oy / od * sepW; }
+    }
+
+    float err = angdiff(atan2f(vy, vx), k->headA);
+    if (fabsf(err) > 2.60f) {
+        if (k->turnSide == 0) k->turnSide = (err < 0 ? -1 : 1);
+    } else if (fabsf(err) < 1.48f) {
+        k->turnSide = 0;
+    }
+    float e = fabsf(err) / 1.15f;
+    if (e > 1.0f) e = 1.0f;
+    float shaped = powf(e, 1.7f) * (float)(k->turnSide ? k->turnSide : (err < 0 ? -1 : 1));
+    float kk = dt * 4.2f; if (kk > 1.0f) kk = 1.0f;
+    k->curv += (shaped * 0.40f - k->curv) * kk;
+    k->headA += k->curv * 2.9f * dt;
+
+    k->gaitTime -= dt;                                    // 步态 burst / coast
+    if (k->gaitTime <= 0) {
+        if (k->burst) { k->burst = 0; k->gaitTime = rnd_f(0.70f, 1.50f); }
+        else          { k->burst = 1; k->gaitTime = rnd_f(0.30f, 0.55f); }
+    }
+    int power = k->seek || s_shakeT > 0.0f || fabsf(err) > 1.20f;
+    int burst = power || k->burst;
+    float ampT = k->seek ? 0.50f : (burst ? 0.38f : 0.24f);
+    float wa_t = dt * (burst ? 5.0f : 2.6f); if (wa_t > 1.0f) wa_t = 1.0f;
+    k->waveAmp += (ampT - k->waveAmp) * wa_t;
+    float hzT = k->seek ? 3.0f : (burst ? 2.4f : 1.5f);
+    float hz_t = dt * 3.6f; if (hz_t > 1.0f) hz_t = 1.0f;
+    k->hz += (hzT - k->hz) * hz_t;
+    k->phase += dt * k->hz * 6.2832f;
+    if (!burst) k->phase += dt * 0.6f;                    // 滑行时相位继续推进
+
+    float align = 0.5f + 0.5f * fcos_t(err);
+    int biting = (k->biteT > 0);
+    float vT = (k->seek ? 24.0f : (s_shakeT > 0 ? 26.0f : 19.0f))
+             * (0.62f + 0.46f * k->grow)
+             * (0.86f + 0.28f * s_satiety)
+             * (0.42f + 0.58f * align) * KOI_SCALE
+             * (biting ? BITE_SLOW : 1.0f);
+    if (burst) {
+        float vk = dt * (biting ? 10.0f : 3.8f); if (vk > 1.0f) vk = 1.0f;
+        k->v += (vT - k->v) * vk;
+    } else {
+        float vk = dt * 0.72f; if (vk > 1.0f) vk = 1.0f;
+        k->v -= k->v * vk;
+    }
+    k->v = clampf(k->v, 0.0f, 34.0f * KOI_SCALE);
+    if (biting) k->biteT -= dt;
+
+    k->x = clampf(k->x + fcos_t(k->headA) * k->v * dt, kh + 3.0f, KW - kh - 3.0f);
+    k->y = clampf(k->y + fsin_t(k->headA) * k->v * dt, kh + 3.0f, KH - kh - 3.0f);
+
+    /* 吃食：判定点 = 吻端 → 吃食圆也落在嘴上（第 18 轮口径） */
+    float mx = k->x + fcos_t(k->headA) * k->L * k->grow * KMOUTH;
+    float my = k->y + fsin_t(k->headA) * k->L * k->grow * KMOUTH;
+    if (ti >= 0 && ti < s_nfood &&
+        hypotf(tx - mx, ty - my) < k->L * k->grow * 0.0805f + 3.0f) {
+        for (int i = ti; i + 1 < s_nfood; i++) {
+            s_food_x[i] = s_food_x[i + 1]; s_food_y[i] = s_food_y[i + 1];
+        }
+        s_nfood--;
+        s_satiety = clampf(s_satiety + 0.05f, 0.0f, 1.0f);
+        k->eat = 0.6f;
+        k->biteT = BITE_T;                                // 啄食停顿：圆灭之前嘴不离开圆
+        k->grow = (k->grow + GROW_PER_PELLET > GROW_MAX) ? GROW_MAX
+                                                         : k->grow + GROW_PER_PELLET;
+        if (splash_ok(2, mx, my, 3)) ripple_add(mx, my, 1, 9, BITE_T, 0.70f, 2, 1, 0);
+    }
+}
+
+/* 需要整屏重画的两种情形：开机第一帧（缓冲还是空的），以及昼夜过渡期
+   （每一行的水色都在变，脏矩形帮不上忙）。其余时间一律走脏区。
+   ★ 这个标志必须"稳态时归零" —— 第一版只在昼夜过渡里清它，白天稳态进不到那个
+     分支，于是标志常年为 1、白天也每帧整屏重推，脏区优化形同虚设。
+     是主机台架的日志"脏区=100.0% rect=0"把它揪出来的（不在板子上也看得见）。 */
+static int s_first_frame = 1;
+
+static void step(float dt)
+{
+    s_time += dt;
+    if (s_shakeT > 0) s_shakeT -= dt;
+
+    if (s_night != s_nightTarget) {
+        float st = dt;                                    // 昼夜过渡 1 秒
+        float d = s_nightTarget - s_night;
+        if (d >  st) d =  st;
+        if (d < -st) d = -st;
+        s_night += d;
+        s_full = 1;
+    } else if (s_first_frame) {
+        s_full = 1;
+        s_first_frame = 0;
+    }
+
+    bands_mark_dirty();
+
+    for (int i = 0; i < s_nkoi; i++) {
+        koi_t *k = &s_koi[i];
+        k->bx0 = k->x; k->by0 = k->y;
+        koi_step(k, dt);
+        k->bx1 = k->x; k->by1 = k->y;
+        float r = k->L * k->grow * 0.75f + 10.0f;         // 包围盒（含尾鳍摆动余量）
+        dirty_add_ext((int)(k->bx0 - r), (int)(k->by0 - r), (int)(k->bx0 + r), (int)(k->by0 + r));
+        dirty_add_ext((int)(k->bx1 - r), (int)(k->by1 - r), (int)(k->bx1 + r), (int)(k->by1 + r));
+    }
+
+    for (int i = s_npel - 1; i >= 0; i--) {               // 饲料下落 / 雨点落水
+        pel_t *pe = &s_pel[i];
+        if (pe->delay > 0) { pe->delay -= dt; continue; }
+        float px0 = pe->x, py0 = pe->y;
+        pe->t += dt / pe->dur;
+        if (pe->t >= 1.0f) {
+            if (pe->food) {
+                if (s_nfood < MAX_FOOD) {
+                    s_food_x[s_nfood] = pe->tx; s_food_y[s_nfood] = pe->ty; s_nfood++;
+                }
+            } else if (splash_ok(1, pe->tx, pe->ty, 6)) {
+                ripple_add(pe->tx, pe->ty, 1, rnd_f(7, 14), rnd_f(0.5f, 0.75f), 0.70f, 1, 1, 0);
+            }
+            dirty_add_ext((int)px0 - 3, (int)py0 - 3, (int)px0 + 4, (int)py0 + 4);
+            s_pel[i] = s_pel[--s_npel];
+        } else {
+            /* ★ 飞行途中也要标脏：不然旧位置的几粒饲料不会被重画，拖出一条"影子"。
+               这一条原来是被鱼那个大方框**掩盖**着的（饲料的落点就在鱼附近，
+               而鱼框有 60 多像素见方，顺手把饲料扫了进去）—— 属于"靠画多了掩盖漏标"，
+               和铁律第 15 条里"脏区框错了却被过大的重绘面积盖住"是同一类坑。 */
+            float ex0 = pe->x, ey0 = pe->y;
+            float e = pe->t * pe->t;
+            pe->x = pe->sx + (pe->tx - pe->sx) * e;
+            pe->y = pe->sy + (pe->ty - pe->sy) * e;
+            dirty_add_ext((int)floorf(ex0) - 3, (int)floorf(ey0) - 3,
+                          (int)ceilf(pe->x) + 3, (int)ceilf(pe->y) + 3);
+        }
+    }
+
+    for (int i = s_nrip - 1; i >= 0; i--) {
+        rip_t *rp = &s_rip[i];
+        rp->age += dt;
+        float rr = rp->rMax + 8.0f;
+        dirty_add_ext((int)(rp->x - rr), (int)(rp->y - rr), (int)(rp->x + rr), (int)(rp->y + rr));
+        if (rp->age >= rp->life) s_rip[i] = s_rip[--s_nrip];
+    }
+    /* 荷叶（含伴生浮萍）也要标脏：它们一边上下呼吸一边缓慢自转，每帧都在变。
+       ★ 浮萍**不单独报脏区** —— 它长在叶缘 WEED_PAD 之内，落进这一个框里。 */
+    for (int i = 0; i < s_nlily; i++) {
+        const lily_t *L = &s_lily[i];
+        float ly = L->y + lily_bob(L);
+        float ex = L->r + WEED_PAD;
+        dirty_add_ext((int)floorf(L->x - ex), (int)floorf(ly - ex),
+                      (int)ceilf(L->x + ex), (int)ceilf(ly + ex));
+    }
+    for (int i = 0; i < s_nfood; i++)
+        dirty_add_ext((int)s_food_x[i] - 3, (int)s_food_y[i] - 3,
+                      (int)s_food_x[i] + 4, (int)s_food_y[i] + 4);
+}
+
+/* ==========================================================================
+   13. 绘制
+   ========================================================================== */
+static int rect_hits(int x0, int y0, int x1, int y1, float bx0, float by0, float bx1, float by1)
+{
+    return !(bx0 > (float)x1 || bx1 < (float)x0 || by0 > (float)y1 || by1 < (float)y0);
+}
+
+static void scene_draw(int x0, int y0, int x1, int y1)
+{
+    set_clip(x0, y0, x1, y1);
+    water_rect(x0, y0, x1, y1);
+    bands_draw();
+    for (int i = 0; i < s_nkoi; i++) {
+        const koi_t *k = &s_koi[i];
+        float r = k->L * k->grow * 0.75f + 10.0f;
+        float bx = k->x < k->bx0 ? k->x : k->bx0;
+        float by = k->y < k->by0 ? k->y : k->by0;
+        float ex = k->x > k->bx0 ? k->x : k->bx0;
+        float ey = k->y > k->by0 ? k->y : k->by0;
+        if (!rect_hits(x0, y0, x1, y1, bx - r, by - r, ex + r, ey + r)) continue;
+        koi_draw(k);
+    }
+    for (int i = 0; i < s_nrip; i++) {
+        float rr = s_rip[i].rMax + 8.0f;
+        if (!rect_hits(x0, y0, x1, y1, s_rip[i].x - rr, s_rip[i].y - rr,
+                       s_rip[i].x + rr, s_rip[i].y + rr)) continue;
+        ripple_draw(&s_rip[i]);
+    }
+    /* 荷叶与浮萍排在涟漪之后、饲料之前（与网页版层序一致）：
+       它们浮在水面上，压在涟漪之上；饲料最后撒，压在荷叶之上。
+       浮萍先画、荷叶后画 —— 两者都浮在水面，荷叶更大更"高"，压着浮萍。 */
+    for (int i = 0; i < s_nlily; i++) {
+        const lily_t *L = &s_lily[i];
+        float ly = L->y + lily_bob(L);
+        float ex = L->r + WEED_PAD;
+        if (!rect_hits(x0, y0, x1, y1, L->x - ex, ly - ex, L->x + ex, ly + ex)) continue;
+        float dy = ly - L->y;
+        for (int k = L->ws0; k < L->ws0 + L->wsn; k++) weed_paint(&s_weed[k], dy);
+        lily_paint(L, L->rot + s_time * L->spin);
+    }
+    pellets_draw();
+}
+
+static void render(void)
+{
+    if (s_full) {
+        scene_draw(0, 0, KW - 1, KH - 1);
+        return;
+    }
+    /* 波带条只画「水 + 波带」两层（它本来就整屏宽，画整栈是白费）。
+       对象矩形接着画整栈 —— 于是对象自然压在波带之上，层序不变。
+       波带条里已有的对象会被这一步覆盖重画，而每个动的东西都有自己的矩形在表里，
+       所以不会"擦掉对象"；这一条由主机台架逐像素校（漏一帧就 FAIL）。 */
+    for (int i = 0; i < s_nbrc; i++) {
+        set_clip(0, s_brc[i].y0, KW - 1, s_brc[i].y1);
+        water_rect(0, s_brc[i].y0, KW - 1, s_brc[i].y1);
+        bands_draw();
+    }
+    for (int i = 0; i < s_nrect; i++)
+        scene_draw(s_rc[i].x0, s_rc[i].y0, s_rc[i].x1, s_rc[i].y1);
+}
+
+/* ==========================================================================
+   14. 定时器 / 生命周期
+   ========================================================================== */
+static lv_obj_t   *s_scr;
+static lv_obj_t   *s_canvas;
+static lv_timer_t *s_timer;
+static int64_t     s_t_last, s_sum_us, s_max_us, s_dirty_acc;
+static int         s_frames, s_log_acc;
+
+static void tick_cb(lv_timer_t *t)
+{
+    (void)t;
+    int64_t t0 = esp_timer_get_time();
+
+    build_palette(s_night);
+
+    s_nrect = 0;
+    s_nbrc  = 0;
+    s_full = 0;                 // 由 step() 决定（开机第一帧 / 昼夜过渡期 → 整屏）
+    step(1.0f / (float)FPS);
+    render();
+
+    if (s_full) {
+        lv_obj_invalidate(s_canvas);
+    } else {
+        for (int i = 0; i < s_nbrc; i++) {
+            lv_area_t a;
+            a.x1 = 0; a.y1 = (int32_t)s_brc[i].y0;
+            a.x2 = (int32_t)(KW - 1); a.y2 = (int32_t)s_brc[i].y1;
+            lv_obj_invalidate_area(s_canvas, &a);
+        }
+        for (int i = 0; i < s_nrect; i++) {
+            lv_area_t a;
+            a.x1 = (int32_t)s_rc[i].x0; a.y1 = (int32_t)s_rc[i].y0;
+            a.x2 = (int32_t)s_rc[i].x1; a.y2 = (int32_t)s_rc[i].y1;
+            lv_obj_invalidate_area(s_canvas, &a);
+        }
+    }
+
+    int64_t us = esp_timer_get_time() - t0;
+    int64_t dpx = 0;
+    if (s_full) dpx = (int64_t)NPX;
+    else {
+        for (int i = 0; i < s_nbrc; i++)
+            dpx += (int64_t)KW * (int64_t)(s_brc[i].y1 - s_brc[i].y0 + 1);
+        for (int i = 0; i < s_nrect; i++)
+            dpx += (int64_t)(s_rc[i].x1 - s_rc[i].x0 + 1) * (s_rc[i].y1 - s_rc[i].y0 + 1);
+    }
+
+    s_frames++; s_sum_us += us; s_dirty_acc += dpx;
+    if (us > s_max_us) s_max_us = us;
+    if (++s_log_acc >= FPS * 2) {
+        int64_t now = esp_timer_get_time();
+        ESP_LOGI(TAG, "%s 渲染 avg=%.2fms max=%.2fms 脏区=%.1f%% rect=%d+%d 鱼=%d 料=%d 食=%d 波=%d 帧=%lld",
+                 s_night > 0.5f ? "夜" : "昼",
+                 (double)s_sum_us / 1000.0 / (double)s_log_acc,
+                 (double)s_max_us / 1000.0,
+                 100.0 * (double)s_dirty_acc / ((double)s_log_acc * (double)NPX),
+                 s_nrect, s_nbrc, s_nkoi, s_npel, s_nfood, s_nrip,
+                 (long long)(s_frames * 1000000 / (now - s_t_last + 1)));
+        s_log_acc = 0; s_sum_us = 0; s_max_us = 0; s_dirty_acc = 0;
+        s_frames = 0; s_t_last = now;
+    }
+}
+
+void demo_koi_enter(void)
+{
+    s_scr = lv_obj_create(NULL);
+    lv_obj_remove_flag(s_scr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(s_scr, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_scr, 0, 0);
+    lv_obj_set_style_pad_all(s_scr, 0, 0);
+
+    s_canvas = lv_canvas_create(s_scr);
+    lv_canvas_set_buffer(s_canvas, s_fb, KW, KH, LV_COLOR_FORMAT_NATIVE);
+    lv_obj_set_pos(s_canvas, 0, 0);
+    lv_screen_load(s_scr);
+
+    sin_init();
+    expand_init();
+    dx2_init();
+    s_pal_night = -1;
+    build_palette(0.0f);
+    pond_init();
+    s_nrip = 0; s_npel = 0; s_nfood = 0;
+    s_time = 0; s_shakeT = 0;
+    s_night = 0; s_nightTarget = 0;
+    s_satiety = 0.5f;
+    s_nrect = 0; s_full = 1; s_first_frame = 1;
+    s_frames = 0; s_log_acc = 0; s_sum_us = 0; s_max_us = 0; s_dirty_acc = 0;
+    s_t_last = esp_timer_get_time();
+
+    ESP_LOGI(TAG, "锦鲤池进入：画布 %dx%d RGB565 = %u B，目标 %d fps，鱼 %d 条",
+             KW, KH, (unsigned)sizeof(s_fb), FPS, s_nkoi);
+
+    s_timer = lv_timer_create(tick_cb, 1000 / FPS, NULL);
+}
+
+void demo_koi_exit(void)
+{
+    if (s_timer) { lv_timer_delete(s_timer); s_timer = NULL; }
+    if (s_scr) { lv_obj_delete(s_scr); s_scr = NULL; s_canvas = NULL; }
+}
+
+void demo_koi_key(bsp_btn_t btn, bsp_btn_ev_t ev)
+{
+    if (ev != BSP_BTN_CLICK) return;
+    if (btn == BSP_BTN_UP)        do_feed();
+    else if (btn == BSP_BTN_DOWN) do_tap();
+    else if (btn == BSP_BTN_OK)   s_nightTarget = (s_nightTarget > 0.5f) ? 0.0f : 1.0f;
+}
