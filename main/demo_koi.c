@@ -1709,10 +1709,12 @@ static const float KAMP[KSEG]  = {0.045f, 0.197f, 0.392f, 0.618f, 0.867f};
 #define KPHASE   0.92f
 static const float KDEPTH[KSEG + 1] = {0.46f, 0.88f, 1.00f, 0.80f, 0.56f, 0.30f};
 /* ★ 第 38 轮：王总「把初始鱼的大小做成现在的 3 倍」→ 2.0 → 6.0。
+   ★ 第 39 轮：王总「把鱼做成现在的大小的一半」→ 6.0 → 3.0
+   （= 原基线 2.0 的 1.5 倍，开局体长 17~23 × 3.0 = 51~69px）。
    倍率**必须同时**作用在体长 / 游速 vT / 吃食 / 同类避让 / 边界硬边距 ——
    统一从 kh = L*grow*0.55 推（第 15 轮定下的规矩），所以这里改一个数就够，
-   下面每处 `* KOI_SCALE` 与每个从 kh 推的量都会跟着 ×3。 */
-#define KOI_SCALE       6.0f
+   下面每处 `* KOI_SCALE` 与每个从 kh 推的量都会跟着变。 */
+#define KOI_SCALE       3.0f
 #define GROW_MAX        1.35f
 #define GROW_PER_PELLET 0.018f
 /* ★ 报脏外扩量（第 34 轮）。它要盖住"形状本身的变化"，而不仅仅是位移：
