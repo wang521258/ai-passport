@@ -19,6 +19,7 @@
 static const char *TAG = "main";
 
 static const demo_entry_t DEMOS[] = {
+    { "Pixel Pet", demo_pixel_pet_enter, demo_pixel_pet_exit, demo_pixel_pet_key },
     { "Display", demo_display_enter, demo_display_exit, demo_display_key },
     { "Button",  demo_button_enter,  demo_button_exit,  demo_button_key  },
     { "Audio",   demo_audio_enter,   demo_audio_exit,   demo_audio_key   },
@@ -26,7 +27,7 @@ static const demo_entry_t DEMOS[] = {
     { "Wi-Fi",   demo_wifi_enter,    demo_wifi_exit,    demo_wifi_key    },
     { "BLE",     demo_ble_enter,     demo_ble_exit,     demo_ble_key     },
     { "Low Power", demo_low_power_enter, demo_low_power_exit, demo_low_power_key },
-    { "Pet",       demo_pet_enter,       demo_pet_exit,       demo_pet_key       },
+    { "Koi Pond",  demo_koi_enter,       demo_koi_exit,       demo_koi_key       },
 };
 #define DEMO_COUNT (sizeof(DEMOS) / sizeof(DEMOS[0]))
 
@@ -37,7 +38,7 @@ static lv_obj_t *s_menu_scr;
 static lv_obj_t *s_cards[DEMO_COUNT];
 static lv_obj_t *s_rows[DEMO_COUNT];
 static lv_obj_t *s_mascot;
-static int  s_sel;                 // 当前选中项
+static int  s_sel = (int)(sizeof(DEMOS) / sizeof(DEMOS[0])) - 1;  // 默认停在 Koi Pond
 static int  s_active = -1;         // 当前所在演示页;-1 = 在菜单
 
 static void menu_refresh(void) {
@@ -54,10 +55,21 @@ static void menu_refresh(void) {
 static void menu_build(void) {
     s_menu_scr = ui_pixel_screen_create("FoloToy");
 
+    // 卡片排布:标题牌下沿 y=41、吉祥物占 y=242..290,可用区实为 48..234。
+    // 行数随条目数自动算(现在 9 条 = 5 行),并同步收窄行距与卡高,避免压到吉祥物。
+    const int rows   = (int)((DEMO_COUNT + 1) / 2);
+    int pitch = (234 - 48) / rows;          // 9 条 → 37;8 条 → 46
+    if (pitch > 47) pitch = 47;             // 条目少时保持原来的疏朗间距
+    const int card_h = (pitch - 6 > 40) ? 40 : pitch - 6;
+
     for (size_t i = 0; i < DEMO_COUNT; i++) {
         int x = 11 + (int)(i % 2) * 112;
-        int y = 52 + (int)(i / 2) * 47;
-        s_cards[i] = ui_pixel_panel_create(s_menu_scr, x, y, 102, 40, UI_PAPER);
+        int y = 48 + (int)(i / 2) * pitch;
+        s_cards[i] = ui_pixel_panel_create(s_menu_scr, x, y, 102, card_h, UI_PAPER);
+        if (card_h < 36) {   // 5 行时卡变矮,描边/内边距同步收,免得文字被挤出框
+            lv_obj_set_style_border_width(s_cards[i], 3, 0);
+            lv_obj_set_style_pad_all(s_cards[i], 2, 0);
+        }
         s_rows[i] = lv_label_create(s_cards[i]);
         lv_obj_set_style_text_font(s_rows[i], &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_align(s_rows[i], LV_TEXT_ALIGN_CENTER, 0);
@@ -125,14 +137,15 @@ void app_main(void) {
     bsp_display_backlight(100);
 
     // 其余外设单项失败不阻塞:菜单里标 [FAIL],其他项照常可测。
-    s_ok[0] = true;                                   // Display 已确认可用
-    s_ok[1] = (bsp_button_init(on_key, NULL) == ESP_OK);
-    s_ok[2] = (bsp_audio_init() == ESP_OK);
-    s_ok[3] = (bsp_battery_init() == ESP_OK);
-    s_ok[4] = true;                                    // 页面内按需初始化并显示错误
-    s_ok[5] = true;
+    s_ok[0] = true;                                   // Pixel Pet 只用屏+按键,均已初始化
+    s_ok[1] = true;                                   // Display 已确认可用
+    s_ok[2] = (bsp_button_init(on_key, NULL) == ESP_OK);
+    s_ok[3] = (bsp_audio_init() == ESP_OK);
+    s_ok[4] = (bsp_battery_init() == ESP_OK);
+    s_ok[5] = true;                                    // 页面内按需初始化并显示错误
     s_ok[6] = true;
-    s_ok[7] = true;                                    /* Pet：纯软件 demo */
+    s_ok[7] = true;
+    s_ok[8] = true;                                    // Koi Pond 只用屏+按键;按键失败也能看鱼游
 
     if (bsp_lvgl_lock(1000)) { enter_menu(); bsp_lvgl_unlock(); }
 
