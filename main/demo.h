@@ -12,6 +12,9 @@ typedef struct {
 } demo_entry_t;
 
 // 各演示页(定义在各自的 .c 里)
+void demo_pixel_pet_enter(void); void demo_pixel_pet_exit(void);
+void demo_pixel_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev);
+
 void demo_display_enter(void); void demo_display_exit(void);
 void demo_display_key(bsp_btn_t btn, bsp_btn_ev_t ev);
 
@@ -33,5 +36,6 @@ void demo_ble_key(bsp_btn_t btn, bsp_btn_ev_t ev);
 void demo_low_power_enter(void); void demo_low_power_exit(void);
 void demo_low_power_key(bsp_btn_t btn, bsp_btn_ev_t ev);
 
-void demo_pet_enter(void); void demo_pet_exit(void);
-void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev);
+// 锦鲤池:全屏自绘(不用 LVGL 控件),240x320 ST7789 竖屏。
+void demo_koi_enter(void);     void demo_koi_exit(void);
+void demo_koi_key(bsp_btn_t btn, bsp_btn_ev_t ev);
