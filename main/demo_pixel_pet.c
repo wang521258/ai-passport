@@ -10,9 +10,25 @@
 // 生成器: D:/workbuddy2/esp32_pixel_pet/_bake_real.py（输入 work/pet_full/*.png）
 #include "demo.h"
 #include "bsp_display.h"
+#include "bsp_pins.h"      // BSP_LCD_W/H（PET_X 要用）
 #include "ui_pixel.h"
 #include "pet_real.h"
 #include "lvgl.h"
+
+// LV_COLOR_DEPTH=16 → lv_color_t 就是 5/6/5 位域结构，**没有 .full 成员**
+//（那是别的库的写法）。这里给两个小工具，把 RGB565 的裸值和 lv_color_t 互相转换。
+static inline lv_color_t pet_rgb565(uint16_t v)
+{
+    lv_color_t c;
+    c.red   = (uint16_t)((v >> 11) & 0x1F);
+    c.green = (uint16_t)((v >> 5) & 0x3F);
+    c.blue  = (uint16_t)(v & 0x1F);
+    return c;
+}
+static inline int pet_is_same(lv_color_t a, lv_color_t b)
+{
+    return a.red == b.red && a.green == b.green && a.blue == b.blue;
+}
 
 #define ANIM_MS      220                              // 动画帧间隔（≈原始抓帧节奏）
 #define CANVAS_PX    PET_REAL_SIZE                    // 144
@@ -64,8 +80,7 @@ static void draw_frame(uint16_t fi) {
         uint16_t v = *p++;
         int n = v >> 1;
         if (v & 1) {                                  // 实色 run（RGB565 直通）
-            lv_color_t c;
-            c.full = v;
+            lv_color_t c = pet_rgb565(v);
             for (int i = 0; i < n; i++) o[i] = c;
         } else {                                      // 透明 run
             for (int i = 0; i < n; i++) o[i] = bg;
@@ -80,7 +95,7 @@ static void draw_frame(uint16_t fi) {
         for (int dx = -36; dx <= 36; dx++) {
             if (dx * dx * 49 + dy * dy * 1296 <= 36 * 36 * 49) {
                 lv_color_t *q = buf + (cy + dy) * CANVAS_PX + (cx + dx);
-                if (q[0].full == bg.full) q[0] = sh;   // 只画在背景上,不盖宠物
+                if (pet_is_same(q[0], bg)) q[0] = sh;   // 只画在背景上,不盖宠物
             }
         }
     }

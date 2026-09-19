@@ -38,14 +38,23 @@ CONFIG_LV_MEM_SIZE_KILOBYTES=24
 # --- 系统 ---
 CONFIG_FREERTOS_HZ=1000
 
+# --- 按键（iot_button / espressif__button）---
+# ★ 第 37 轮：王总要求「长按 OK 键 = 重置回首页」。
+#   代码侧这条路一直都在（main/demo_koi.c 的 `OK && BSP_BTN_LONG` → reset_to_home），
+#   但组件默认的 CONFIG_BUTTON_LONG_PRESS_TIME_MS = 1500ms（合法范围 500~5000），
+#   而**按住 1 秒松手会走成"单击"** —— 池内单击恰好是"昼夜切换"。
+#   于是体感就是"长按 OK 没重置，反而切了白天黑夜"。
+#   这里压到 800ms：留得住"长按"与"单击"的区分度，又不用死等 1.5 秒。
+#   ⚠️ 只有 OK 的长按被处理（↑↓ 长按目前无动作），所以调这一个值不影响别的键。
+CONFIG_BUTTON_LONG_PRESS_TIME_MS=800
+
 # --- Bluetooth LE / NimBLE ---
-# ESP32-C3 仅支持 BLE；示例只启用单连接 peripheral 所需的最小 host 配置。
-CONFIG_BT_ENABLED=y
-CONFIG_BT_NIMBLE_ENABLED=y
-CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
-CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
-CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
-CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
-CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY=n
-CONFIG_BT_NIMBLE_NVS_PERSIST=n
+# ★ 本分支(koi-firmware)整体关闭无线栈，理由见 main/main.c 顶部：
+#   ESP32-C3 无 PSRAM，DRAM 只有 ~320KB，而锦鲤池要一块 240x320 RGB565
+#   全屏帧缓冲 = 153,600 B。开着无线栈直接链接失败（实测溢出 146,800 B）。
+#   光是把 wifi/ble 的 demo 从 main.c 里摘掉还不够 —— ESP-IDF 的
+#   .esp_system_init_fn 段是 KEEP 的，会把注册了系统初始化的归档成员一并拉进来，
+#   所以这里必须从 Kconfig 层面彻底关掉，链接结果才可预期。
+#   要恢复上游 AI Passport 功能：把 CONFIG_BT_ENABLED 改回 y，
+#   并把原厂 8MB 整片备份刷回去。
+CONFIG_BT_ENABLED=n
