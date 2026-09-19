@@ -1708,7 +1708,11 @@ static const float KBEND[KSEG] = {0.14f, 0.24f, 0.23f, 0.21f, 0.18f};
 static const float KAMP[KSEG]  = {0.045f, 0.197f, 0.392f, 0.618f, 0.867f};
 #define KPHASE   0.92f
 static const float KDEPTH[KSEG + 1] = {0.46f, 0.88f, 1.00f, 0.80f, 0.56f, 0.30f};
-#define KOI_SCALE       2.0f
+/* ★ 第 38 轮：王总「把初始鱼的大小做成现在的 3 倍」→ 2.0 → 6.0。
+   倍率**必须同时**作用在体长 / 游速 vT / 吃食 / 同类避让 / 边界硬边距 ——
+   统一从 kh = L*grow*0.55 推（第 15 轮定下的规矩），所以这里改一个数就够，
+   下面每处 `* KOI_SCALE` 与每个从 kh 推的量都会跟着 ×3。 */
+#define KOI_SCALE       6.0f
 #define GROW_MAX        1.35f
 #define GROW_PER_PELLET 0.018f
 /* ★ 报脏外扩量（第 34 轮）。它要盖住"形状本身的变化"，而不仅仅是位移：
@@ -2428,8 +2432,15 @@ static void koi_step(koi_t *k, float dt)
             k->wanderT = rnd_f(3.4f, 6.4f);
             for (int tr = 0; tr < 8; tr++) {
                 float wa = rnd_f(0, 6.2832f), wr = sqrtf(rnd_f(0.10f, 1.0f));
-                k->wx = (float)KW * 0.5f + fcos_t(wa) * ((float)KW * 0.5f - 44.0f - kh) * wr;
-                k->wy = (float)KH * 0.5f + fsin_t(wa) * ((float)KH * 0.5f - 54.0f - kh) * wr;
+                /* ★ 第 38 轮：体量 ×3 后 kh 最大 ≈103px，KW/2−44−kh 会变**负**
+                   → 目标点被甩到中心对面、鱼来回抽搐。加下限即可：
+                   kh 小的时候（开局）这里读数和改动前**逐位相同**，只有大 kh 才起作用。 */
+                float rwx = (float)KW * 0.5f - 44.0f - kh;
+                float rwy = (float)KH * 0.5f - 54.0f - kh;
+                if (rwx < 4.0f) rwx = 4.0f;
+                if (rwy < 4.0f) rwy = 4.0f;
+                k->wx = (float)KW * 0.5f + fcos_t(wa) * rwx * wr;
+                k->wy = (float)KH * 0.5f + fsin_t(wa) * rwy * wr;
                 if (hypotf(k->wx - k->x, k->wy - k->y) >= 48.0f &&
                     fabsf(angdiff(atan2f(k->wy - k->y, k->wx - k->x), k->headA)) <= 1.92f) break;
             }
@@ -2450,6 +2461,10 @@ static void koi_step(koi_t *k, float dt)
     }
 
     float m2 = 26.0f + kh;                                // 边界回避带（随体量缩放）
+    /* ★ 第 38 轮：体量 ×3 后 m2 会超过半屏宽，左右两侧推力方向打架 → 鱼原地抖。
+       钳到 0.40*KW（=96）以内，与下面 clamp 的可达区间一致。
+       kh 小的时候（开局）m2 远小于这个上限，**读数与改动前逐位相同**。 */
+    if (m2 > (float)KW * 0.40f) m2 = (float)KW * 0.40f;
     if (k->x < m2)              vx += (m2 - k->x) / m2 * 3.2f;
     if (k->x > KW - m2)         vx -= (k->x - (KW - m2)) / m2 * 3.2f;
     if (k->y < m2 + 6.0f)       vy += (m2 + 6.0f - k->y) / m2 * 3.2f;
