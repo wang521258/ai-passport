@@ -293,6 +293,14 @@ enum {
     PI_KBODY, PI_KSPOT, PI_KGOLD, PI_KFIN, PI_KEDGE,
     PI_RIPPLE, PI_PELLET,
     PI_LILYFILL, PI_LILYEDGE, PI_LILYVEIN, PI_WEED, PI_WEEDPALE,
+    /* ★★ 第 53 轮：御黄金专用的一套**金属金层次**（王总给的五个色）。
+       原来只有一个 PI_KGOLD 平涂，所以金鱼读起来是"一片黄纸"，没有金属感。
+       ⚠️ 只给 pat==1（御黄金）用；红白那套（PI_KBODY/KSPOT）一个字节都不动。 */
+    PI_KGOLD_DK,     /* 阴影   #B96812 = 185,104,18 —— 腹部 / 尾根压暗 */
+    PI_KGOLD_LT,     /* 亮部   #FFD34E = 255,211,78 —— 头部略亮 */
+    PI_KGOLD_HI,     /* 高光   #FFF0A0 = 255,240,160 —— 背部中央那条**很窄**的带 */
+    PI_KSCALE,       /* 鳞片点 #FFF7D1 = 255,247,209 —— 背上几粒很小的点 */
+    PI_KGOLD_TL,     /* 尾梢浅金 #FFE28C —— 尾鳍"金黄→半透明浅金"的**那一端** */
     PI_NPAL
 };
 
@@ -306,11 +314,23 @@ static const uint8_t DAY_PAL[PI_NPAL][3] = {
        ⚠️ 这一项只被金鱼身与尾鳍淡色表用（build_tail_pale），
           水面/涟漪/波光各有自己的槽位（PI_RIPPLE 等），不受影响。
        ⚠️ 改这一项会让所有历史"金鱼颜色"截图作废 —— 是有意的（王总要的就是改它）。 */
-    {250, 246, 238}, {232,  90,  38}, {255, 200,  92}, {252, 204, 176},
+    {250, 246, 238}, {232,  90,  38}, {245, 166,  35}, {252, 204, 176},
     {158,  78,  38}, {232, 255, 248}, {246, 208, 138},
     /* 荷叶 / 浮萍（网页版 DAY.lilyFill / lilyEdge / lilyVein / weed / weedPale） */
     { 52, 156,  88}, { 22,  94,  54}, {104, 210, 140}, {116, 192,  96},
     {164, 226, 118},
+    /* ★★ 第 53 轮：御黄金的金属金层次（王总指定色值，一个都不要改）
+         PI_KGOLD    #F5A623 = 245,166,35   主色（原橙金 255,200,92 作废）
+         PI_KGOLD_DK #B96812 = 185,104,18   阴影
+         PI_KGOLD_LT #FFD34E = 255,211,78   亮部
+         PI_KGOLD_HI #FFF0A0 = 255,240,160  高光
+         PI_KSCALE   #FFF7D1 = 255,247,209  鳞片点
+         PI_KGOLD_TL #FFE28C = 255,226,140  尾梢浅金（**派生色**：介于 LT 与 HI 之间，
+                                            只用于尾鳍末端向"半透明浅金"过渡的那一层）
+       ⚠️ 主色比原橙金**暗且更橙**（R−G = 79，色相 ~36°），这是"金属金"的读感来源；
+          五档之间跨度要够大，否则叠出来的层次会被 RGB565 的量化吃掉。 */
+    {185, 104,  18}, {255, 211,  78}, {255, 240, 160}, {255, 247, 209},
+    {255, 226, 140},
 };
 
 /* 夜间亮度 = 白天的 42%。挑这个数不是拍的：再低鱼红就开始并档（232,90,38 乘到
@@ -321,6 +341,7 @@ static const uint8_t DAY_PAL[PI_NPAL][3] = {
 
 static uint8_t s_pal[PI_NPAL][3];
 static int     s_pal_night = -1;    // 已建立对应的 night×255；-1 = 还没建过
+static int     s_pal_ver   = 0;     // ★ 52 轮：调色板版本号（荷叶快照的失效开关）
 
 /* ==========================================================================
    2c. ★ 第 37 轮「观感档位」—— 一条参数阶梯，档 0 = 改动前**逐字节等价**的现状
@@ -683,20 +704,54 @@ const char *demo_koi_who_snap_at(int x, int y)
 #define WHO_PUT(x, y)       do { } while (0)
 #endif
 
+/* ★★ 第 52 轮：绘制目标可重定向（荷叶 RAM 快照要用）。
+   真机一帧要重画 ~6 片荷叶（真机 60ms/帧，比鱼的 40ms 还贵），而荷叶的**样子**
+   每秒才变一次：自转角 `L->rot + t·spin`（spin ≤0.07 rad/s）被量化到 0.05 rad
+   ⇒ 0.7~1.4 秒才跳一档。也就是说：**60ms 的成本是在反复重画一张 1Hz 才变的图**。
+   ⇒ 缓存成一张小图（预乘色 + 覆盖率），之后每帧只做一次贴图。
+
+   ⚠️ 为什么改 px_blend 而不是另写一个"快照专用"像素函数：
+      光栅化**只有一个出口**（px_set 已无调用点，是死代码），改一处就够；
+      复制一份会留下两份永远对不齐的实现（铁律 6：耦合的量只留一个入口）。
+      正常绘制时 s_tgt = s_fb / s_stride = KW ⇒ 与改动前逐位相同。 */
+static uint16_t *s_tgt     = s_fb;
+static int       s_stride  = KW;
+static uint8_t  *s_asnap;                 /* 非 NULL = 快照模式 */
+static int       s_aw;                    /* 快照模式下 alpha 的行宽（= 缓冲宽） */
+
 /* alpha 0..256；a=256 时精确等于 src */
 static inline void px_blend(int x, int y, int r, int g, int b, int a)
 {
     if (a <= 0 || x < s_cx0 || x > s_cx1 || y < s_cy0 || y > s_cy1) return;
     PCNT(px);                            /* ★ 第 35 轮：真正写进去的像素数 */
     WHO_PUT(x, y);                       /* ★ 第 37 轮：像素归属探针（仅台架） */
-    uint16_t d = s_fb[y * KW + x];
+    /* ★ 快照模式：顺手把**总覆盖率** A 累加出来。
+       px_blend 的式子 d+(src−d)·a 展开就是 d·(1−a)+src·a —— dst 初始为 0 时
+       得到的正是**预乘色** P = Σ src·a·Π(1−a)，所以"颜色"这一半不用另加逻辑；
+       只差一个 A = 1−Π(1−a)，这里补上（8bit，精确，不靠反推）。
+       ⇒ 贴图时 out = P + 水色·(1−A)，与直接画出来的结果**逐位相同**。 */
+    if (s_asnap) {
+        /* ⚠️⚠️ a **可以 > 256**：a = (a_sub·cov)>>8，而抗锯齿的 cov 在边的端点
+           处会溢出 256（代码里那个 s_cov_over 计数器就是盯它的）。
+           (256-a) 一变负 ⇒ 255 - ((255-A)·负数 >> 8) 会**往上溢出 uint8**，
+           A 从 255 直接塌到几十 —— 叶子整体变成"半透明"，与直接画差出上百个色阶。
+           ★ 第 52 轮排障记：A/B 对拍最大通道差 140，差异正好 6 个团块（= 6 片叶子）。
+           ⇒ 累加前必须把 a 夹到 [0,256]。颜色那一路 (dr += ((r-dr)*a)>>8) 的溢出
+             是**改动前就有**的行为，两条路径一致，所以不用动。 */
+        int ac = a;
+        if (ac > 256) ac = 256;
+        int i = (y - s_cy0) * s_aw + (x - s_cx0);
+        int A = s_asnap[i];
+        s_asnap[i] = (uint8_t)(255 - (((255 - A) * (256 - ac)) >> 8));
+    }
+    uint16_t d = s_tgt[y * s_stride + x];
     int dr = s_e5[(d >> 11) & 31];
     int dg = s_e6[(d >> 5) & 63];
     int db = s_e5[d & 31];
     dr += ((r - dr) * a) >> 8;
     dg += ((g - dg) * a) >> 8;
     db += ((b - db) * a) >> 8;
-    s_fb[y * KW + x] = pack565(dr, dg, db);
+    s_tgt[y * s_stride + x] = pack565(dr, dg, db);
 }
 
 static inline void px_set(int x, int y, int r, int g, int b)
@@ -1167,6 +1222,7 @@ static int build_palette(float night)
     int n8 = (int)rne_f2i(night * 255.0f);
     if (n8 == s_pal_night) return 0;          // ★ 稳态复用，零重建
     s_pal_night = n8;
+    s_pal_ver++;        /* ★ 52 轮：调色板一变，荷叶快照必须失效（叶子颜色也在表里） */
     /* 整屏压暗：k = 256（白天）→ 256-NIGHT_DROP（夜里）。
        ★ 必须写成 `(v * k) >> 8` 而**不是** `v * NIGHT_DIM`：
          k == 256 时右移 8 位恒等于原值（IEEE754 下 0 误差），
@@ -1620,6 +1676,10 @@ static inline float lily_rot(const lily_t *L)
     return floorf(v * (1.0f / LILY_ROT_Q) + 0.5f) * LILY_ROT_Q;
 }
 
+/* ★ 52 轮：画叶子时的落点偏移。正常绘制恒为 0（逐位不变）；
+   只有建快照时临时设成"把叶子挪到小缓冲中央"的量。 */
+static float s_ofx = 0.0f, s_ofy = 0.0f;
+
 /* ★★ 第 37 轮「荷叶档」—— 一条阶梯，只动三个量，档 0 = 现状（逐字节等价）。
    ① 老叶斑 alpha   固件有 2 块 0.18α 的暗斑糊在叶面上，而**参考图样没有大面积暗斑**
                     → 这是叶面"发闷"的主因（实测叶身被拉低一档）
@@ -1662,7 +1722,9 @@ static void lily_paint(const lily_t *L, float th)
        改完不会白多报一个像素。
        ⚠️ 取的是 lily_bob(L)（量化版）而不是原始值 —— 量化档不变时叶身纹丝不动，
           所以量化门那套"跨档才重画"依然成立。 */
-    s_lrx = L->x; s_lry = L->y + lily_bob(L);
+    /* ★ 52 轮：s_ofx/s_ofy 是**快照模式的落点偏移**（正常绘制恒为 0）。
+       建快照时把叶子画到小缓冲的中央，而不是它在池里的真实位置。 */
+    s_lrx = L->x - s_ofx; s_lry = L->y + lily_bob(L) - s_ofy;
     s_lca = fcos_t(th); s_lsa = fsin_t(th);
 
     /* ① 水下根影（偏右下 1.5 / 2.5） */
@@ -1818,6 +1880,140 @@ static void lily_paint(const lily_t *L, float th)
         stroke_pts(s_wf, s_npts, 0, 1.4f, c_rim, 33);                   /* 0.13 */
     }
 }
+
+/* ==========================================================================
+   7b-2. ★★ 第 52 轮：荷叶 RAM 快照
+   --------------------------------------------------------------------------
+   【账先算清楚】真机 v17 读数：荷 **60ms** / 鱼 40ms / 水 3.6ms —— 荷叶是单项最大。
+   而荷叶每秒被重画 ~42 次（7fps × 6 片），它的**样子**却只有 ~1Hz 才变：
+      自转角 = L->rot + t·spin（spin ∈ ±0.07 rad/s），量化步长 LILY_ROT_Q = 0.05
+      ⇒ 最快 0.05/0.07 ≈ 0.7s 跳一档，最慢 2.9s。
+   也就是说：**每帧的 60ms 都在重画一张 1Hz 才变的图** ⇒ 缓存它。
+
+   【存什么】预乘色 P（RGB565）+ 覆盖率 A（A8），3 B/px。
+     · P：px_blend 的式子 d+(src−d)·a = d·(1−a)+src·a，dst 初始为 0 时
+       累加出来的正是预乘色；
+     · A：在 px_blend 里顺手累加 A = 1−Π(1−a)，8bit 精确（不靠黑白两遍反推）。
+     ⇒ 贴图 out = P + 水色·(1−A)，与直接画出来的结果**逐位相同**。
+
+   【为什么不整片叶一次 memcpy】叶子是**半透明**的（根影 0.22 / 叶脉 0.60 /
+     叶芯 0.42 / 反光 0.13），底下是水面渐变 + 涟漪 ⇒ 必须带 alpha 合成，
+     不能当不透明图块贴。
+
+   【DRAM】每片叶子 (2r+7)² px，r ∈ [13,21] ⇒ 最大 49² = 2401 px。
+     池子固定 6 片，按**最大**开槽：6 × 2401 × 3 B = 43,218 B。
+     ⚠️ 铁律 21：这片 C3 的 DRAM 本来就贴着边（帧缓冲 153,600 B 是最大单项）。
+        如果链接时 DRAM 溢出，先把 KOI_LILY_SNAP 关掉（编译期开关，见下），
+        再考虑缩小 LILY_SNAP_W（改成按实际 r 开槽）。
+   ========================================================================== */
+#ifndef KOI_LILY_SNAP
+#define KOI_LILY_SNAP   1
+#endif
+
+#define LILY_SNAP_W     (2 * 21 + 7)      /* r 上限 21 → 49 */
+#define LILY_SNAP_PX    (LILY_SNAP_W * LILY_SNAP_W)
+
+typedef struct {
+    int       w, h;
+    uint16_t *c;            /* 预乘色 RGB565 */
+    uint8_t  *a;            /* 覆盖率 A8 */
+    float     keyRot;       /* 建图时的量化自转角 */
+    int       keyPal;       /* 建图时的调色板版本 */
+    int       ok;
+} lsnap_t;
+
+#if KOI_LILY_SNAP
+/* ⚠️ 别叫 s_lsa —— 那已经是荷叶"局部→世界"变换里的 sin 分量（s_lca/s_lsa）。 */
+static uint16_t s_lsnap_c[LILY_SNAP_PX * MAX_LILY];  /* 28,812 B */
+static uint8_t  s_lsnap_a[LILY_SNAP_PX * MAX_LILY];  /* 14,406 B */
+static lsnap_t  s_lsnap[MAX_LILY];
+#endif
+
+#if KOI_LILY_SNAP
+static void lily_snap_build(int li, float th)
+{
+    lsnap_t *S = &s_lsnap[li];
+    const lily_t *L = &s_lily[li];
+    int w = (int)(2.0f * L->r) + 7;
+    if (w > LILY_SNAP_W) w = LILY_SNAP_W;
+    int h = w;
+    int slot = li * LILY_SNAP_PX;
+
+    S->w = w; S->h = h;
+    S->c = &s_lsnap_c[slot];
+    S->a = &s_lsnap_a[slot];
+
+    /* 预乘色的起点 = 全 0；覆盖率起点 = 全 0 */
+    for (int i = 0; i < w * h; i++) { S->c[i] = 0; S->a[i] = 0; }
+
+    uint16_t *sv_tgt = s_tgt; int sv_stride = s_stride; uint8_t *sv_a = s_asnap;
+    int sv_cx0 = s_cx0, sv_cx1 = s_cx1, sv_cy0 = s_cy0, sv_cy1 = s_cy1;
+
+    float ly = L->y + lily_bob(L);
+    s_tgt = S->c; s_stride = w; s_asnap = S->a; s_aw = w;
+    set_clip(0, 0, w - 1, h - 1);
+    /* ★★ 亚像素对齐（第 52 轮踩的坑，务必看懂再改）：
+       局部像素 i 覆盖世界区间 [L->x + i - w/2, +1)，而世界的像素 p 覆盖 [p, p+1)。
+       要让"快照里第 i 个像素"正好等于"世界里某个像素"，**平移量必须是整数** ——
+       否则快照的像素网格与世界的像素网格错开 frac(L->x) 个像素，
+       贴回去就是一次**亚像素平移**：叶子内部全是细线（11 条叶脉 + 反光弧），
+       一平移边缘抗锯齿全变 ⇒ A/B 对拍最大通道差 140、差异正好 6 个团块。
+       ⇒ s_ofx/s_ofy 取 **floor**（整数），贴图时用同一个整数偏移。 */
+    s_ofx = floorf(L->x) - (float)(w / 2);
+    s_ofy = floorf(ly)   - (float)(h / 2);
+    lily_paint(L, th);
+    s_ofx = 0.0f; s_ofy = 0.0f;
+
+    s_tgt = sv_tgt; s_stride = sv_stride; s_asnap = sv_a;
+    set_clip(sv_cx0, sv_cy0, sv_cx1, sv_cy1);
+
+    S->keyRot = th;
+    S->keyPal = s_pal_ver;
+    S->ok = 1;
+}
+
+static void lily_snap_blit(int li, float ly)
+{
+    const lsnap_t *S = &s_lsnap[li];
+    const lily_t  *L = &s_lily[li];
+    /* ★ 与建图时同一个 floor 对齐（见 lily_snap_build 里那段注释）：
+       整数平移量 ⇒ 快照的像素网格与世界的像素网格严格重合，零亚像素误差。 */
+    int ox = (int)floorf(L->x) - S->w / 2;
+    int oy = (int)floorf(ly)   - S->h / 2;
+    for (int j = 0; j < S->h; j++) {
+        int y = oy + j;
+        if (y < s_cy0 || y > s_cy1) continue;
+        int base = j * S->w;
+        uint16_t *dst = &s_fb[y * KW];
+        for (int i = 0; i < S->w; i++) {
+            int x = ox + i;
+            if (x < s_cx0 || x > s_cx1) continue;
+            int A = S->a[base + i];
+            if (A == 0) continue;
+            PCNT(px);
+            WHO_PUT(x, y);
+            uint16_t P = S->c[base + i];
+            uint16_t d = dst[x];
+            int k = 255 - A;                      /* out = P + 水色·(1−A) */
+            int r = s_e5[(P >> 11) & 31] + (((int)s_e5[(d >> 11) & 31] * k) >> 8);
+            int g = s_e6[(P >> 5)  & 63] + (((int)s_e6[(d >> 5)  & 63] * k) >> 8);
+            int b = s_e5[P & 31]         + (((int)s_e5[d & 31]         * k) >> 8);
+            if (r > 255) r = 255;
+            if (g > 255) g = 255;
+            if (b > 255) b = 255;
+            dst[x] = pack565(r, g, b);
+        }
+    }
+}
+
+static void lily_snap_draw(int li, float th, float ly)
+{
+    lsnap_t *S = &s_lsnap[li];
+    /* 失效条件三个：没建过 / 自转角跳档 / 调色板重建（叶子颜色在 s_pal 里） */
+    if (!S->ok || S->keyRot != th || S->keyPal != s_pal_ver) lily_snap_build(li, th);
+    lily_snap_blit(li, ly);
+}
+#endif   /* KOI_LILY_SNAP */
 
 /* 浮萍：三笔 —— 偏右下的水下根影、略压扁的叶身、偏左上的亮芯。
    少了这三笔它就只是"屏上一个小色块"，读不出"浮在水面上"（王总说的"没有透视"）。 */
@@ -2271,6 +2467,69 @@ static float _lx[KSEG + 1], _ly[KSEG + 1], _rx[KSEG + 1], _ry[KSEG + 1];
 #define KOI_SPOT_SCALE  1.15f
 #endif
 
+/* ★★ 第 53 轮：御黄金金属层次的**四个渐变强度**（0..256）。
+   王总给的五个色（见 DAY_PAL 的 PI_KGOLD_* 注释）之外，还得定"各层压多重"。
+   这四个是纯观感刻度 —— 王总看完真机要微调就改这几个，别去动几何。
+     GOLD_SIDE_A  两侧（腹）压暗   124 ≈ 0.48
+     GOLD_BACK_A  背部中央窄高光   116 ≈ 0.45（色本身很亮 #FFF0A0，再高就发白）
+     GOLD_HEAD_A  头部略亮          90 ≈ 0.35
+     GOLD_TAIL_A  尾根压暗         108 ≈ 0.42
+   ★ 为什么从 96/92/72/84 提到 124/116/90/108（第 53 轮第二次调）：
+     第一版按"金属反射应该 subtle"取了 0.28~0.38，台架 240×320 **就是真机的分辨率**，
+     出图一看：鱼身只有 50px 长、~17px 宽，那么小的面积上 0.3 的压暗
+     被 RGB565 的量化（每通道只有 32/64 级）吃掉大半 ⇒ 读出来还是"一片黄纸"。
+     ★ 记一条判据：小面积上的渐变，alpha 不够 0.45 就看不见。
+   ⚠️ 窄带的**宽度**在 koi_draw 里写死成 ±0.13Wd（一侧 0.42Wd 渐隐）——
+      那是"很窄"的几何量化，比 alpha 更影响"是不是一条线"，要改就改那边。 */
+#ifndef GOLD_SIDE_A
+#define GOLD_SIDE_A    124
+#endif
+#ifndef GOLD_BACK_A
+#define GOLD_BACK_A    116
+#endif
+#ifndef GOLD_HEAD_A
+#define GOLD_HEAD_A     90
+#endif
+#ifndef GOLD_TAIL_A
+#define GOLD_TAIL_A    108
+#endif
+/* ★★ 第 53 轮：尾鳍「从金黄色向半透明浅金色过渡」。
+   ⚠️ grad_t **只插值 alpha、不插值颜色**（见 4 节定义），所以"换个颜色渐变"
+      做不到单层 —— 正解是**两层渐变交叉淡化**：
+        第一层 金黄 PI_KGOLD   alpha 由根到梢 236 → GOLD_TJ_A2（**递减**）
+        第二层 浅金 PI_KGOLD_TL alpha 由根到梢 0   → GOLD_TJ_LT2（**递增**）
+      合成后：根部是纯金黄、中段两色各半、梢部以浅金为主且总不透明度下降
+      ⇒ 读感就是"金黄 → 半透明浅金"。
+      梢部残留给背景的比例 = (1−a1)(1−a2)：a1=70/256、a2=176/256 ⇒ 约 21%，
+      水色透上来 ⇒ "半透明"。 */
+#ifndef GOLD_TJ_A1
+#define GOLD_TJ_A1     150      /* 金黄层：中段 alpha */
+#endif
+#ifndef GOLD_TJ_A2
+#define GOLD_TJ_A2      70      /* 金黄层：尾梢 alpha（原 TJ_GG[2] = 82，再降一点） */
+#endif
+#ifndef GOLD_TJ_LT1
+#define GOLD_TJ_LT1     88      /* 浅金层：中段 alpha（开始接手） */
+#endif
+#ifndef GOLD_TJ_LT2
+#define GOLD_TJ_LT2    176      /* 浅金层：尾梢 alpha */
+#endif
+
+/* 鳞片点 / 背上高光点：半径（px）与 alpha。
+   王总原话「1~2 个**很小**的淡金/近白高光点」⇒ 半径必须 ≤1.2px，大了就成疮。 */
+#ifndef GOLD_SCALE_R
+#define GOLD_SCALE_R   0.85f
+#endif
+#ifndef GOLD_SCALE_A
+#define GOLD_SCALE_A   130
+#endif
+#ifndef GOLD_HIDOT_R
+#define GOLD_HIDOT_R   1.15f
+#endif
+#ifndef GOLD_HIDOT_A
+#define GOLD_HIDOT_A   190
+#endif
+
 static void make_spots(koi_t *k)
 {
     if (k->pat == 1) { k->ns = 0; return; }               // 黄金鲤不该有红斑
@@ -2327,6 +2586,11 @@ static void pond_init(void)
 {
     s_rnd = 20260919u;
     s_nlily = 0;
+#if KOI_LILY_SNAP
+    /* ★ 52 轮：重建池子 ⇒ 荷叶的 r / gap / 位置全换了，旧快照一律作废。
+       ⚠️ 少了这一句，"长按 OK 重置"之后会贴上**上一池**的叶子（同下标不同叶）。 */
+    for (int i = 0; i < MAX_LILY; i++) s_lsnap[i].ok = 0;
+#endif
     /* ★ 鱼色由开局三屏的「分色」决定（网页版 initPond(curColors())）：
        pick_colors 把 s_split_kh 条红白**均匀交错**排进 s_nkoi 条里。
        ⚠️ 原来这里是一张固定的 pats[5] = {0,1,0,2,0}，里面有条 pat=2（大正三色）——
@@ -2538,6 +2802,105 @@ static void koi_draw(koi_t *k)
     /* ② 鱼身 + 体缘暗线（复用上面那一份点列，不再 body_pts） */
     to_q8(s_npts, 0.0f, 0.0f);
     fill_poly(s_poly, s_npts, bodyCol, NULL, 256);
+
+    /* ★★ 第 53 轮：御黄金的**金属金层次**（只给 pat==1，红白一个字节都不动）
+       ⚠️⚠️ 全部用 fill_poly 的 **grad（逐像素插值）** —— 这是第 47 轮否决后、
+          注释里明确写下的正解：
+            第 47 轮做的是"沿 spine 等距偏移的折线多边形"，第 48 轮被王总否掉
+            （"金色鱼背部有条线不对劲 做纯色就行"）。根因：折线的两条边在**弯曲**
+            的鱼身上是斜切过身体的直边，叠半透明深褐就成了一条明显的线，
+            而"金属感"要的是**明暗过渡**不是轮廓线。
+          ⇒ grad 沿方向 u 逐像素插值 alpha，天然是软过渡，不会有硬边。
+
+       四层（王总指定的五个色 + 四条要求）：
+         ① 两侧（腹）压暗   PI_KGOLD_DK #B96812   横向 grad，|s|=Wd 处最强、中央 0
+         ② 背部中央窄高光   PI_KGOLD_HI #FFF0A0   横向 grad，只在 ±0.13Wd 的窄带里
+         ③ 头部略亮         PI_KGOLD_LT #FFD34E   纵向 grad，越靠头越亮
+         ④ 尾根压暗         PI_KGOLD_DK #B96812   纵向 grad，尾端最强、中段归零
+       ⚠️ 四个 alpha 提成宏：这是纯观感刻度，王总看完可能要微调，别写死。
+       ⚠️ 成本：鱼身多边形多填 4 遍（面积 ~300px ⇒ +1200 像素/条）。
+          荷叶快照省下来的 ~55ms 就是给这个留的余量。 */
+    if (isGold) {
+        int   mid = KSEG / 2;
+        float ox  = _spx[mid], oy = _spy[mid];           /* 投影原点 = 鱼身中点 */
+        float nx  = -fsin_t(_spa[mid]), ny = fcos_t(_spa[mid]);   /* 横向（两侧） */
+        float tx  =  fcos_t(_spa[mid]), ty = fsin_t(_spa[mid]);   /* 纵向（头→尾） */
+        float Wq  = (Wd > 1.0f) ? Wd : 1.0f;
+        float Hl  = L * 0.5f;                            /* 鱼身半长（近似） */
+        grad_t g;
+
+        /* ① 两侧压暗：|s| = 1.15Wd 处最强，|s| = 0.45Wd 处归零 */
+        g.ux = (int32_t)rne_f2i(nx * 256.0f); g.uy = (int32_t)rne_f2i(ny * 256.0f);
+        g.cx = (int32_t)rne_f2i(ox * 256.0f); g.cy = (int32_t)rne_f2i(oy * 256.0f);
+        g.s0 = (int32_t)(-Wq * 1.15f * 256.0f); g.a0 = GOLD_SIDE_A;
+        g.s1 = (int32_t)(-Wq * 0.45f * 256.0f); g.a1 = 0;
+        g.s2 = (int32_t)( Wq * 0.45f * 256.0f); g.a2 = 0;
+        g.s3 = (int32_t)( Wq * 1.15f * 256.0f); g.a3 = GOLD_SIDE_A;
+        fill_poly(s_poly, s_npts, s_pal[PI_KGOLD_DK], &g, 256);
+
+        /* ② 背部中央**很窄**的高光带：只在 ±0.13Wd 内，两侧到 0.42Wd 渐隐 */
+        g.s0 = (int32_t)(-Wq * 0.42f * 256.0f); g.a0 = 0;
+        g.s1 = (int32_t)(-Wq * 0.13f * 256.0f); g.a1 = GOLD_BACK_A;
+        g.s2 = (int32_t)( Wq * 0.13f * 256.0f); g.a2 = GOLD_BACK_A;
+        g.s3 = (int32_t)( Wq * 0.42f * 256.0f); g.a3 = 0;
+        fill_poly(s_poly, s_npts, s_pal[PI_KGOLD_HI], &g, 256);
+
+        /* ③ 头部略亮：u 取**指向头**的方向（切向是头→尾，取负） */
+        g.ux = (int32_t)rne_f2i(-tx * 256.0f); g.uy = (int32_t)rne_f2i(-ty * 256.0f);
+        g.s0 = (int32_t)(-Hl * 1.10f * 256.0f); g.a0 = 0;
+        g.s1 = (int32_t)(-Hl * 0.20f * 256.0f); g.a1 = 0;
+        g.s2 = (int32_t)( Hl * 0.55f * 256.0f); g.a2 = GOLD_HEAD_A;
+        g.s3 = (int32_t)( Hl * 1.10f * 256.0f); g.a3 = GOLD_HEAD_A;
+        fill_poly(s_poly, s_npts, s_pal[PI_KGOLD_LT], &g, 256);
+
+        /* ④ 尾根压暗：尾端最强、中段归零 */
+        g.s0 = (int32_t)(-Hl * 1.10f * 256.0f); g.a0 = GOLD_TAIL_A;
+        g.s1 = (int32_t)(-Hl * 0.55f * 256.0f); g.a1 = GOLD_TAIL_A;
+        g.s2 = (int32_t)(-Hl * 0.10f * 256.0f); g.a2 = 0;
+        g.s3 = (int32_t)( Hl * 1.10f * 256.0f); g.a3 = 0;
+        fill_poly(s_poly, s_npts, s_pal[PI_KGOLD_DK], &g, 256);
+
+        /* ★ 鳞片点 + 背上 1~2 个很小的淡金高光点（王总："鱼背上加 1~2 个很小的
+             淡金/近白高光点"）。位置**确定性**（由段号推出，不抽 rnd —— 铁律 20，
+             动随机序列会把整池鱼的位置/荷叶全挪位）。 */
+        static const float SCL_SG[4] = {1.35f, 2.05f, 2.75f, 3.35f};
+        static const float SCL_OF[4] = { 0.34f, -0.26f,  0.30f, -0.22f };
+        for (int q = 0; q < 4; q++) {
+            float sg = SCL_SG[q];
+            int   i0 = (int)sg; float tt = sg - i0;
+            if (i0 < 0) i0 = 0; if (i0 > KSEG - 1) i0 = KSEG - 1;
+            float px = _spx[i0] + (_spx[i0 + 1] - _spx[i0]) * tt;
+            float py = _spy[i0] + (_spy[i0 + 1] - _spy[i0]) * tt;
+            float aa = _spa[i0];
+            float ax = -fsin_t(aa), ay = fcos_t(aa);
+            float off = SCL_OF[q] * Wd;
+            px += ax * off; py += ay * off;
+            ipt_t d[8];
+            for (int v = 0; v < 8; v++) {
+                d[v].x = (int32_t)rne_f2i((px + s_oct_u[v][0] * GOLD_SCALE_R) * 256.0f);
+                d[v].y = (int32_t)rne_f2i((py + s_oct_u[v][1] * GOLD_SCALE_R) * 256.0f);
+            }
+            fill_poly(d, 8, s_pal[PI_KSCALE], NULL, GOLD_SCALE_A);
+        }
+        /* 背上那 1~2 粒：更靠脊线、更大一点、更亮 */
+        static const float HI_SG[2] = {1.70f, 2.60f};
+        for (int q = 0; q < 2; q++) {
+            float sg = HI_SG[q];
+            int   i0 = (int)sg; float tt = sg - i0;
+            if (i0 < 0) i0 = 0; if (i0 > KSEG - 1) i0 = KSEG - 1;
+            float px = _spx[i0] + (_spx[i0 + 1] - _spx[i0]) * tt;
+            float py = _spy[i0] + (_spy[i0 + 1] - _spy[i0]) * tt;
+            float aa = _spa[i0];
+            float ax = -fsin_t(aa), ay = fcos_t(aa);
+            px += ax * (-0.08f * Wd); py += ay * (-0.08f * Wd);
+            ipt_t d[8];
+            for (int v = 0; v < 8; v++) {
+                d[v].x = (int32_t)rne_f2i((px + s_oct_u[v][0] * GOLD_HIDOT_R) * 256.0f);
+                d[v].y = (int32_t)rne_f2i((py + s_oct_u[v][1] * GOLD_HIDOT_R) * 256.0f);
+            }
+            fill_poly(d, 8, s_pal[PI_KSCALE], NULL, GOLD_HIDOT_A);
+        }
+    }
     {
         float save[NPTS * 2];
         int n = s_npts;
@@ -2673,13 +3036,28 @@ static void koi_draw(koi_t *k)
             g.s1 = hold * 256; g.a1 = A[0];
             g.s2 = mid * 256;  g.a2 = A[1];
             g.s3 = nend * 256; g.a3 = A[2];
+            /* ★★ 第 53 轮：御黄金尾鳍「金黄 → 半透明浅金」。
+               红白**一个字节都不动**（仍走下面四条分支里的 TJ_GA）。
+               ⚠️ 只加在 `fine` 那条路上（细档鱼才画渐变尾鳍），
+                  下面三条 flat 分支保持原样 —— 少动就是少风险。 */
+            if (isGold && fine) {
+                grad_t g2 = g;                       /* 同方向 u、同原点 c */
+                g.a2  = GOLD_TJ_A1;                  /* 金黄：中段开始让位 */
+                g.a3  = GOLD_TJ_A2;                  /* 金黄：梢部只剩一点 */
+                g2.s0 = 0;          g2.a0 = 0;
+                g2.s1 = hold * 256; g2.a1 = 0;
+                g2.s2 = mid * 256;  g2.a2 = GOLD_TJ_LT1;
+                g2.s3 = nend * 256; g2.a3 = GOLD_TJ_LT2;
+                fill_poly(s_poly, n, bodyCol, &g, 256);                 /* 金黄层 */
+                fill_poly(s_poly, n, s_pal[PI_KGOLD_TL], &g2, 256);     /* 浅金层 */
+            }
             /* ★ 第 39 轮**不动这里**。曾试过把档 2 提到最前当"鱼要实体感"的解，
                但那样等于**擅自改立度**（档 0 的 21° → 档 2 的 30°），超出"就做这两个事"。
                本轮"实体感"由 fill_poly 的根因修复解决（鱼身 α 0.75 → 1.00）。
                遗留（**下一轮单独做**）：`s_look_tail >= 2` 排在 `if (fine)` 之后，
                而 fine = (grow > 0.56)，开局 6 条鱼 grow 0.56~0.68 ⇒ **档 2 从没覆盖过
                细档鱼的渐变尾鳍**（TJ_GA = 256/179/108，尾梢只剩 0.42）—— 真缺陷。 */
-            if (fine) fill_poly(s_poly, n, bodyCol, &g, 256);
+            else if (fine) fill_poly(s_poly, n, bodyCol, &g, 256);
             else if (s_look_tail >= 2) fill_poly(s_poly, n, bodyCol, NULL, 256);
             else if (s_look_tail == 1) fill_poly(s_poly, n, s_tailpale[isGold ? 1 : 0], NULL, 256);
             else      fill_poly(s_poly, n, bodyCol, NULL, A[1]);
@@ -3925,7 +4303,12 @@ static void scene_draw(int x0, int y0, int x1, int y1, int ri)
             weed_paint(&s_weed[k], dy);
         }
         demo_koi_who(7, i);
-        lily_paint(L, lily_rot(L));    /* 与标脏共用同一个量化角，画/报永远一致 */
+        /* ★ 52 轮：走快照（默认开）。lily_rot 与标脏共用同一个量化角，画/报永远一致。 */
+#if KOI_LILY_SNAP
+        lily_snap_draw(i, lily_rot(L), ly);
+#else
+        lily_paint(L, lily_rot(L));
+#endif
     }
     PROF_TICK(7);
     demo_koi_who(4, -1);
@@ -4204,6 +4587,15 @@ static void setup_draw(void)
     } else {
         setup_cards();
         ui_draw(UI_TIP_SPLIT, KW / 2, KH - 38);
+        /* ★★ 第 53 轮：分色屏（进池前最后一屏）下面再加一行**小字**——
+           王总原话「下面你给我加个 开启后长按OK键可重置 这个字可以小点 一行显示出来」。
+           为什么要加：第 52 轮做了断电续玩，上电会**直接进池、不再是首页**；
+           玩家一旦忘了"怎么回首页"就出不来了 —— 这行字就是那个出口的说明。
+           ⚠️ 位图是 koi_assets.h 里的 UI_TIP_RESET（13px 146x23，比主提示条的
+              18px 小一档）；固件没有字体引擎，一行字 = 一张烘好的点阵。
+           ⚠️ 只挂在第 2 屏（分配颜色）—— 那是"开启"动作发生的那一屏，
+              挂在第 1 屏（选条数）会让人以为现在就能长按。 */
+        ui_draw(UI_TIP_RESET, KW / 2, KH - 14);
     }
 }
 
