@@ -2868,7 +2868,8 @@ static void koi_draw(koi_t *k)
         for (int q = 0; q < 4; q++) {
             float sg = SCL_SG[q];
             int   i0 = (int)sg; float tt = sg - i0;
-            if (i0 < 0) i0 = 0; if (i0 > KSEG - 1) i0 = KSEG - 1;
+            if (i0 < 0) i0 = 0;
+            if (i0 > KSEG - 1) i0 = KSEG - 1;
             float px = _spx[i0] + (_spx[i0 + 1] - _spx[i0]) * tt;
             float py = _spy[i0] + (_spy[i0 + 1] - _spy[i0]) * tt;
             float aa = _spa[i0];
@@ -2887,7 +2888,8 @@ static void koi_draw(koi_t *k)
         for (int q = 0; q < 2; q++) {
             float sg = HI_SG[q];
             int   i0 = (int)sg; float tt = sg - i0;
-            if (i0 < 0) i0 = 0; if (i0 > KSEG - 1) i0 = KSEG - 1;
+            if (i0 < 0) i0 = 0;
+            if (i0 > KSEG - 1) i0 = KSEG - 1;
             float px = _spx[i0] + (_spx[i0 + 1] - _spx[i0]) * tt;
             float py = _spy[i0] + (_spy[i0 + 1] - _spy[i0]) * tt;
             float aa = _spa[i0];
