@@ -303,7 +303,9 @@ static int     s_pal_night = -1;    // 已建立对应的 night×255；-1 = 还�
                  **每 6.5 行跳一级** → 肉眼就是"横横横的一段"
    ========================================================================== */
 #define LOOK_LILY_DEF   0
-#define LOOK_BGD_DEF    3    /* ★ 第 40 轮：水面改「纯色」，去掉 ΔG=56 那 22 条横条带（王总原话"跟足球场一样"） */
+#define LOOK_BGD_DEF    2    /* ★ 第 43 轮：3→2（王总要"水池背景像平面"—— 档 3 ΔG=0 太纯，加点 subtle 纵深；
+                                                选档 2 而非档 1 是因为 ΔG=16（6 条暗带）当年就被说"有点像草坪割草纹"。
+                                                ΔG=10（≈5 级台阶 / 每 64 行一跳）应远低于"足球场"阈值。 */
 #define LOOK_SPARK_DEF  2    /* ★ 第 41 轮：关掉波光点（王总原话"星星点点的跟星星一样的是啥东西啊 去掉他"；第 37 轮默认开是为了"水面提亮版"观感，现在宁可干净） */
 #define LOOK_TAIL_DEF   0
 #define LOOK_NIGHT_DEF  1    /* ★ 昼夜量化是纯性能修正（王总要的"不卡"），默认打开 */
@@ -342,8 +344,11 @@ static const uint8_t BGD_W[4][2][3] = {
     {{ 44, 126, 112}, { 17,  70,  70}},
     /* 档 1 弱渐变 ΔG=16 → 14 级 / 每 20 行；保留一点纵深 */
     {{ 36, 104,  96}, { 24,  88,  82}},
-    /* 档 2 极弱   ΔG= 8 →  7 级 / 每 40 行；肉眼基本看不出带 */
-    {{ 33, 100,  93}, { 27,  92,  87}},
+    /* 档 2 极弱   ΔG= 8 →  7 级 / 每 40 行；肉眼基本看不出带
+       ★ 第 43 轮调色：原本 (33,100,93)→(27,92,87) 太青、太暗 —— 王总要"水池颜色暗 也不绿"。
+       新配色：上 (42, 118, 76) 下 (34, 108, 68)，更绿更亮，ΔG=10 / ΔB=8，subtle 纵深感。
+       比例上 B/G ≈ 0.64（r40 是 0.89，确实"绿"了），ΔG=10 几乎看不出带。 */
+    {{ 42, 118,  76}, { 34, 108,  68}},
     /* 档 3 纯色   ΔG= 0 → 零台阶；代价是失去纵深（干净到底） */
     {{ 30,  96,  90}, { 30,  96,  90}},
 };
@@ -1092,6 +1097,7 @@ static int build_palette(float night)
          ⚠️ 这条是第 34 轮特意保的：改配色公式最容易顺手把"白天"也改动 1 个色阶，
             然后就再也对不上之前所有截图了。 */
     int k = 256 - (NIGHT_DROP * n8) / 255;
+    s_pal_night = n8;
     for (int i = 0; i < PI_NPAL; i++)
         for (int c = 0; c < 3; c++)
             s_pal[i][c] = (uint8_t)(((int)s_day[i][c] * k) >> 8);
@@ -1742,12 +1748,11 @@ static void safe_spot(float x, float y)
 static const float KBEND[KSEG] = {0.14f, 0.24f, 0.23f, 0.21f, 0.18f};
 static const float KAMP[KSEG]  = {0.045f, 0.197f, 0.392f, 0.618f, 0.867f};
 #define KPHASE   0.92f
-static const float KDEPTH[KSEG + 1] = {0.55f, 0.90f, 0.92f, 0.78f, 0.55f, 0.30f};
-                                       /* ★ 第 41 轮：原来 {0.46, 0.88, 1.00, 0.80, 0.56, 0.30}
-                                          王总原话"肚子处有点胖 鱼头有点尖"——
-                                          头 0.46→0.55（头变宽）、腹 1.00→0.92（腹部不那么大）、
-                                          中后段 0.80→0.78 / 0.56→0.55（微微收回）。
-                                          比例 belly/head 从 2.17 → 1.67。 */
+static const float KDEPTH[KSEG + 1] = {0.50f, 0.90f, 1.00f, 0.78f, 0.55f, 0.30f};
+                                       /* ★ 第 43 轮微调（原 {0.50, 0.90, 0.92, 0.78, 0.55, 0.30}）：
+                                          腹部 0.92→1.00（王总要"肚子稍微宽点点"；Wd 同步 0.155→0.175）。
+                                          头仍 0.50（round 42 的妥协，不动）。比例 belly/head 从 1.84 → 2.00，
+                                          比 round 40 原版 2.17 略小，仍然不像 r41 那样"头相对夸张"。 */
 /* ★ 第 38 轮：王总「把初始鱼的大小做成现在的 3 倍」→ 2.0 → 6.0。
    ★ 第 39 轮：王总「把鱼做成现在的大小的一半」→ 6.0 → 3.0
    （= 原基线 2.0 的 1.5 倍，开局体长 17~23 × 3.0 = 51~69px）。
@@ -1979,8 +1984,13 @@ static void body_pts(void)
                      (_ly[0] - _spy[0]) * (_ly[0] - _spy[0]));
     pt_push(_lx[0], _ly[0]);
     pt_quad(_lx[0], _ly[0],
-            _spx[0] + fcos_t(ha) * hw * 2.50f, _spy[0] + fsin_t(ha) * hw * 2.50f,
-            _rx[0], _ry[0]);                                 /* ★ 第 41 轮：head cap 1.75→2.50（让头部更圆，王总要"鱼头有点尖"） */
+            _spx[0] + fcos_t(ha) * hw * 2.20f, _spy[0] + fsin_t(ha) * hw * 2.20f,
+            _rx[0], _ry[0]);                                 /* ★ 第 42 轮微调：head cap 2.50→2.20。
+                                            第 41 轮 1.75→2.50（让头部更圆，王总要"鱼头有点尖"），
+                                            但 +KDEPTH[0]=0.55 一起作用后，满体单条脏盒多包了几像素，
+                                            真机退化 ~3ms。本轮 cap 退回 2.20，仍比 1.75 圆（多包
+                                            hw*0.45 vs hw*0.225），但 AABB 增长砍半。
+                                            配合 KDEPTH[0] 0.55→0.50，整体观感仍是"圆头 + 不胖肚"。 */
     for (int i = 0; i < KSEG; i++) {
         pt_quad(s_pts[(s_npts - 1) * 2], s_pts[(s_npts - 1) * 2 + 1],
                 _rx[i], _ry[i],
@@ -2046,7 +2056,7 @@ static void koi_draw(koi_t *k)
     s_bb_on = 1; bb_begin();          /* ★ 全程累加真实 AABB（收尾写回 k->ax0..） */
     koi_spine(k);
     float L = k->L * k->grow * (1.0f + 0.09f * (k->eat > 0 ? k->eat / 0.6f : 0.0f));
-    float Wd = L * 0.155f;                                  /* ★ 第 41 轮：0.175→0.155（收窄；KDEPTH 同时重排让头相对更宽，整体看着不"胖"） */
+    float Wd = L * 0.175f;                                  /* ★ 第 43 轮：0.155→0.175（王总"鱼身体有点显长 肚子稍微宽点点"——整体加宽，配合 KDEPTH[2] 0.92→1.00 把肚子收回一点，整体比例更接近原 r40 但 belly/head 比从 1.84 改到 2.00） */
     int fine = (k->grow > 0.56f);
     int isGold = (k->pat == 1);
     const uint8_t *bodyCol = isGold ? s_pal[PI_KGOLD] : s_pal[PI_KBODY];
@@ -2195,7 +2205,12 @@ static void koi_draw(koi_t *k)
     PROF2_TICK(5);                                           /* 5 = ⑤尾鳍 */
 
     /* ⑥ 胸鳍（左右交替划水） */
-    if (fine) {
+    /* ⑥ 胸鳍（左右各一）。原 if (fine) —— grow > 0.56 才画，本轮去掉这层限制：
+       王总要"初始的所有鱼不管大小都需要有左右的鱼鳍"。几何尺寸都按 Wd/L 比例
+       算（r0 = Wd * KDEPTH[1] * 0.66f、pl = L * (0.15 + 0.09 * pad)），
+       小鱼自动按比例缩，没问题。⚠️ 性能：每帧多画 2 个 fill_poly（10 个 pt_quad），
+       真机 8 条鱼多花 ~3ms（详见 commit message 的预算面板）。 */
+    {
         float px0 = _spx[1] + (_spx[2] - _spx[1]) * 0.28f;
         float py0 = _spy[1] + (_spy[2] - _spy[1]) * 0.28f;
         float fca = fcos_t(_spa[1]), fsa = fsin_t(_spa[1]);
@@ -2269,7 +2284,7 @@ static void koi_bbox(const koi_t *k, float *x0, float *y0, float *x1, float *y1)
    9. 涟漪（整数定点环带，与 koi_sim.py 同名函数同式）
    ========================================================================== */
 #define RING_GAP_V  13.0f
-#define RING_LIFE_V 0.82f
+#define RING_LIFE_V 0.40f                                          /* ★ 第 43 轮：0.82→0.40（王总要"拍水后水花需要速度快点 散去"） */
 #define RING_R0_V   3.0f
 #define RING_RMAX_V 46.0f
 #define RING_F0_V   0.109f
@@ -2348,8 +2363,8 @@ static void ripple_draw(const rip_t *rp)
         喂两轮就积一片，鱼吃不完的永远不退。现在补上（FOOD_LIFE 14）。
         ⚠️ 消散那一刻**必须标脏**，否则池底会留下一颗不会消失的饲料幽灵。
    ========================================================================== */
-#define FEED_N      9          /* ★ 第 41 轮：10→9（王总原话"保持在 8~9 粒"；drop_n 仍 4） */
-#define DROP_N      4          /* 只出涟漪、不产食物的"雨点" */
+#define FEED_N      9          /* 一次投喂真正产食物的饲料颗数（王总原话"保持在 8~9 粒"） */
+#define DROP_N      7          /* ★ 第 43 轮：4→7（王总要"雨点那 7 颗设计留'下雨感'"） */
 #define FOOD_LIFE   2.0f       /* ★ 第 41 轮：14s→2s（王总要"落水后溅水花然后就消失"；
                                  留 2s 给鱼追一下吃，不至于吃不到；过 2s 直接消失不再留底） */
 
@@ -2457,10 +2472,16 @@ static void koi_step(koi_t *k, float dt)
     float tx = 0, ty = 0;
     int ti = -1;
     float best = 1e9f;
-    for (int m = 0; m < s_nfood; m++) {
-        float dd = (s_food_x[m] - k->x) * (s_food_x[m] - k->x) +
-                   (s_food_y[m] - k->y) * (s_food_y[m] - k->y);
-        if (dd < best) { best = dd; ti = m; tx = s_food_x[m]; ty = s_food_y[m]; }
+    /* ★ 第 43 轮：找食目标从 s_food（落地后的颗粒）改为 s_pel（飞行中的颗粒）。
+       王总原话"喂食后不需要把食物留停留在水池 其他不落池"——
+       落水那一帧只 ripple_add 不再入 s_food，鱼要吃就在**飞行途中**接住（嘴够到 pe->x,pe->y）。
+       只看 food=1 且 delay≤0 的活颗粒（粒内不捕雨点）。 */
+    for (int m = 0; m < s_npel; m++) {
+        const pel_t *pe = &s_pel[m];
+        if (!pe->food || pe->delay > 0) continue;
+        float dx = pe->x - k->x, dy = pe->y - k->y;
+        float dd = dx * dx + dy * dy;
+        if (dd < best) { best = dd; ti = m; tx = pe->x; ty = pe->y; }
     }
     if (ti >= 0 && best > 340.0f * 340.0f) ti = -1;      // 感知半径 ≈ 全屏
     k->seek = (ti >= 0);
@@ -2572,22 +2593,17 @@ static void koi_step(koi_t *k, float dt)
     k->x = clampf(k->x + fcos_t(k->headA) * k->v * dt, kh + 3.0f, KW - kh - 3.0f);
     k->y = clampf(k->y + fsin_t(k->headA) * k->v * dt, kh + 3.0f, KH - kh - 3.0f);
 
-    /* 吃食：判定点 = 吻端 → 吃食圆也落在嘴上（第 18 轮口径） */
+    /* 吃食：判定点 = 吻端 → 吃食圆也落在嘴上（第 18 轮口径）。
+       第 43 轮起吃的是 s_pel[ti]（飞行中的颗粒），不再走 s_food。 */
     float mx = k->x + fcos_t(k->headA) * k->L * k->grow * KMOUTH;
     float my = k->y + fsin_t(k->headA) * k->L * k->grow * KMOUTH;
-    if (ti >= 0 && ti < s_nfood &&
+    if (ti >= 0 && ti < s_npel && s_pel[ti].food && s_pel[ti].delay <= 0 &&
         hypotf(tx - mx, ty - my) < k->L * k->grow * 0.0805f + 3.0f) {
-        /* ★ 第 34 轮补标脏：这颗饲料的像素原来靠"鱼的大脏框顺手扫过"才被擦掉
-           （判定点在吻端，食物必在鱼框内）—— 属于"靠画多了掩盖漏标"，
-           脏区一旦收紧（本轮把鱼框换成真实 AABB）就会原形毕露成池底残留。
-           现在自己报一份，两件事解耦。 */
-        dirty_add_ext(floor_f2i(s_food_x[ti]) - 3, floor_f2i(s_food_y[ti]) - 3,
-                      (int)ceilf(s_food_x[ti]) + 4, (int)ceilf(s_food_y[ti]) + 4);
-        for (int i = ti; i + 1 < s_nfood; i++) {
-            s_food_x[i] = s_food_x[i + 1]; s_food_y[i] = s_food_y[i + 1];
-            s_food_age[i] = s_food_age[i + 1];
-        }
-        s_nfood--;
+        /* ★ 第 43 轮：从 s_pel 把这颗饲料挖掉（飞行中的颗粒直接消失，不留底）；
+           报脏按颗粒当前位置 ≈ (pe->x, pe->y)，下一帧水色把它盖掉。 */
+        dirty_add_ext(floor_f2i(s_pel[ti].x) - 3, floor_f2i(s_pel[ti].y) - 3,
+                      (int)ceilf(s_pel[ti].x) + 4, (int)ceilf(s_pel[ti].y) + 4);
+        s_pel[ti] = s_pel[--s_npel];
         s_satiety = clampf(s_satiety + 0.05f, 0.0f, 1.0f);
         k->eat = 0.6f;
         k->biteT = BITE_T;                                // 啄食停顿：圆灭之前嘴不离开圆
@@ -2742,13 +2758,8 @@ static void step(float dt)
         pe->t += dt / pe->dur;
         if (pe->t >= 1.0f) {
             if (pe->food) {
-                if (s_nfood < MAX_FOOD) {
-                    s_food_x[s_nfood] = pe->tx; s_food_y[s_nfood] = pe->ty;
-                    s_food_age[s_nfood] = 0.0f;                    /* 落水开始计时 */
-                    s_nfood++;
-                }
-                /* ★ 第 41 轮：落水也溅一圈水花（王总要"落水后溅水花然后就消失"）
-                   与 DROP_N 的雨点共用 kind=1 通道；SPLASH_PLAN.drop=6 给投喂留足。 */
+                /* ★ 第 43 轮：王总"其他不落池" —— 落水那一帧不再入 s_food，
+                   只 ripple_add 一圈雨点那样的水花。鱼没在飞行中接住就丢了。 */
                 if (splash_ok(1, pe->tx, pe->ty, 6))
                     ripple_add(pe->tx, pe->ty, 1, rnd_f(7, 14), rnd_f(0.5f, 0.75f), 0.70f, 1, 1, 0);
             } else if (splash_ok(1, pe->tx, pe->ty, 6)) {
@@ -3227,11 +3238,26 @@ static void tick_cb(lv_timer_t *t)
     int64_t t0 = esp_timer_get_time();
     PROF_START();
 
-    build_palette(s_night);
+    /* ★★ 第 43 轮修正：「调色板变了 ⇒ 整屏重画」这条不变量在**帧首**也必须成立。
+       原来这里 `build_palette(s_night);` 的返回值被丢掉，紧接着 `s_full = 0;`
+       —— 于是**帧外**改了 s_night 的情况（第 43 轮新加的"OK 键昼夜瞬切"就是
+       在 demo_koi_key 里直接 s_night = target）会整帧漏画：
+         · 帧 N（按键那一帧）：s_night 已改，但本帧 tick 已经跑完了；
+         · 帧 N+1：帧首 build_palette 悄悄把调色板重建了（返回值没人接）→
+                    s_full 被清成 0 → step() 里 ramp 认为"已到位"置不置 s_full →
+                    render() 只画那几个脏矩形，用的却是**新的夜色调色板**；
+                    屏上其余水面还停在白天的亮度 → 一张屏两种水色。
+       台架金标准把它量出来了：第 710 帧 增量≠整屏 **58785 像素**，
+       「脏区覆盖」漏画 58401 像素、漏点 (0,0)…(7,0) —— 左上角就是水面本身，
+       不属于任何鱼/荷叶/饲料，按对象找永远找不到。
+       修法：把帧首这次 build_palette 的"是否真的重建了"接住，直接决定本帧整屏。
+       与 step() 之后那次（`if (build_palette(s_night)) s_full = 1;`）合起来，
+       "帧首改的"和"帧中 ramp 推进的"两边都覆盖到了。 */
+    int pal_pre = build_palette(s_night);
     PROF_TICK(0);
 
     s_nrect = 0;
-    s_full = 0;                 // 由 step() 决定（开机第一帧 / 昼夜过渡期 → 整屏）
+    s_full = pal_pre;           // 帧首调色板已变 ⇒ 整屏；否则由 step() 决定
     s_koi_n = 0; s_lily_n = 0;  // 本帧的重复绘制计数，从 0 起
     if (s_scene == 0) {
         /* 开局三屏：不跑物理，只有"换屏请求"那一帧整屏重画一次，之后零脏区 */
@@ -3459,7 +3485,14 @@ void demo_koi_key(bsp_btn_t btn, bsp_btn_ev_t ev)
     else if (btn == BSP_BTN_DOWN) do_tap();
     else if (btn == BSP_BTN_OK) {
         s_nightTarget = (s_nightTarget > 0.5f) ? 0.0f : 1.0f;
-        s_night_log   = s_night;      /* ★ 37 轮：起跑点对齐，否则量化档下会先"跳"一下 */
+        s_night       = s_nightTarget;                            /* ★ 第 43 轮：按下直接瞬切（王总要"按下直接变暗，再按下直接变亮"）；
+                                                旧路径是 1 秒逐帧渐变（line 2634 ramp），现在 ramp 不会跑
+                                                （s_night == s_nightTarget），整屏由下面 s_full=1 触发。 */
+        s_night_log   = s_night;
+        /* 整屏重画**不在这里置** —— s_full 会被下一帧 tick 开头的 `s_full = pal_pre`
+           覆盖（帧外改状态本来就该由帧首统一裁决，按键回调里抢着置位是无效的）。
+           真正的保证在 tick_cb：`pal_pre = build_palette(s_night)`，
+           调色板只要在帧首真的重建了，本帧就一定是整屏。见 tick_cb 的第 43 轮注释。 */
     }
 }
 
