@@ -301,6 +301,16 @@ enum {
     PI_KGOLD_HI,     /* 高光   #FFF0A0 = 255,240,160 —— 背部中央那条**很窄**的带 */
     PI_KSCALE,       /* 鳞片点 #FFF7D1 = 255,247,209 —— 背上几粒很小的点 */
     PI_KGOLD_TL,     /* 尾梢浅金 #FFE28C —— 尾鳍"金黄→半透明浅金"的**那一端** */
+    /* ★★ 第 54 轮：红白鲤的**立体化**（王总：「不要像红白两色的平面纸片。
+         先塑造鱼身体的体积，再绘制红色花纹」）
+         白身从**背中央**向**两侧**四档：亮白 → 暖白 → 灰白 → 稍深阴影
+         红斑三档：受光亮朱红 → 主体朱红 → 两侧/边缘深红
+       ⚠️ 与御黄金那套**互不干扰**：这套只给 pat != 1 用。 */
+    PI_KBODY_HI,     /* 亮白   #FFFDF5 = 255,253,245  背中央受光（非常窄的柔和高光） */
+    PI_KBODY_SIDE,   /* 浅灰白 #D9DDD8 = 217,221,216  身体两侧 */
+    PI_KBODY_DK,     /* 稍深灰 #BFC6C3 = 191,198,195  腹 / 尾根 / 鳍根阴影 */
+    PI_KSPOT_LT,     /* 亮朱红 #F25A45 = 242, 90, 69  红斑受光处 */
+    PI_KSPOT_DK,     /* 深红   #A92320 = 169, 35, 32  红斑靠两侧 / 边缘 */
     PI_NPAL
 };
 
@@ -314,7 +324,15 @@ static const uint8_t DAY_PAL[PI_NPAL][3] = {
        ⚠️ 这一项只被金鱼身与尾鳍淡色表用（build_tail_pale），
           水面/涟漪/波光各有自己的槽位（PI_RIPPLE 等），不受影响。
        ⚠️ 改这一项会让所有历史"金鱼颜色"截图作废 —— 是有意的（王总要的就是改它）。 */
-    {250, 246, 238}, {232,  90,  38}, {245, 166,  35}, {252, 204, 176},
+    /* ★★ 第 54 轮：白身主色 {250,246,238} → **暖白 #F4F1E8 = 244,241,232**
+       （王总："白色身体不要使用纯白色整块填充。身体主色使用暖白 #F4F1E8"）。
+       旧值 R>G>B 差得少（250/246/238）读出来偏"冷白/纸白"；暖白的 B 再降 6，
+       色温往米黄走一点点，才有"活鱼的体色"而不是"复印纸"。
+       ⚠️ PI_KBODY 还被 build_tail_pale 用作尾鳍淡色的基色 ⇒ 尾鳍跟着变暖，是有意的。
+       ★★ 红斑主色 {232,90,38} → **锦鲤朱红 #E5392D = 229,57,45**
+       （王总："红斑主体使用锦鲤朱红 #E5392D"）。旧值偏橙（G=90），新值 G=57 更抳红、
+       B 38→45 让它不那么"火"，是锦鲤品种里标准的"绯"色。 */
+    {244, 241, 232}, {229,  57,  45}, {245, 166,  35}, {252, 204, 176},
     {158,  78,  38}, {232, 255, 248}, {246, 208, 138},
     /* 荷叶 / 浮萍（网页版 DAY.lilyFill / lilyEdge / lilyVein / weed / weedPale） */
     { 52, 156,  88}, { 22,  94,  54}, {104, 210, 140}, {116, 192,  96},
@@ -331,6 +349,17 @@ static const uint8_t DAY_PAL[PI_NPAL][3] = {
           五档之间跨度要够大，否则叠出来的层次会被 RGB565 的量化吃掉。 */
     {185, 104,  18}, {255, 211,  78}, {255, 240, 160}, {255, 247, 209},
     {255, 226, 140},
+    /* ★★ 第 54 轮：红白鲤立体化的五个色（王总指定，一个都不要改）
+         PI_KBODY_HI   #FFFDF5 = 255,253,245  背中央受光·亮白
+         PI_KBODY_SIDE #D9DDD8 = 217,221,216  身体两侧·浅灰白
+         PI_KBODY_DK   #BFC6C3 = 191,198,195  腹 / 尾根 / 鳍根·稍深灰
+         PI_KSPOT_LT   #F25A45 = 242, 90, 69  红斑受光处·较亮朱红
+         PI_KSPOT_DK   #A92320 = 169, 35, 32  红斑靠两侧 / 边缘·深红
+       ⚠️ 三档白的**跨度只有 64 级**（255→191），RGB565 的 R 只有 32 级
+          （= 8 级/档）—— 这就是为什么要靠**渐变**而不是再分层：
+          硬分层在小鱼身上会变成一圈圈的色带，渐变才是"圆鼓鼓"。 */
+    {255, 253, 245}, {217, 221, 216}, {191, 198, 195},
+    {242,  90,  69}, {169,  35,  32},
 };
 
 /* 夜间亮度 = 白天的 42%。挑这个数不是拍的：再低鱼红就开始并档（232,90,38 乘到
@@ -2444,10 +2473,16 @@ static float _lx[KSEG + 1], _ly[KSEG + 1], _rx[KSEG + 1], _ry[KSEG + 1];
    ⚠️ 两个宏只影响"形状"，**不消费 rnd**（扰动是确定性三角函数，见绘制处）——
       所以改档位不会让随机序列错位（铁律 20）。 */
 #ifndef KOI_SPOT_SEGS
-#define KOI_SPOT_SEGS   8
+/* ★ 第 54 轮：8 → 11。王总"红斑不要画成规则圆点…边缘有轻微凹凸"。
+   8 个顶点的多边形在 sl≈0.10L（≈5px）的斑上，每个边就 2px 长，
+   读出来还是"带棱角的圆"；11 个顶点 + 双频扰动才够碎。
+   ⚠️ 上限 12：再多就是纯浪费（11 顶点已经把 5px 的斑切到 1.4px 一段）。 */
+#define KOI_SPOT_SEGS   11
 #endif
 #ifndef KOI_SPOT_JIT
-#define KOI_SPOT_JIT    0.30f
+/* ★ 第 54 轮：0.30 → 0.34。扰动现在是**双频叠加**（0.68·cos2.3θ + 0.32·cos3.7θ），
+   两个频率同时取到峰的概率很低 ⇒ 实际起伏比单频小，所以要补一点幅度回来。 */
+#define KOI_SPOT_JIT    0.34f
 #endif
 
 /* ★ 第 51 轮：红斑的**整体尺寸**倍率（王总「红色在鱼身上覆盖的稍微再多点占比」）。
@@ -2513,6 +2548,44 @@ static float _lx[KSEG + 1], _ly[KSEG + 1], _rx[KSEG + 1], _ry[KSEG + 1];
 #endif
 #ifndef GOLD_TJ_LT2
 #define GOLD_TJ_LT2    176      /* 浅金层：尾梢 alpha */
+#endif
+
+/* ★★ 第 54 轮：红白鲤立体化的**强度刻度**（0..256）。
+   王总给的六个色之外，"各层压多重"是纯观感 —— 全提成宏，看完真机要调就改这几个。
+     KBODY_SIDE_A  身体两侧浅灰白   112 ≈ 0.44
+     KBODY_DK_A    腹 / 尾根稍深灰   128 ≈ 0.50
+     KBODY_BACK_A  背中央亮白窄带    120 ≈ 0.47（“**非常窄**的柔和高光”）
+     KBODY_TAIL_A  尾根压暗（前后层次）118 ≈ 0.46
+     KSPOT_LT_A    红斑受光亮朱红    150 ≈ 0.59
+     KSPOT_DK_A    红斑两侧/边缘深红 140 ≈ 0.55
+   ★ 为什么这套数比御黄金（96~124）**整体更重**：
+     白身三档之间只差 64/255，而黄金五档差到 70~130 —— 白身的对比天生更弱，
+     不加重就完全是一片白（台架 240×320 就是真机分辨率，出图确认过）。
+   ⚠️ 几何（窄带宽度 ±0.12Wd 等）在 koi_draw 里写死，比 alpha 更影响
+      "是不是一条线"，要改去那边。 */
+#ifndef KBODY_SIDE_A
+#define KBODY_SIDE_A   112
+#endif
+#ifndef KBODY_DK_A
+#define KBODY_DK_A     128
+#endif
+#ifndef KBODY_BACK_A
+#define KBODY_BACK_A   120
+#endif
+#ifndef KBODY_TAIL_A
+#define KBODY_TAIL_A   118
+#endif
+#ifndef KBODY_HEAD_R
+#define KBODY_HEAD_R   1.25f      /* 头顶那 1 个小高光的半径（px） */
+#endif
+#ifndef KBODY_HEAD_A
+#define KBODY_HEAD_A   205
+#endif
+#ifndef KSPOT_LT_A
+#define KSPOT_LT_A     150
+#endif
+#ifndef KSPOT_DK_A
+#define KSPOT_DK_A     140
 #endif
 
 /* 鳞片点 / 背上高光点：半径（px）与 alpha。
@@ -2903,6 +2976,83 @@ static void koi_draw(koi_t *k)
             fill_poly(d, 8, s_pal[PI_KSCALE], NULL, GOLD_HIDOT_A);
         }
     }
+
+    /* ★★ 第 54 轮：红白鲤的**身体体积**（只给 pat != 1；御黄金走上面那套，互不干扰）
+       王总原话：「不要像红白两色的平面纸片。先塑造鱼身体的体积，再绘制红色花纹」
+       从**背中央**向**两侧**四档：亮白 → 暖白(底色) → 灰白 → 稍深阴影。
+
+       ⚠️⚠️ 与御黄金同一条路：**只用 fill_poly 的 grad**（沿方向 u 逐像素插值 alpha）。
+          第 47 轮"沿 spine 等距偏移的折线多边形"被王总否掉过（"金色鱼背部有条线
+          不对劲"）—— 根因是折线的两条边在**弯曲**的鱼身上是斜切过身体的直边，
+          叠半透明色就成了**一条线**；而"圆鼓鼓"要的是**明暗过渡**。
+
+       ★ grad 的对称写法（4 个断点做出"中间 0、两侧满"）：
+           s ≤ s0 → a0（覆盖外侧整段）· s0→s1 渐降 · s1..s2 恒定 · s2→s3 渐升 ·
+           s ≥ s3 → a3（覆盖外侧整段）。
+         所以"两侧压暗"= a0/a3 取满、a1/a2 取 0；"背中央窄高光"反过来。
+       ⚠️ 满档点必须落在**鱼身内部**：身体半宽 ≈ Wd·KDEPTH[mid] ≈ Wd，
+         所以外侧断点取 0.95Wq 而不是 1.15Wq —— 取到 1.15 的话腹侧只吃到
+         斜坡的一小截，"腹部压暗"就几乎看不见了。 */
+    if (!isGold) {
+        int   mid = KSEG / 2;
+        float ox  = _spx[mid], oy = _spy[mid];
+        float nx  = -fsin_t(_spa[mid]), ny = fcos_t(_spa[mid]);   /* 横向（背↔腹） */
+        float tx  =  fcos_t(_spa[mid]), ty = fsin_t(_spa[mid]);   /* 纵向（头→尾） */
+        float Wq  = (Wd > 1.0f) ? Wd : 1.0f;
+        float Hl  = L * 0.5f;
+        grad_t g;
+        g.ux = (int32_t)rne_f2i(nx * 256.0f); g.uy = (int32_t)rne_f2i(ny * 256.0f);
+        g.cx = (int32_t)rne_f2i(ox * 256.0f); g.cy = (int32_t)rne_f2i(oy * 256.0f);
+
+        /* ① 身体两侧 → 浅灰白 #D9DDD8：|s| 0.70Wd 起满、0.22Wd 归零 */
+        g.s0 = (int32_t)(-Wq * 0.70f * 256.0f); g.a0 = KBODY_SIDE_A;
+        g.s1 = (int32_t)(-Wq * 0.22f * 256.0f); g.a1 = 0;
+        g.s2 = (int32_t)( Wq * 0.22f * 256.0f); g.a2 = 0;
+        g.s3 = (int32_t)( Wq * 0.70f * 256.0f); g.a3 = KBODY_SIDE_A;
+        fill_poly(s_poly, s_npts, s_pal[PI_KBODY_SIDE], &g, 256);
+
+        /* ② 靠腹 / 更外侧 → 稍深灰 #BFC6C3：|s| 0.95Wd 起满、0.45Wd 归零。
+              与 ① 叠起来，腹侧 = 灰白 + 稍深灰 ⇒ 两级下压， outermost 最深。 */
+        g.s0 = (int32_t)(-Wq * 0.95f * 256.0f); g.a0 = KBODY_DK_A;
+        g.s1 = (int32_t)(-Wq * 0.45f * 256.0f); g.a1 = 0;
+        g.s2 = (int32_t)( Wq * 0.45f * 256.0f); g.a2 = 0;
+        g.s3 = (int32_t)( Wq * 0.95f * 256.0f); g.a3 = KBODY_DK_A;
+        fill_poly(s_poly, s_npts, s_pal[PI_KBODY_DK], &g, 256);
+
+        /* ③ 背中央**非常窄**的柔和高光 → 亮白 #FFFDF5：只在 ±0.12Wd，0.40Wd 渐隐。
+              ⚠️ 王总特别强调"非常窄" —— 宽了就是第 41 轮被关掉的那条"脊骨"
+                 （「鱼的骨骼显现出来了，需要隐藏」）。0.12Wd ≈ 2px，是柔光不是骨线。 */
+        g.s0 = (int32_t)(-Wq * 0.40f * 256.0f); g.a0 = 0;
+        g.s1 = (int32_t)(-Wq * 0.12f * 256.0f); g.a1 = KBODY_BACK_A;
+        g.s2 = (int32_t)( Wq * 0.12f * 256.0f); g.a2 = KBODY_BACK_A;
+        g.s3 = (int32_t)( Wq * 0.40f * 256.0f); g.a3 = 0;
+        fill_poly(s_poly, s_npts, s_pal[PI_KBODY_HI], &g, 256);
+
+        /* ④ 尾根压暗 → 稍深灰 #BFC6C3（"使身体和尾巴产生前后层次"）。
+              u 取**指尾**方向（切向是头→尾，这里直接用 +tx/+ty）；
+              头半段恒 0、从中段开始渐强、尾端满。 */
+        g.ux = (int32_t)rne_f2i(tx * 256.0f); g.uy = (int32_t)rne_f2i(ty * 256.0f);
+        g.s0 = (int32_t)(-Hl * 1.10f * 256.0f); g.a0 = 0;
+        g.s1 = (int32_t)(-Hl * 0.10f * 256.0f); g.a1 = 0;
+        g.s2 = (int32_t)( Hl * 0.60f * 256.0f); g.a2 = KBODY_TAIL_A;
+        g.s3 = (int32_t)( Hl * 1.10f * 256.0f); g.a3 = KBODY_TAIL_A;
+        fill_poly(s_poly, s_npts, s_pal[PI_KBODY_DK], &g, 256);
+
+        /* ⑤ 头顶 1 个小高光（王总："头顶可增加1个小高光"）。
+              位置**确定性**（段号推出，不抽 rnd —— 铁律 20）。 */
+        {
+            float sg = 0.45f;
+            int   i0 = 0; float tt = sg;
+            float px = _spx[i0] + (_spx[i0 + 1] - _spx[i0]) * tt;
+            float py = _spy[i0] + (_spy[i0 + 1] - _spy[i0]) * tt;
+            ipt_t d[8];
+            for (int v = 0; v < 8; v++) {
+                d[v].x = (int32_t)rne_f2i((px + s_oct_u[v][0] * KBODY_HEAD_R) * 256.0f);
+                d[v].y = (int32_t)rne_f2i((py + s_oct_u[v][1] * KBODY_HEAD_R) * 256.0f);
+            }
+            fill_poly(d, 8, s_pal[PI_KBODY_HI], NULL, KBODY_HEAD_A);
+        }
+    }
     {
         float save[NPTS * 2];
         int n = s_npts;
@@ -2949,14 +3099,62 @@ static void koi_draw(koi_t *k)
         s_npts = SEGS;
         for (int v = 0; v < SEGS; v++) {
             float ang = ph + (float)v * (6.2832f / (float)SEGS);
-            float r = 1.0f + KOI_SPOT_JIT * fcos_t(ang * 2.3f + ph * 1.7f);
+            /* ★★ 第 54 轮：径向扰动改**双频**（王总："边缘有轻微凹凸"）。
+               单频 cos(2.3θ) 只在两个方向上鼓出来，读着还是"橄榄球"；
+               叠一个 3.7θ 的高频（权重 0.32）才能出现**细碎的凹凸**，
+               像真实绯斑那种不规则的边缘。
+               ⚠️ 两个频率**互质**（2.3 / 3.7），否则拍频会让所有斑长一个样。 */
+            float r = 1.0f + KOI_SPOT_JIT *
+                      (0.68f * fcos_t(ang * 2.3f + ph * 1.7f) +
+                       0.32f * fcos_t(ang * 3.7f + ph * 2.9f));
             float rx = fcos_t(ang) * sl * r;
             float ry = fsin_t(ang) * sw * r;
             s_pts[v*2]     = cax + ca * rx - sa * ry;
             s_pts[v*2 + 1] = cay + sa * rx + ca * ry;
         }
         to_q8(s_npts, 0.0f, 0.0f);
-        fill_poly(s_poly, s_npts, s_pal[PI_KSPOT], NULL, 236);   // 0.92
+        /* ★★ 第 54 轮：红斑**不再是平涂一个色**（王总："不要使用一个颜色。
+           红斑应该是不规则自然色块…主体朱红 #E5392D，受光 #F25A45，
+           靠身体两侧和边缘 #A92320"）。
+           ⇒ 三遍 fill：底（主体朱红）+ 亮（受光）+ 暗（靠两侧/边缘）。
+           ⚠️ **两个 grad 用不同的轴**，这是有意的：
+             · 亮用**斑自身**的横轴（以斑心为原点、半宽 sw 为单位）
+               ⇒ 斑心受光最亮 —— 表现"斑自己是个鼓起来的色块"；
+             · 暗用**鱼身**的横轴（以脊线为原点、Wd 为单位）
+               ⇒ 长在腹侧的斑整体偏深红 —— 表现"斑贴在曲面上"。
+             两条轴叠起来 = 斑既有自己的明暗，又跟着身体的曲面走。
+           ⚠️ 边缘的"轻微凹凸、大小不同"由上面的**双频径向扰动**给
+              （KOI_SPOT_SEGS 8→11 + JIT 双频），不是靠再叠一圈描边。 */
+        fill_poly(s_poly, s_npts, s_pal[PI_KSPOT], NULL, 236);   // 0.92 底：主体朱红
+
+        grad_t gs;
+        /* 亮：斑心受光 → 较亮朱红 #F25A45 */
+        gs.ux = (int32_t)rne_f2i(-sa * 256.0f);
+        gs.uy = (int32_t)rne_f2i( ca * 256.0f);
+        gs.cx = (int32_t)rne_f2i(cax * 256.0f);
+        gs.cy = (int32_t)rne_f2i(cay * 256.0f);
+        gs.s0 = (int32_t)(-0.55f * sw * 256.0f); gs.a0 = 0;
+        gs.s1 = (int32_t)(-0.08f * sw * 256.0f); gs.a1 = KSPOT_LT_A;
+        gs.s2 = (int32_t)( 0.08f * sw * 256.0f); gs.a2 = KSPOT_LT_A;
+        gs.s3 = (int32_t)( 0.55f * sw * 256.0f); gs.a3 = 0;
+        fill_poly(s_poly, s_npts, s_pal[PI_KSPOT_LT], &gs, 256);
+
+        /* 暗：斑整体偏在身体哪一侧 → 靠两侧就压深红 #A92320。
+           ⚠️ 轴换成**鱼身横轴**（以脊线中段为原点），所以这里要重算 cx/cy。 */
+        {
+            int   mid2 = KSEG / 2;
+            float nx2 = -fsin_t(_spa[mid2]), ny2 = fcos_t(_spa[mid2]);
+            float Wq2 = (Wd > 1.0f) ? Wd : 1.0f;
+            gs.ux = (int32_t)rne_f2i(nx2 * 256.0f);
+            gs.uy = (int32_t)rne_f2i(ny2 * 256.0f);
+            gs.cx = (int32_t)rne_f2i(_spx[mid2] * 256.0f);
+            gs.cy = (int32_t)rne_f2i(_spy[mid2] * 256.0f);
+            gs.s0 = (int32_t)(-Wq2 * 0.92f * 256.0f); gs.a0 = KSPOT_DK_A;
+            gs.s1 = (int32_t)(-Wq2 * 0.30f * 256.0f); gs.a1 = 0;
+            gs.s2 = (int32_t)( Wq2 * 0.30f * 256.0f); gs.a2 = 0;
+            gs.s3 = (int32_t)( Wq2 * 0.92f * 256.0f); gs.a3 = KSPOT_DK_A;
+            fill_poly(s_poly, s_npts, s_pal[PI_KSPOT_DK], &gs, 256);
+        }
     }
     if (k->pat == 2) {
         static const uint8_t ink[3] = {26, 24, 30};
