@@ -296,7 +296,15 @@ enum {
 
 static const uint8_t DAY_PAL[PI_NPAL][3] = {
     { 44, 126, 112}, { 17,  70,  70}, {220, 254, 240},
-    {250, 246, 238}, {232,  90,  38}, {253, 216, 124}, {252, 204, 176},
+    /* ★★ 第 47 轮：PI_KGOLD 由 {253,216,124}（米黄/柠檬黄）改成 {255,200,92}（橙金）。
+       王总原话"黄金锦鲤要有金属金/橙金的层次感，而不是纯黄色"。
+       原来那档 R≈G（253 vs 216）读出来就是"浅黄"，色相 ~48°；
+       新值 R−G = 55，色相压到 ~40°，明显偏橙，配合背脊那条暗带（见 koi_draw ②段）
+       就有了"背暗腹亮"的金属反射层次。
+       ⚠️ 这一项只被金鱼身与尾鳍淡色表用（build_tail_pale），
+          水面/涟漪/波光各有自己的槽位（PI_RIPPLE 等），不受影响。
+       ⚠️ 改这一项会让所有历史"金鱼颜色"截图作废 —— 是有意的（王总要的就是改它）。 */
+    {250, 246, 238}, {232,  90,  38}, {255, 200,  92}, {252, 204, 176},
     {158,  78,  38}, {232, 255, 248}, {246, 208, 138},
     /* 荷叶 / 浮萍（网页版 DAY.lilyFill / lilyEdge / lilyVein / weed / weedPale） */
     { 52, 156,  88}, { 22,  94,  54}, {104, 210, 140}, {116, 192,  96},
@@ -1300,12 +1308,43 @@ static int s_full;
    要用它做分发，所以必须在水面节之前声明）。这里留个索引注释，免得下次在
    "脏区"这节里找它。 */
 
+/* ==========================================================================
+   ★★ 第 47 轮：合并阈值重新定档（两个数字都提成宏，好扫档）
+   --------------------------------------------------------------------------
+   第 34 轮把膨胀阈值从 15% 放宽到 45%，当时的账是：
+     "多并一点 → 脏区面积 ↑（多填的水几乎免费）→ 矩形个数 ↓ →
+      鱼/荷叶被重复重画的次数 ↓（那才是真机 216ms/frame 的主项）"
+   那笔账在当年成立，因为当时水面每像素要算 dx²+dy² 再查两次表 *之外*，
+   还有一条 112ms/帧的**波带**横条（第 46 轮已整段删除）。
+
+   第 46 轮把「时间膨胀」修好之后，天平翻了回来，真机读数变了：
+     v10 昼 avg=132.96ms  max=162.34ms  脏区=46.7%  **rect=1**
+     剖 pal=0.03 step=6.98 | 水=5.64 鱼=53.01 涟=0.02 **荷=66.88** 料=0.04
+     重复 鱼画=5.00/6 荷画=4.96/6
+   ★ 「rect=1」是这份读数里最刺眼的一个：6 条鱼 + 6 片荷叶的脏框被**级联**
+     粘成了一个覆盖 46.7% 屏幕的大包围盒。于是每一帧：
+       · 水 memcpy 35866px（本来 6 个小框合计只要 ~4000px）；
+       · 那个大框必然命中 5~6 片荷叶 ⇒ **荷=66.88ms 成了最大项**（画一片荷叶
+         要比 memcpy 一行水贵两个数量级：叶芯 + 老叶斑 + 叶缘弧 + 伴生浮萍）。
+   ★ 也就是说：**第 34 轮要省的那笔"重复重画"，在 rect=1 时已经降到 1 遍/条
+     （鱼画=5.00/6、荷画=4.96/6 都 < 1），省无可省**；而它付的代价（大包围盒）
+     现在全落在「水 memcpy + 荷叶重画」上。天平翻了，阈值必须跟着往回收。
+   收多少 —— 用 `_tools/mergeladder47.py` 扫档决定，结论写在本文件末尾 H 节。 */
+#ifndef KOI_MERGE_GROW
+#define KOI_MERGE_GROW  145       /* 并集膨胀 ≤ 45% 就并（第 34 轮值，第 47 轮重定） */
+#endif
+#ifndef KOI_MERGE_OVLP
+#define KOI_MERGE_OVLP   40       /* 重叠面积 ≥ 较小者的 40% 就并 */
+#endif
+
 /* 合并值不值？ —— 判据一：**并集面积相对"两块各自面积之和"的膨胀率**。
    合并本身是必要的：LVGL 每帧的失效区个数有上限（LV_INV_BUF_SIZE），
    而且小矩形（饲料 8x8、涟漪）本来就该并起来。
    但"碰一下就并"会把散落的鱼 / 荷叶一路粘成一个包围盒 ——
    实测夜态 4 个框粘成 1 个 202x257（= 全屏 68% 脏区），而真正变化的像素只有 6%。
-   所以只在「几乎不膨胀」或「本来就大面积重叠」时才并。 */
+   所以只在「几乎不膨胀」或「本来就大面积重叠」时才并。
+   ★ 注意级联合并：A∪B 变大之后，再去并 C 时判据是拿**新框**算的，
+     于是"每步只膨胀 45%"可以一路滚成一个覆盖半屏的框 —— 第 47 轮的真因。 */
 static int merge_worth(int i, int x0, int y0, int x1, int y1)
 {
     int ux0 = s_rc[i].x0 < x0 ? s_rc[i].x0 : x0;
@@ -1322,7 +1361,7 @@ static int merge_worth(int i, int x0, int y0, int x1, int y1)
          多并一点 → 脏区面积 ↑（多填的水几乎免费）→ 矩形个数 ↓ →
          鱼/荷叶被重复重画的次数 ↓（那才是真机 216ms/frame 的主项）。
        数值会写进文档：脏区占比与"鱼画/荷画"两个读数都要一起重新采。 */
-    if (su * 100 <= (sa + sb) * 145) return 1;          /* 膨胀 ≤ 45% → 值得并 */
+    if (su * 100 <= (sa + sb) * KOI_MERGE_GROW) return 1;   /* 膨胀够小 → 值得并 */
 
     int ox0 = s_rc[i].x0 > x0 ? s_rc[i].x0 : x0;
     int oy0 = s_rc[i].y0 > y0 ? s_rc[i].y0 : y0;
@@ -1331,7 +1370,7 @@ static int merge_worth(int i, int x0, int y0, int x1, int y1)
     if (ox1 >= ox0 && oy1 >= oy0) {
         long sm = sa < sb ? sa : sb;
         long ov = (long)(ox1 - ox0 + 1) * (oy1 - oy0 + 1);
-        if (ov * 100 >= sm * 40) return 1;              /* 重叠 ≥ 40% → 值得并 */
+        if (ov * 100 >= sm * KOI_MERGE_OVLP) return 1;  /* 重叠够多 → 值得并 */
     }
     return 0;
 }
@@ -1962,30 +2001,42 @@ static const float KDEPTH[KSEG + 1] = {KOI_KDEPTH0, 0.90f, 1.00f, 0.78f, 0.55f, 
          物理原来写死 step(1/24s)，真机一帧 105ms ⇒ 鱼速与摆尾频率一起只剩 40%。
          那是先修的（修完时间膨胀比 1.000）。这五个乘数是在"时间已经对得上"之后
          再往上加的主观活泼度。
+
+   ★★ 第 47 轮回调：**P1 → P0.5（增量减半）**。
+      王总看完 v10 说「鱼太活跃了 稍微往下减成现在的一半」。
+      ⚠️ "减成一半"要减的是**相对 baseline 的增量**，不是把乘数砍到 0.5 倍：
+         全 1.00（P0）就是他上一轮嫌"不活泼"的那版，砍到 0.5 倍会比那还慢，
+         等于把上一轮的修复又退回去。所以取 P0 与 P1 的**中点**——
+         比"不活泼"那版明显活泼，但只有 v10 的一半劲儿。
+           SPD  1.35 → 1.18      HZ   1.10 → 1.05
+           TURN 1.30 → 1.15      WAND 1.40 → 1.20
+           GAIT 1.60 → 1.30      （GAIT 管冲刺占空，是"飘逸感"的主旋钮）
    --------------------------------------------------------------------------
-   台架实测四档（`_tools/lvsweep46.py`，KOI_FRAMEMS=105，稳态帧·鱼平均）：
+   台架实测（`_tools/lvsweep46.py`，KOI_FRAMEMS=105，稳态帧·鱼平均）：
      档位        巡游速度   转头速率   |弯曲|   冲刺占空
      P0 全1.00   27.1px/s  0.43rad/s  0.150   29.6%   ← 第 45 轮上板值（王总说"不活泼/飘逸"）
-     P1 活泼     47.0      0.69       0.182   50.2%   ← ★ 本轮默认
+     P0.5        37.0      0.54       0.162   40.7%   ← ★ 第 47 轮默认（P0 与 P1 中点）
+     P1 活泼     47.0      0.69       0.182   50.2%   ← 第 46 轮（王总说"太活跃"）
      P2 很活泼   58.0      0.82       0.195   57.7%
      P3 只快不冲 45.0      0.62       0.177   29.7%   ← 对照：证明"快"不等于"活泼"，
                                                         冲刺占空不动时照样"飘逸"
    四档的安全区越界都是 0.00px、金标准两条判据（脏区渲染 / 脏区覆盖）全 PASS。
+   ★ 档位表已备好，王总再要调只需改这五个宏，不用重新找参数。
    ========================================================================== */
 #ifndef KOI_LV_SPD
-#define KOI_LV_SPD      1.35f
+#define KOI_LV_SPD      1.18f     /* P0.5：P0(1.00) 与 P1(1.35) 的中点 */
 #endif
 #ifndef KOI_LV_HZ
-#define KOI_LV_HZ       1.10f
+#define KOI_LV_HZ       1.05f     /* P0.5：P0(1.00) 与 P1(1.10) 的中点 */
 #endif
 #ifndef KOI_LV_TURN
-#define KOI_LV_TURN     1.30f
+#define KOI_LV_TURN     1.15f     /* P0.5：P0(1.00) 与 P1(1.30) 的中点 */
 #endif
 #ifndef KOI_LV_WAND
-#define KOI_LV_WAND     1.40f
+#define KOI_LV_WAND     1.20f     /* P0.5：P0(1.00) 与 P1(1.40) 的中点 */
 #endif
 #ifndef KOI_LV_GAIT
-#define KOI_LV_GAIT     1.60f
+#define KOI_LV_GAIT     1.30f     /* P0.5：P0(1.00) 与 P1(1.60) 的中点 */
 #endif
 /* ★ 报脏外扩量（第 34 轮）。它要盖住"形状本身的变化"，而不仅仅是位移：
    一帧之内 AABB 还会因为 ① 转身（绕 (x,y) 转 dθ，最远点位移 ≈ R·dθ）
@@ -2079,6 +2130,19 @@ static float _spx[KSEG + 1], _spy[KSEG + 1], _spa[KSEG + 1];
 static float _lx[KSEG + 1], _ly[KSEG + 1], _rx[KSEG + 1], _ry[KSEG + 1];
 /* clampf / angdiff / s_pts / s_npts / pt_push / pt_quad / s_poly / to_q8
    已上提到第 4b 节 —— 第 7b 节的荷叶浮萍也要用，放在这里就来不及了。 */
+
+/* ★★ 第 47 轮：红斑**形状**两个参数（提成宏，供 _tools/spotshape47.py 出阶梯）
+   · KOI_SPOT_SEGS：斑的顶点数。14 = 旧值（视觉上就是个圆点）；
+                    8 = 本轮默认（明显不规则）。下限 6（再少就成三角形了）。
+   · KOI_SPOT_JIT ：顶点径向扰动幅度。0 = 正圆（旧观感）；0.30 = 本轮默认。
+   ⚠️ 两个宏只影响"形状"，**不消费 rnd**（扰动是确定性三角函数，见绘制处）——
+      所以改档位不会让随机序列错位（铁律 20）。 */
+#ifndef KOI_SPOT_SEGS
+#define KOI_SPOT_SEGS   8
+#endif
+#ifndef KOI_SPOT_JIT
+#define KOI_SPOT_JIT    0.30f
+#endif
 
 static void make_spots(koi_t *k)
 {
@@ -2353,9 +2417,41 @@ static void koi_draw(koi_t *k)
         for (int i = 0; i < n * 2; i++) save[i] = s_pts[i];
         stroke_pts(save, n, 1, 0.7f, s_pal[PI_KEDGE], 133);  // 0.52
     }
+    /* ★★ 第 47 轮：金属感 —— 在金黄鱼身上沿脊柱叠一条暗带（PI_KEDGE 半透明），
+       让"背暗腹亮"产生金属反射感。红白身不加：米白身上叠暗带会读成"鱼脏了"。
+       几何：spine 上下偏移 ±Wd·0.20 / ∓Wd·0.08 形成一条窄带，旋转/平移由 fill_poly
+       内部统一加（与 body_pts 同一条路），不在世界坐标里折腾。
+       成本：多一个 2·(KSEG+1)=14 顶点多边形 + 一次 fill_poly，相对鱼身 48 顶点 < 5%。
+       ⚠️ 顺序：必须在 stroke_pts 之后（save[] 已经 copy 完整鱼身轮廓）—— 这次 fill
+          改 s_pts/s_npts 不会污染下游 stroke 缓存。 */
+    if (isGold) {
+        s_npts = 0;
+        for (int i = 0; i <= KSEG; i++) {
+            float nx = -fsin_t(_spa[i]), ny = fcos_t(_spa[i]);
+            s_pts[s_npts*2]     = _spx[i] + nx * Wd * 0.20f;
+            s_pts[s_npts*2 + 1] = _spy[i] + ny * Wd * 0.20f;
+            s_npts++;
+        }
+        for (int i = KSEG; i >= 0; i--) {
+            float nx = -fsin_t(_spa[i]), ny = fcos_t(_spa[i]);
+            s_pts[s_npts*2]     = _spx[i] - nx * Wd * 0.08f;
+            s_pts[s_npts*2 + 1] = _spy[i] - ny * Wd * 0.08f;
+            s_npts++;
+        }
+        to_q8(s_npts, 0.0f, 0.0f);
+        fill_poly(s_poly, s_npts, s_pal[PI_KEDGE], NULL, 96);   // 0.375（第 47 轮 80→96，让金属感更立得住）
+    }
     PROF2_TICK(2);                                           /* 2 = ②鱼身 + 体缘暗线 */
 
-    /* ③ 红斑（黄金鲤没有；大正三色另加墨斑） */
+    /* ③ 红斑（黄金鲤没有；大正三色另加墨斑）
+       ★★ 第 47 轮：14 段椭圆 → **8 顶点径向扰动多边形**。
+       王总原话"红斑现在是 ●●● 三个圆点，要改成不规则的 2~3 块色斑"：
+       14 段椭圆太圆，看上去就是三粒红点。改成 8 个顶点，每个顶点的径向比 r
+       在 [0.70, 1.30] 间起伏，振幅由 cos(ang·2.3 + phase·1.7) 算出来，
+       phase = 斑索引 × 1.7 mod 2π → 3 块斑得到 3 种不同形态（确定性、不消费
+       rnd，与铁律 20 兼容）。8 顶点比 14 段还便宜（三角函数 14×2 → 8）。
+       ⚠️ 报脏没改：AABB 算的是"上帧 AABB ∪ 平移副本"，不关心具体形状，
+          r=1.3 偶尔超半轴的像素由 KOI_DIRT_MARGIN=6.0 兜住（台架已 PASS）。 */
     for (int s = 0; s < k->ns; s++) {
         int sg = (int)k->sp[s][0];
         float tt = k->sp[s][1];
@@ -2363,14 +2459,40 @@ static void koi_draw(koi_t *k)
         float ax = _spx[sg] + (_spx[sg + 1] - _spx[sg]) * tt;
         float ay = _spy[sg] + (_spy[sg + 1] - _spy[sg]) * tt;
         float off = k->sp[s][4] * Wd;
-        ellipse_pts(ax - fsin_t(aa) * off, ay + fcos_t(aa) * off,
-                    L * k->sp[s][2], Wd * k->sp[s][3], aa, 14);
+        float ph  = (float)s * 1.7f;
+        float sl = L * k->sp[s][2];
+        float sw = Wd * k->sp[s][3];
+        float ca = fcos_t(aa), sa = fsin_t(aa);
+        float cax = ax - sa * off, cay = ay + ca * off;
+        const int SEGS = KOI_SPOT_SEGS;
+        s_npts = SEGS;
+        for (int v = 0; v < SEGS; v++) {
+            float ang = ph + (float)v * (6.2832f / (float)SEGS);
+            float r = 1.0f + KOI_SPOT_JIT * fcos_t(ang * 2.3f + ph * 1.7f);
+            float rx = fcos_t(ang) * sl * r;
+            float ry = fsin_t(ang) * sw * r;
+            s_pts[v*2]     = cax + ca * rx - sa * ry;
+            s_pts[v*2 + 1] = cay + sa * rx + ca * ry;
+        }
         to_q8(s_npts, 0.0f, 0.0f);
         fill_poly(s_poly, s_npts, s_pal[PI_KSPOT], NULL, 236);   // 0.92
     }
     if (k->pat == 2) {
         static const uint8_t ink[3] = {26, 24, 30};
-        ellipse_pts(_spx[2], _spy[2], L * 0.055f, Wd * 0.20f, _spa[2], 12);
+        /* 大正三色墨斑同形态 —— phase 给 0.85 让它和红斑错开 */
+        float ph = 0.85f;
+        float ca = fcos_t(_spa[2]), sa = fsin_t(_spa[2]);
+        float sl = L * 0.055f, sw = Wd * 0.20f;
+        const int SEGS = KOI_SPOT_SEGS;
+        s_npts = SEGS;
+        for (int v = 0; v < SEGS; v++) {
+            float ang = ph + (float)v * (6.2832f / (float)SEGS);
+            float r = 1.0f + KOI_SPOT_JIT * fcos_t(ang * 2.3f + ph * 1.7f);
+            float rx = fcos_t(ang) * sl * r;
+            float ry = fsin_t(ang) * sw * r;
+            s_pts[v*2]     = _spx[2] + ca * rx - sa * ry;
+            s_pts[v*2 + 1] = _spy[2] + sa * rx + ca * ry;
+        }
         to_q8(s_npts, 0.0f, 0.0f);
         fill_poly(s_poly, s_npts, ink, NULL, 159);
     }
