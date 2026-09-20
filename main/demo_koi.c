@@ -2523,7 +2523,13 @@ static float _lx[KSEG + 1], _ly[KSEG + 1], _rx[KSEG + 1], _ry[KSEG + 1];
 #define GOLD_BACK_A    116
 #endif
 #ifndef GOLD_HEAD_A
-#define GOLD_HEAD_A     90
+/* ★ 第 54 轮：90 → 135。王总第 54 轮 v19 后反馈「黄金的鱼，鱼头处颜色有点深了」。
+   复盘：③ 头部略亮的 alpha 只 90，比 ① 两侧压暗(124) 弱一头；
+   再加上 ④ 尾根压暗的零区 s2=-0.10Hl 离中点很近 ⇒ 中段前部还在压暗，
+   两个暗层夹一束弱亮 ⇒ 净效果是头偏暗。
+   修：把 HEAD_A 加到 135（与 SIDE/TAIL 同档），并把 ③ 的"渐强起点"前挪到 -0.75Hl、
+   把 ④ 的"归零点"推到 +0.25Hl ⇒ 头端只剩 ①+②+③ 三层，无 ④ 干扰。 */
+#define GOLD_HEAD_A    135
 #endif
 #ifndef GOLD_TAIL_A
 #define GOLD_TAIL_A    108
@@ -2918,18 +2924,24 @@ static void koi_draw(koi_t *k)
         g.s3 = (int32_t)( Wq * 0.42f * 256.0f); g.a3 = 0;
         fill_poly(s_poly, s_npts, s_pal[PI_KGOLD_HI], &g, 256);
 
-        /* ③ 头部略亮：u 取**指向头**的方向（切向是头→尾，取负） */
+        /* ③ 头部略亮：u 取**指向头**的方向（切向是头→尾，取负）。
+              ★★ 第 54 轮修正：渐强起点从 -0.20Hl 提前到 -0.75Hl（从尾后段就开始渐亮），
+              满档从 +0.55Hl 提前到 +0.30Hl（更早到满）。原来中段还在压暗，
+              头端的"略亮"补不回来 ⇒ 读出来"头偏暗"。 */
         g.ux = (int32_t)rne_f2i(-tx * 256.0f); g.uy = (int32_t)rne_f2i(-ty * 256.0f);
         g.s0 = (int32_t)(-Hl * 1.10f * 256.0f); g.a0 = 0;
-        g.s1 = (int32_t)(-Hl * 0.20f * 256.0f); g.a1 = 0;
-        g.s2 = (int32_t)( Hl * 0.55f * 256.0f); g.a2 = GOLD_HEAD_A;
+        g.s1 = (int32_t)(-Hl * 0.75f * 256.0f); g.a1 = 0;
+        g.s2 = (int32_t)( Hl * 0.30f * 256.0f); g.a2 = GOLD_HEAD_A;
         g.s3 = (int32_t)( Hl * 1.10f * 256.0f); g.a3 = GOLD_HEAD_A;
         fill_poly(s_poly, s_npts, s_pal[PI_KGOLD_LT], &g, 256);
 
-        /* ④ 尾根压暗：尾端最强、中段归零 */
+        /* ④ 尾根压暗：尾端最强、中段归零。
+              ★★ 第 54 轮修正：归零点从 s2=-0.10Hl 推到 s2=+0.25Hl（中点之后才归零），
+              渐降区间也从 [-0.55,-0.10] 移到 [-0.30,+0.25] —— 头部完全脱离 ④ 的覆盖，
+              让头端只剩 ① 弱 + ② 背中央亮 + ③ 头部亮 三层亮色。 */
         g.s0 = (int32_t)(-Hl * 1.10f * 256.0f); g.a0 = GOLD_TAIL_A;
-        g.s1 = (int32_t)(-Hl * 0.55f * 256.0f); g.a1 = GOLD_TAIL_A;
-        g.s2 = (int32_t)(-Hl * 0.10f * 256.0f); g.a2 = 0;
+        g.s1 = (int32_t)(-Hl * 0.30f * 256.0f); g.a1 = GOLD_TAIL_A;
+        g.s2 = (int32_t)( Hl * 0.25f * 256.0f); g.a2 = 0;
         g.s3 = (int32_t)( Hl * 1.10f * 256.0f); g.a3 = 0;
         fill_poly(s_poly, s_npts, s_pal[PI_KGOLD_DK], &g, 256);
 
