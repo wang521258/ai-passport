@@ -304,7 +304,7 @@ static int     s_pal_night = -1;    // 已建立对应的 night×255；-1 = 还�
    ========================================================================== */
 #define LOOK_LILY_DEF   0
 #define LOOK_BGD_DEF    3    /* ★ 第 40 轮：水面改「纯色」，去掉 ΔG=56 那 22 条横条带（王总原话"跟足球场一样"） */
-#define LOOK_SPARK_DEF  0
+#define LOOK_SPARK_DEF  2    /* ★ 第 41 轮：关掉波光点（王总原话"星星点点的跟星星一样的是啥东西啊 去掉他"；第 37 轮默认开是为了"水面提亮版"观感，现在宁可干净） */
 #define LOOK_TAIL_DEF   0
 #define LOOK_NIGHT_DEF  1    /* ★ 昼夜量化是纯性能修正（王总要的"不卡"），默认打开 */
 /* ★ 昼夜过渡分成几阶（0 = 不量化 = 逐帧推进 = 改动前的现状）。
@@ -1742,7 +1742,12 @@ static void safe_spot(float x, float y)
 static const float KBEND[KSEG] = {0.14f, 0.24f, 0.23f, 0.21f, 0.18f};
 static const float KAMP[KSEG]  = {0.045f, 0.197f, 0.392f, 0.618f, 0.867f};
 #define KPHASE   0.92f
-static const float KDEPTH[KSEG + 1] = {0.46f, 0.88f, 1.00f, 0.80f, 0.56f, 0.30f};
+static const float KDEPTH[KSEG + 1] = {0.55f, 0.90f, 0.92f, 0.78f, 0.55f, 0.30f};
+                                       /* ★ 第 41 轮：原来 {0.46, 0.88, 1.00, 0.80, 0.56, 0.30}
+                                          王总原话"肚子处有点胖 鱼头有点尖"——
+                                          头 0.46→0.55（头变宽）、腹 1.00→0.92（腹部不那么大）、
+                                          中后段 0.80→0.78 / 0.56→0.55（微微收回）。
+                                          比例 belly/head 从 2.17 → 1.67。 */
 /* ★ 第 38 轮：王总「把初始鱼的大小做成现在的 3 倍」→ 2.0 → 6.0。
    ★ 第 39 轮：王总「把鱼做成现在的大小的一半」→ 6.0 → 3.0
    （= 原基线 2.0 的 1.5 倍，开局体长 17~23 × 3.0 = 51~69px）。
@@ -1974,8 +1979,8 @@ static void body_pts(void)
                      (_ly[0] - _spy[0]) * (_ly[0] - _spy[0]));
     pt_push(_lx[0], _ly[0]);
     pt_quad(_lx[0], _ly[0],
-            _spx[0] + fcos_t(ha) * hw * 1.75f, _spy[0] + fsin_t(ha) * hw * 1.75f,
-            _rx[0], _ry[0]);
+            _spx[0] + fcos_t(ha) * hw * 2.50f, _spy[0] + fsin_t(ha) * hw * 2.50f,
+            _rx[0], _ry[0]);                                 /* ★ 第 41 轮：head cap 1.75→2.50（让头部更圆，王总要"鱼头有点尖"） */
     for (int i = 0; i < KSEG; i++) {
         pt_quad(s_pts[(s_npts - 1) * 2], s_pts[(s_npts - 1) * 2 + 1],
                 _rx[i], _ry[i],
@@ -2041,7 +2046,7 @@ static void koi_draw(koi_t *k)
     s_bb_on = 1; bb_begin();          /* ★ 全程累加真实 AABB（收尾写回 k->ax0..） */
     koi_spine(k);
     float L = k->L * k->grow * (1.0f + 0.09f * (k->eat > 0 ? k->eat / 0.6f : 0.0f));
-    float Wd = L * 0.175f;
+    float Wd = L * 0.155f;                                  /* ★ 第 41 轮：0.175→0.155（收窄；KDEPTH 同时重排让头相对更宽，整体看着不"胖"） */
     int fine = (k->grow > 0.56f);
     int isGold = (k->pat == 1);
     const uint8_t *bodyCol = isGold ? s_pal[PI_KGOLD] : s_pal[PI_KBODY];
@@ -2102,18 +2107,11 @@ static void koi_draw(koi_t *k)
     }
     PROF2_TICK(3);                                           /* 3 = ③红斑 / 墨斑 */
 
-    /* ④ 脊背高光：只填纯色就是纸片，一条亮带才有圆柱体积感 */
-    if (fine) {
-        static const uint8_t wht[3] = {255, 255, 255};
-        float hi[KSEG * 2];
-        hi[0] = _spx[0] + (_spx[1] - _spx[0]) * 0.30f;
-        hi[1] = _spy[0] + (_spy[1] - _spy[0]) * 0.30f;
-        for (int i = 1; i < KSEG; i++) { hi[i * 2] = _spx[i]; hi[i * 2 + 1] = _spy[i]; }
-        float lw = Wd * 0.55f;
-        if (lw < 0.8f) lw = 0.8f;
-        stroke_pts(hi, KSEG, 0, lw, wht, 77);                // 0.30
-    }
-    PROF2_TICK(4);                                           /* 4 = ④脊背高光 */
+    /* ④ 脊背高光：只填纯色就是纸片，一条亮带才有圆柱体积感
+       —— ★ 第 41 轮整段关闭：王总原话"鱼的骨骼显现出来了，需要隐藏"
+       （这条白高光在白鱼（红白）身上看起来就像一条脊骨）。
+       体积感由 ① 鱼身渐变与 ③ 红斑本身承担，少这条高光鱼不会变纸片。 */
+    PROF2_TICK(4);                                           /* 4 = ④脊背高光（已关） */
 
     /* ⑤ 尾鳍：根部一律埋进身体（局部 x=0 起笔）盖住身体尾端那道横截面；
        描边才从"露出身体那一点"（sink）起笔 —— 第 24 轮定死的口径。 */
@@ -2350,9 +2348,10 @@ static void ripple_draw(const rip_t *rp)
         喂两轮就积一片，鱼吃不完的永远不退。现在补上（FOOD_LIFE 14）。
         ⚠️ 消散那一刻**必须标脏**，否则池底会留下一颗不会消失的饲料幽灵。
    ========================================================================== */
-#define FEED_N     10          /* 一次投喂真正产食物的饲料颗数 */
+#define FEED_N      9          /* ★ 第 41 轮：10→9（王总原话"保持在 8~9 粒"；drop_n 仍 4） */
 #define DROP_N      4          /* 只出涟漪、不产食物的"雨点" */
-#define FOOD_LIFE  14.0f       /* 漂浮食物寿命（秒）—— 与网页版同值 */
+#define FOOD_LIFE   2.0f       /* ★ 第 41 轮：14s→2s（王总要"落水后溅水花然后就消失"；
+                                 留 2s 给鱼追一下吃，不至于吃不到；过 2s 直接消失不再留底） */
 
 typedef struct { float x, y, sx, sy, tx, ty, t, dur, delay; int food; } pel_t;
 static pel_t s_pel[MAX_PEL];
@@ -2748,6 +2747,10 @@ static void step(float dt)
                     s_food_age[s_nfood] = 0.0f;                    /* 落水开始计时 */
                     s_nfood++;
                 }
+                /* ★ 第 41 轮：落水也溅一圈水花（王总要"落水后溅水花然后就消失"）
+                   与 DROP_N 的雨点共用 kind=1 通道；SPLASH_PLAN.drop=6 给投喂留足。 */
+                if (splash_ok(1, pe->tx, pe->ty, 6))
+                    ripple_add(pe->tx, pe->ty, 1, rnd_f(7, 14), rnd_f(0.5f, 0.75f), 0.70f, 1, 1, 0);
             } else if (splash_ok(1, pe->tx, pe->ty, 6)) {
                 ripple_add(pe->tx, pe->ty, 1, rnd_f(7, 14), rnd_f(0.5f, 0.75f), 0.70f, 1, 1, 0);
             }
