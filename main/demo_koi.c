@@ -2129,6 +2129,30 @@ static const float KDEPTH[KSEG + 1] = {KOI_KDEPTH0, 0.90f, 1.00f, 0.78f, 0.55f, 
 #ifndef EAT_RING_LIFE
 #define EAT_RING_LIFE  0.85f     /* 第 50 轮：0.42 → 0.85（真机 7fps 下 ≈ 6 帧） */
 #endif
+
+/* ★★ 第 51 轮：曾经试过"追食途中也冒水花"，**王总否掉了**（「这个不要啊」）。
+     保留这段说明免得以后再提：做法是在 seek 期间每 0.35s 往吻端放一个
+     小涟漪（r=5 / life=0.45）。否决理由（推测）：鱼一路冒水花会把"吃到那一下"
+     淹掉 —— 到处都是圈，反而看不出哪一下是真吃到了。
+   ⇒ **只在真吃到那一刻放一圈**（EAT_RING_RMAX=12 / EAT_RING_LIFE=0.85），
+      途中什么都没有。想再试就按上面三个数加回 SEEK_FX_*，别重新设计。 */
+
+/* ★ 第 51 轮：**落水的食物画不画**。
+     0 = 不画（王总「显示是隐藏的」）—— 它只作为鱼的追踪/进食目标存在；
+     1 = 画出来（第 43 轮之前的口径，池里能看到一颗颗饲料）。
+   ⚠️ 这是**纯显示开关**，不影响 s_food 的生命周期与鱼的追食逻辑。 */
+#ifndef KOI_FOOD_DRAW
+#define KOI_FOOD_DRAW  0
+#endif
+
+/* ★ 第 51 轮："嘴够得到"的判定半径里那个**固定余量**（px）。
+     旧值 3.0 ⇒ 总半径 = L·grow·0.0805 + 3.0 ≈ **4.9px**（L≈40、grow≈0.6）；
+     而真机 7fps 下鱼一帧就走 **3.9px** —— 窗口比步长还窄，鱼经常擦身而过不算吃到，
+     这就是王总说的「鱼碰到鱼食的几率很小」。
+     放到 6.0 ⇒ ≈7.9px，约等于鱼两帧的步长，够得着了。 */
+#ifndef KOI_EAT_REACH
+#define KOI_EAT_REACH  10.0f
+#endif
 /* 尾鳍立度：王总第 25 轮定档「25°」= TAIL_LV[1] */
 #define TK_TL 0.93f
 #define TK_TO 1.04f
@@ -2205,6 +2229,23 @@ static float _lx[KSEG + 1], _ly[KSEG + 1], _rx[KSEG + 1], _ry[KSEG + 1];
 #endif
 #ifndef KOI_SPOT_JIT
 #define KOI_SPOT_JIT    0.30f
+#endif
+
+/* ★ 第 51 轮：红斑的**整体尺寸**倍率（王总「红色在鱼身上覆盖的稍微再多点占比」）。
+     1.00 = 第 47 轮定下的形状（8 顶点 + 0.30 径向扰动）原尺寸
+     1.15 = 面积 +32%（"稍微多点"）
+     1.30 = 面积 +69%
+   ⚠️ 只乘在 sl/sw 上，**不动 k->sp[][] 的随机系数**（动它们会挪动全局随机序列）。
+   ⚠️ 放太大红斑会连成一片、盖住白底 —— 那就不是"红白"了，1.30 是上限。 */
+/* ★ 第 51 轮定档 **1.15**（王总「现在鱼的红斑占比要再多点」）。
+     阶梯与判据见 `_preview/红斑占比_三档51.png`（整屏统计 红斑/(红斑+白身)）：
+       ×1.00 ≈ 22.0%（第 47 轮原尺寸）
+       ×1.15 ≈ **27.7%**  ← ★ 现值，面积 +32%，"稍微再多点"
+       ×1.30 ≈  36.8%（再大就连成片、白底被盖掉，就不是"红白"了）
+   ⚠️ 别搞错顺序：王总原话是「先弄喂食特效」然后「红斑占比要再多点」——
+      **两件都要**，不是"做了喂食就不要红斑"。我曾误读成后者回滚过一次。 */
+#ifndef KOI_SPOT_SCALE
+#define KOI_SPOT_SCALE  1.15f
 #endif
 
 static void make_spots(koi_t *k)
@@ -2508,8 +2549,12 @@ static void koi_draw(koi_t *k)
         float ay = _spy[sg] + (_spy[sg + 1] - _spy[sg]) * tt;
         float off = k->sp[s][4] * Wd;
         float ph  = (float)s * 1.7f;
-        float sl = L * k->sp[s][2];
-        float sw = Wd * k->sp[s][3];
+        /* ★ 第 51 轮：红斑尺寸整体缩放（王总「红色我需要在鱼身上覆盖的稍微再多点占比」）。
+           ⚠️ 只改**尺寸**，不改 k->sp[][] 里那些随机系数 —— 动它们会改随机序列
+              （铁律 20），整池鱼的位置/斑的分布全跟着变。
+           面积 = π·sl·sw，所以线性放大 1.15 ⇒ 面积 +32%，1.30 ⇒ +69%。 */
+        float sl = L * k->sp[s][2] * KOI_SPOT_SCALE;
+        float sw = Wd * k->sp[s][3] * KOI_SPOT_SCALE;
         float ca = fcos_t(aa), sa = fsin_t(aa);
         float cax = ax - sa * off, cay = ay + ca * off;
         const int SEGS = KOI_SPOT_SEGS;
@@ -2865,11 +2910,16 @@ static void pellets_draw(void)
         to_q8(s_npts, 0.0f, 0.0f);
         fill_poly(s_poly, s_npts, col, NULL, a);
     }
+    /* ★ 第 51 轮：落水的食物**默认不画**（KOI_FOOD_DRAW=0）。
+       王总「停留加回来 但是显示是隐藏的」—— 它只作为鱼的追踪/进食目标存在，
+       屏上看不见。想 A/B 对照"看得见的版本"就 -DKOI_FOOD_DRAW=1 编一版。 */
+#if KOI_FOOD_DRAW
     for (int i = 0; i < s_nfood; i++) {                    // 已落定的食物
         ellipse_pts(s_food_x[i], s_food_y[i], 1.6f, 1.6f, 0.0f, 8);
         to_q8(s_npts, 0.0f, 0.0f);
         fill_poly(s_poly, s_npts, col, NULL, 256);
     }
+#endif
 }
 
 /* ==========================================================================
@@ -3072,7 +3122,8 @@ static void koi_step(koi_t *k, float dt)
     float kh = k->L * k->grow * 0.55f;
 
     float tx = 0, ty = 0;
-    int ti = -1;
+    int ti = -1;      /* 飞行中的目标在 s_pel 的下标，-1 = 无 */
+    int fi = -1;      /* ★ 第 51 轮：落水后的目标在 s_food 的下标，-1 = 无 */
     float best = 1e9f;
     /* ★ 第 43 轮：找食目标从 s_food（落地后的颗粒）改为 s_pel（飞行中的颗粒）。
        王总原话"喂食后不需要把食物留停留在水池 其他不落池"——
@@ -3093,10 +3144,24 @@ static void koi_step(koi_t *k, float dt)
         if (!pe->food) continue;                     /* 不捕雨点 */
         float dx = pe->tx - k->x, dy = pe->ty - k->y;
         float dd = dx * dx + dy * dy;
-        if (dd < best) { best = dd; ti = m; tx = pe->tx; ty = pe->ty; }
+        if (dd < best) { best = dd; ti = m; fi = -1; tx = pe->tx; ty = pe->ty; }
     }
-    if (ti >= 0 && best > 340.0f * 340.0f) ti = -1;      // 感知半径 ≈ 全屏
-    k->seek = (ti >= 0);
+    /* ★★ 第 51 轮：**落水后的颗粒也当目标**（s_food）。
+       王总：「饲料进水 鱼应该随机往饲料方向游动 这样就有交互感了」
+             「停留加回来 但是显示是隐藏的」
+       ⇒ 饲料落水后**继续存在**（鱼有东西可追、可吃），但**屏幕上不画**
+         （pellets_draw 里那段被 KOI_FOOD_DRAW 关掉了）。
+         这样既有"鱼冲过去吃"的交互，又不会看到池底积一堆饲料 ——
+         第 43 轮「其他不落池」那条要求保住了。
+       ⚠️ 不加这一段的后果：饲料落水即消失，鱼游到落点时那儿已经空了，
+         于是"追了半天啥也没吃到" —— 就是王总说的"碰到几率很小"。 */
+    for (int m = 0; m < s_nfood; m++) {
+        float dx = s_food_x[m] - k->x, dy = s_food_y[m] - k->y;
+        float dd = dx * dx + dy * dy;
+        if (dd < best) { best = dd; ti = -1; fi = m; tx = s_food_x[m]; ty = s_food_y[m]; }
+    }
+    if (best > 340.0f * 340.0f) { ti = -1; fi = -1; }    // 感知半径 ≈ 全屏
+    k->seek = (ti >= 0 || fi >= 0);
 
     float vx = fcos_t(k->headA), vy = fsin_t(k->headA);  // 前进惯性项，不能省
     if (ti >= 0) {
@@ -3245,16 +3310,39 @@ static void koi_step(koi_t *k, float dt)
     swim_push(&k->x, &k->y, kh + 3.0f);
 
     /* 吃食：判定点 = 吻端 → 吃食圆也落在嘴上（第 18 轮口径）。
-       第 43 轮起吃的是 s_pel[ti]（飞行中的颗粒），不再走 s_food。 */
+       ★★ 第 51 轮：目标**两类都吃**
+         ① s_pel[ti] —— 飞行中的颗粒（第 43/50 轮口径，鱼在空中接住）
+         ② s_food[fi] —— **落水后漂在水面**的颗粒（第 41 轮口径，本轮加回来）
+       ★★ 判定半径也放大（+3.0 → KOI_EAT_REACH 默认 6.0）：
+         旧值 = L·grow·0.0805 + 3.0 ≈ **4.9px**（L≈40、grow≈0.6），
+         而真机 7fps 下鱼一帧就走 **3.9px** —— 判定窗口只有 4.9px，
+         鱼很容易"擦着饲料游过去"却不算吃到，这正是王总说的
+         「鱼碰到鱼食的几率很小」。放到 ≈7.9px 才对得上鱼一帧的步长。 */
     float mx = k->x + fcos_t(k->headA) * k->L * k->grow * KMOUTH;
     float my = k->y + fsin_t(k->headA) * k->L * k->grow * KMOUTH;
+    float eatR = k->L * k->grow * 0.0805f + KOI_EAT_REACH;
+    int got = 0;
     if (ti >= 0 && ti < s_npel && s_pel[ti].food && s_pel[ti].delay <= 0 &&
-        hypotf(tx - mx, ty - my) < k->L * k->grow * 0.0805f + 3.0f) {
-        /* ★ 第 43 轮：从 s_pel 把这颗饲料挖掉（飞行中的颗粒直接消失，不留底）；
+        hypotf(tx - mx, ty - my) < eatR) {
+        /* 从 s_pel 把这颗饲料挖掉（飞行中的颗粒直接消失，不留底）；
            报脏按颗粒当前位置 ≈ (pe->x, pe->y)，下一帧水色把它盖掉。 */
         dirty_add_ext(floor_f2i(s_pel[ti].x) - 3, floor_f2i(s_pel[ti].y) - 3,
                       (int)ceilf(s_pel[ti].x) + 4, (int)ceilf(s_pel[ti].y) + 4);
         s_pel[ti] = s_pel[--s_npel];
+        got = 1;
+    } else if (fi >= 0 && fi < s_nfood && hypotf(tx - mx, ty - my) < eatR) {
+        /* 吃掉水里漂着的那颗：按索引删（尾部搬上来，与 s_pel 同一套）。
+           ⚠️ 三个数组要**一起搬**，只搬 x/y 会把 age 张冠李戴，
+           于是某颗饲料会"刚落水就到 2 秒"被提前清掉。 */
+        dirty_add_ext(floor_f2i(s_food_x[fi]) - 4, floor_f2i(s_food_y[fi]) - 4,
+                      (int)ceilf(s_food_x[fi]) + 5, (int)ceilf(s_food_y[fi]) + 5);
+        s_food_x[fi]   = s_food_x[s_nfood - 1];
+        s_food_y[fi]   = s_food_y[s_nfood - 1];
+        s_food_age[fi] = s_food_age[s_nfood - 1];
+        s_nfood--;
+        got = 1;
+    }
+    if (got) {
         s_satiety = clampf(s_satiety + 0.05f, 0.0f, 1.0f);
         k->eat = 0.6f;
         k->biteT = BITE_T;                                // 啄食停顿：圆灭之前嘴不离开圆
@@ -3459,15 +3547,27 @@ static void step(float dt)
         }
         float px0 = pe->x, py0 = pe->y;
         pe->t += dt / pe->dur;
-        if (pe->t >= 1.0f) {
-            if (pe->food) {
-                /* ★ 第 43 轮：王总"其他不落池" —— 落水那一帧不再入 s_food，
-                   只 ripple_add 一圈雨点那样的水花。鱼没在飞行中接住就丢了。 */
-                if (splash_ok(1, pe->tx, pe->ty, 6))
+            if (pe->t >= 1.0f) {
+                if (pe->food) {
+                    /* ★★ 第 51 轮：**落水后入 s_food，但屏幕上不画**（KOI_FOOD_DRAW=0）。
+                       王总原话：「停留加回来 但是显示是隐藏的」——
+                         要"停留"：鱼才有东西可追、可吃（否则游到落点扑空，
+                                   就是他说的"碰到鱼食的几率很小"）；
+                         要"隐藏"：屏上不出现留在池里的饲料（第 43 轮「其他不落池」）。
+                       这两个要求**不矛盾** —— 存在 ≠ 可见。
+                       ⚠️ 有 FOOD_LIFE(=2s) 兜底：2 秒没被吃就自己消失，不会无限堆积。
+                       ⚠️ 雨点（food=0）**不入池**，只留一圈水花，保持"下雨"的观感。 */
+                    if (s_nfood < MAX_FOOD) {
+                        s_food_x[s_nfood]   = pe->tx;
+                        s_food_y[s_nfood]   = pe->ty;
+                        s_food_age[s_nfood] = 0;
+                        s_nfood++;
+                    }
+                    if (splash_ok(1, pe->tx, pe->ty, 6))
+                        ripple_add(pe->tx, pe->ty, 1, rnd_f(7, 14), rnd_f(0.5f, 0.75f), 0.70f, 1, 1, 0);
+                } else if (splash_ok(1, pe->tx, pe->ty, 6)) {
                     ripple_add(pe->tx, pe->ty, 1, rnd_f(7, 14), rnd_f(0.5f, 0.75f), 0.70f, 1, 1, 0);
-            } else if (splash_ok(1, pe->tx, pe->ty, 6)) {
-                ripple_add(pe->tx, pe->ty, 1, rnd_f(7, 14), rnd_f(0.5f, 0.75f), 0.70f, 1, 1, 0);
-            }
+                }
             /* ★★ 第 34 轮修正②（金标准判据指出的第二个漏洞）：
                **落水那一帧，饲料画在落点，不是帧初位置**。
                走进本分支时 pe->t 已经 ≥ 1，pellet 不再按 (pe->x,pe->y) 画 ——
