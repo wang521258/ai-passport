@@ -125,6 +125,14 @@ static inline int32_t floor_f2i(float v)
 /* 开局三屏的位图资源（首页整屏设计稿 / 7 枚档位图章 / UI 文字小图）。
    全是 const，进 flash；由 _tools/koi_assets_gen.py 从网页版抽出，**勿手改**。 */
 #include "koi_assets.h"
+/* ★★ 第 44 轮：鱼池背景 = 王总给的水下光斑图（240x320 RGB565，153,600 B）。
+   由 _tools/bgbake43.py 烘焙，**勿手改**。它是**静态底图**：
+   进池子那一帧整屏铺一次，之后每次重画脏矩形 = 从这张图里把那一段 memcpy 回来
+   —— 也就是"背景只画一次、之后只刷新鱼动过的那几块"。
+   ⚠️ 别把它当"每帧重画整张"：water_rect/bg_rect 只在**脏矩形**里被调用。
+   ⚠️ 它进 .rodata（flash），**不占 RAM** —— C3 只有 ~320KB DRAM，而 s_fb 已经吃掉 153,600 B
+      （铁律 21）。所以"背景备份一份到 RAM"这条路是死的，必须从 flash 读。 */
+#include "koi_bg.h"
 
 static const char *TAG = "koi";
 
@@ -1068,6 +1076,14 @@ static void pick_colors(uint8_t *out, int n, int nk)
    320 个 uint16 = 640 B，比原来 320×32 的 LUT（20 KB！）省得离谱，而且查表变直写。 */
 static uint16_t s_water_row[KH];
 
+/* ★★ 第 44 轮：背景源开关。1 = 王总给的照片（koi_bg.h，从 flash 按行拷）；
+   0 = 程序化纵向渐变（第 34~43 轮那套，靠 LOOK_BGD 档位调色）。
+   默认 1 —— 王总这次的原话是「你把图片做成鱼池背景」。
+   ⚠️ 留 0 这条回退路径不是"死代码"：它是**逐字节对拍**用的基线 ——
+      台架把 KOI_BGPHOTO=0 跑一遍，能证明"照片这条路只改了底图、没碰别的绘制"。
+      这与第 37 轮"档 0 = 改动前逐字节等价"是同一套做法（铁律 14）。 */
+static int s_bg_photo = 1;
+
 static void water_row_build(void)
 {
     const uint8_t *wt = s_pal[PI_WTOP], *wb = s_pal[PI_WBOT];
@@ -1106,8 +1122,25 @@ static int build_palette(float night)
     return 1;
 }
 
-/* 水面（含常驻波光点）填一个矩形 */
+/* 水面（含常驻波光点）填一个矩形 —— ★★ 第 44 轮起这里是**分发口**：
+   池子背景改成王总给的照片之后，"填水"有两种实现，靠 s_bg_photo 选：
+     · 1 = 照片背景（bg_rect，从 flash 按行 memcpy）—— 第 44 轮起的默认
+     · 0 = 程序化纵向渐变（water_rect_proc）—— 回退路径，也是 LOOK_BGD 档位还在的意义
+   两个实现都自带 spark_overlay，所以**调用点完全不用知道用的是哪个**。
+   ⚠️ 别把分发写进调用点（scene_draw / 开局屏各写一次 if）—— 两处早晚跑偏，
+      而且"漏改一处"的表现是"某一屏还是老水色"，很难定位。 */
+static void spark_overlay(int x0, int y0, int x1, int y1);   /* 第 44 轮抽出的公共叠加层 */
+static KOI_HOT void bg_rect(int x0, int y0, int x1, int y1);
+static KOI_HOT void water_rect_proc(int x0, int y0, int x1, int y1);
+
 static KOI_HOT void water_rect(int x0, int y0, int x1, int y1)
+{
+    if (s_bg_photo) { bg_rect(x0, y0, x1, y1); return; }
+    water_rect_proc(x0, y0, x1, y1);
+}
+
+/* 程序化水面：每行一个颜色（纵向渐变），第 34 轮起就没有 LUT 了。 */
+static KOI_HOT void water_rect_proc(int x0, int y0, int x1, int y1)
 {
     demo_koi_who(1, -1);                          /* ★ 归属探针：这一片是"水" */
     for (int y = y0; y <= y1; y++) {
@@ -1120,6 +1153,35 @@ static KOI_HOT void water_rect(int x0, int y0, int x1, int y1)
 #endif
         }
     }
+    spark_overlay(x0, y0, x1, y1);
+}
+
+/* ★★ 第 44 轮：照片背景填一个矩形 —— 从 flash 里把这一段的像素**按行拷回来**。
+   这就是"背景只绘制一次"的全部机制：进池子那一帧整屏铺一遍（s_full），
+   之后每次只重画脏矩形，脏矩形里先用这一行把底图恢复，再把鱼/荷叶画上去。
+   ⚠️ 用 memcpy 按行拷而不是逐像素：s_fb 与 koi_bg 都是行主序连续，
+      x0..x1 在这一行里也是连续的，一行就是一次 memcpy —— 比逐像素少 240 倍的循环开销。
+   ⚠️ koi_bg 在 flash（memory-mapped，过 cache），不在 RAM：C3 的 DRAM 装不下第二份 153,600 B
+      （铁律 21）。所以这里是"从 flash 读"，不是"从 RAM 备份读"。
+   ⚠️ 别把这段搬进"每帧整屏重画"：它只在**脏矩形**里被调用，面积通常 15%~35%。 */
+static KOI_HOT void bg_rect(int x0, int y0, int x1, int y1)
+{
+    demo_koi_who(1, -1);                          /* 归属探针：这一片是"背景" */
+    int n = (x1 - x0 + 1) * 2;
+    for (int y = y0; y <= y1; y++) {
+        memcpy(&s_fb[y * KW + x0], &koi_bg[y * KW + x0], (size_t)n);
+#ifdef KOI_HOST_PROBE
+        for (int x = x0; x <= x1; x++) WHO_PUT(x, y);
+#endif
+    }
+    spark_overlay(x0, y0, x1, y1);
+}
+
+/* 波光点（44 个，按矩形过滤，代价可忽略）。
+   ★ 第 44 轮抽成独立函数：照片背景那条路径也要在同一层叠波光 ——
+   复制一份必然两边慢慢跑偏（铁律 8 那一族：draw 与 dump 必须共用一函数）。 */
+static void spark_overlay(int x0, int y0, int x1, int y1)
+{
     /* ★ 第 37 轮「波光点档」—— 王总：「上面还有星星点点的杂质不知道是怎么回事」。
        量出来的真值（参考图样 vs 固件，同一把尺子量"彩色偏移量"）：
          参考图样 波光点只比水色亮 **+20 / +28 / +23**（是"水色提亮版"，不是白点）
@@ -1172,6 +1234,10 @@ static KOI_HOT void water_rect(int x0, int y0, int x1, int y1)
 static int s_nrect;
 static struct { int x0, y0, x1, y1; } s_rc[MAX_RECT];
 static int s_full;
+
+/* ★★ 第 44 轮：背景源开关在这里（真正那份声明在"6. 水面"节首 —— water_rect
+   要用它做分发，所以必须在水面节之前声明）。这里留个索引注释，免得下次在
+   "脏区"这节里找它。 */
 
 /* 合并值不值？ —— 判据一：**并集面积相对"两块各自面积之和"的膨胀率**。
    合并本身是必要的：LVGL 每帧的失效区个数有上限（LV_INV_BUF_SIZE），
@@ -1759,7 +1825,22 @@ static const float KDEPTH[KSEG + 1] = {0.50f, 0.90f, 1.00f, 0.78f, 0.55f, 0.30f}
    倍率**必须同时**作用在体长 / 游速 vT / 吃食 / 同类避让 / 边界硬边距 ——
    统一从 kh = L*grow*0.55 推（第 15 轮定下的规矩），所以这里改一个数就够，
    下面每处 `* KOI_SCALE` 与每个从 kh 推的量都会跟着变。 */
+/* ★★ 第 44 轮：王总先给了**绝对像素**规格（体长 24~26 / 体宽 12~14 ...），
+   按规格做了 4 档尺寸阶梯（_preview/鱼尺寸_档位阶梯44.png，工具 _tools/koiladder44.py）
+   给他挑，他的回答是「鱼尺寸都不想要 还回归咱们自己的鱼」
+   —— 所以**体量一个数都没动**，回到第 43 轮上板版。
+   下面这两个宏留着（值 = 原值），因为：
+     · `KOI_WD` 把原来写死在 koi_draw 里的 0.175f 提成了名字 ——
+       以后真要调体宽，是一个数的事，不用再去正文里找；
+     · 台架的 `KOI_CDEFS=-DKOI_SCALE=... -DKOI_WD=...` 尺寸阶梯工具还能直接用
+       （铁律 14：观感类改动先出阶梯让王总挑，别自己拍 —— 这次就是靠它一次问清的）。
+   ⚠️ 值必须与第 43 轮逐位相同：3.0f / 0.175f。改一个数就会改画面。 */
+#ifndef KOI_SCALE
 #define KOI_SCALE       3.0f
+#endif
+#ifndef KOI_WD
+#define KOI_WD          0.175f
+#endif
 #define GROW_MAX        1.35f
 #define GROW_PER_PELLET 0.018f
 /* ★ 报脏外扩量（第 34 轮）。它要盖住"形状本身的变化"，而不仅仅是位移：
@@ -1839,6 +1920,12 @@ static float _lx[KSEG + 1], _ly[KSEG + 1], _rx[KSEG + 1], _ry[KSEG + 1];
 static void make_spots(koi_t *k)
 {
     if (k->pat == 1) { k->ns = 0; return; }               // 黄金鲤不该有红斑
+    /* ★★ 第 44 轮：这里曾按王总的规格「花纹：2~3 块大色斑」改成只出大斑
+       （原版是大小斑交替 `big = (i % 2 == 0)`）。他看过尺寸阶梯后说
+       「鱼尺寸都不想要 还回归咱们自己的鱼」，已**逐字撤回**。
+       记一句当时的观察，免得下次重新踩：体长缩到 25px 之后，小斑 sl=0.052~0.072
+       只剩 1.3px，在屏上就是一粒噪点 —— 也就是说"小斑"这个设计只在
+       L≈40px 以上才读得出来，是**跟体量强耦合**的。真要把鱼缩小，这条必须一起改。 */
     int n = (k->pat == 2) ? (3 + (rnd_f(0, 1) < 0.5f ? 0 : 1))
                           : (2 + (rnd_f(0, 1) < 0.75f ? 1 : 0));
     float head = rnd_f(0, 0.6f);
@@ -2056,7 +2143,8 @@ static void koi_draw(koi_t *k)
     s_bb_on = 1; bb_begin();          /* ★ 全程累加真实 AABB（收尾写回 k->ax0..） */
     koi_spine(k);
     float L = k->L * k->grow * (1.0f + 0.09f * (k->eat > 0 ? k->eat / 0.6f : 0.0f));
-    float Wd = L * 0.175f;                                  /* ★ 第 43 轮：0.155→0.175（王总"鱼身体有点显长 肚子稍微宽点点"——整体加宽，配合 KDEPTH[2] 0.92→1.00 把肚子收回一点，整体比例更接近原 r40 但 belly/head 比从 1.84 改到 2.00） */
+    float Wd = L * KOI_WD;                                  /* ★ 第 43 轮：0.155→0.175（王总"鱼身体有点显长 肚子稍微宽点点"——整体加宽，配合 KDEPTH[2] 0.92→1.00 把肚子收回一点，整体比例更接近原 r40 但 belly/head 比从 1.84 改到 2.00）
+                                                               ★ 第 44 轮：写死的 0.175 提成 KOI_WD 宏（值仍是 0.175）—— 第 44 轮试过按王总的像素规格改成 0.295，他看过阶梯后说"还回归咱们自己的鱼"，已撤回。 */
     int fine = (k->grow > 0.56f);
     int isGold = (k->pat == 1);
     const uint8_t *bodyCol = isGold ? s_pal[PI_KGOLD] : s_pal[PI_KBODY];
@@ -2132,6 +2220,12 @@ static void koi_draw(koi_t *k)
         float sink = segLen * TJ_SINK;
         float flap = fsin_t(k->phase - (float)KSEG * KPHASE - 0.85f) *
                      (0.16f + k->waveAmp * 0.95f) * L * 0.20f * TJ_FLAP;
+        /* ★★ 第 44 轮：这里曾按王总的规格「尾鳍 7×9 px」把尾鳍放大
+           （tl 0.238L→0.365L、tw 从挂在 L 上改成挂在 Wd 上，好让"尾鳍/体宽"
+           不随体宽系数变）。他看过尺寸阶梯后说「鱼尺寸都不想要 还回归咱们自己的鱼」，
+           已**逐字撤回** —— 注意 tw 必须回到 `L*0.094`（不是等价的 Wd*0.537），
+           因为 KOI_WD 已经回到 0.175，两者虽数学等价但浮点路径不同，不是逐位相同。
+           下一轮若真要动尾鳍，先跑 _tools/koimeasure44.py 把绝对像素算出来。 */
         float tl = L * 0.238f * TK_TL + sink;
         float to = Wd * KDEPTH[KSEG] * 1.10f * TK_TO;
         float tw = L * 0.094f * TK_TW;
@@ -3080,8 +3174,17 @@ static void setup_koi_icon(int pat, float cx, float cy2)
         {3.0f, 0.50f, 0.105f, 0.40f,  0.10f},
     };
     static koi_t ik;                             /* static：不占栈（koi_t 有 sp[4][5]） */
+    /* ★★ 第 44 轮：L 32 曾按"体宽系数变成 0.295"改成 5.6/KOI_WD，好让图标
+       （固定尺寸卡片里的一枚装饰）不跟着鱼变胖而长高。体宽撤回 0.175 之后，
+       这里逐字回到 32.0f。
+       ⚠️ 留一句给下次：**图标的 L 与 KOI_WD 是耦合的** —— 图标全高 = 4×L×KOI_WD，
+          卡片留白是按旧值调好的。真要改 KOI_WD，这里必须一起改，
+          否则 `ik.y = cy2 − h/2` 会把鱼顶出卡片（32 × 0.295 那版就是 37.8px 高）。 */
     const float L  = 32.0f;
-    float Wd = L * 0.175f;
+    float Wd = L * KOI_WD;                       /* ★ 第 44 轮：0.175 → KOI_WD（值仍是 0.175）。
+                                                    这里只用来算**画布留白**（下面的 w/h），
+                                                    而 koi_draw 内部已经用 KOI_WD 画了 ——
+                                                    两处必须同一个数，否则图标会被画布裁掉。 */
     /* 画布尺寸按"游姿伸出去的最远处"留（与网页版同式）：
        胸鳍会扇到 ±1.5 倍体半宽，尾楔往后 0.26L */
     float w = ceilf(L * 1.45f) + 8.0f;
@@ -3538,6 +3641,15 @@ void demo_koi_key(bsp_btn_t btn, bsp_btn_ev_t ev)
       然后置 s_full = 1 整屏重画 —— 否则新档只在"恰好碰到的脏区"里生效，
       画面一半新一半旧（铁律 13 那一族：状态变了但没人重建）。
    ⚠️ night 档切换时 s_night_log 要跟着对齐，不然量化档会先蹦一下。 */
+/* ★★ 第 44 轮：背景源开关的运行时入口（只给台架用）。
+   0 = 程序化渐变（第 43 轮那套），1 = 照片背景。用来做 A/B 与逐字节对拍。 */
+void demo_koi_set_bgphoto(int on)
+{
+    s_bg_photo = on ? 1 : 0;
+    s_full = 1;                 /* 换底图必须整屏重画一次，否则半屏照片半屏渐变 */
+    s_first_frame = 1;
+}
+
 void demo_koi_set_look(int lily, int bgd, int spark, int tail, int night)
 {
     s_look_lily  = lily;
