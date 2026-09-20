@@ -303,7 +303,7 @@ static int     s_pal_night = -1;    // 已建立对应的 night×255；-1 = 还�
                  **每 6.5 行跳一级** → 肉眼就是"横横横的一段"
    ========================================================================== */
 #define LOOK_LILY_DEF   0
-#define LOOK_BGD_DEF    0
+#define LOOK_BGD_DEF    3    /* ★ 第 40 轮：水面改「纯色」，去掉 ΔG=56 那 22 条横条带（王总原话"跟足球场一样"） */
 #define LOOK_SPARK_DEF  0
 #define LOOK_TAIL_DEF   0
 #define LOOK_NIGHT_DEF  1    /* ★ 昼夜量化是纯性能修正（王总要的"不卡"），默认打开 */
