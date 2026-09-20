@@ -2247,7 +2247,30 @@ static const float KDEPTH[KSEG + 1] = {KOI_KDEPTH0, 0.90f, 1.00f, 0.78f, 0.55f, 
 #endif
 
 #define GROW_MAX        1.35f
-#define GROW_PER_PELLET 0.018f
+#define GROW_PER_PELLET 0.018f   /* ★ 第 55 轮起**已停用**（见下面 FEED_PER_GROW 的注释） */
+
+/* ★★ 第 55 轮：成长改成**离散** —— 按「玩家按了几次喂食键」，不再按吃到的颗数。
+   王总原话：「喂食100次成长一次 直到长到最高值就不长 / 喂食时候照常吃食
+             但是不长体型 / 玩家按100次喂食后 成长一次」
+             第 55 轮补充澄清：「跟几粒饲料 游动 吃食都没关系」
+   ⇒ 三条硬口径：
+     ① 计数器 = **do_feed() 被调用的次数**（玩家按一次喂食键 = 1），
+        与 FEED_N（一次撒 9 颗）、鱼有没有吃到、吃了几颗**全部无关**；
+     ② 鱼照常追食、照常吃、照常有吃到特效 + 饱食度 —— **只是不加 grow**；
+     ③ 满 FEED_PER_GROW 次 ⇒ 整池鱼 grow += GROW_STEP 一档，封顶 GROW_MAX。
+   ⚠️ 为什么"整池一起长"：计数是按玩家的键，不是按鱼，没有"哪条鱼吃了"这个概念。
+   ⚠️ ⚠️ grow **进速度公式** vT = (…) × (0.62 + 0.46·grow)（第 52 轮量出来的）：
+        grow 0.62→1.35 速度涨 37%。改成离散后涨得**慢得多**（原来是吃 42 颗就满级），
+        正合王总"鱼别游那么快"的抱怨方向。
+   ⚠️ GROW_STEP 是**一档跳多少**：L≈44 时 0.15 ⇒ 体长 +6.6px，一眼看得出来。
+       从开局 grow≈0.62 到 1.35 约需 5 档 = 500 次喂食满级 —— 慢养成的节奏。
+       要更快就调大 GROW_STEP，要更慢就调小。 */
+#ifndef FEED_PER_GROW
+#define FEED_PER_GROW   100
+#endif
+#ifndef GROW_STEP
+#define GROW_STEP       0.15f
+#endif
 
 /* ==========================================================================
    ★★ 第 46 轮：活泼度档位（王总「鱼活泼感一定要弄出来」）
@@ -3521,6 +3544,16 @@ static pel_t s_pel[MAX_PEL];
 static int   s_npel;
 static float s_food_x[MAX_FOOD], s_food_y[MAX_FOOD], s_food_age[MAX_FOOD];
 static int   s_nfood;
+/* ★★ 第 55 轮：玩家按喂食键的累计次数（满 FEED_PER_GROW 长一档后清零）。
+   ⚠️ 与"鱼吃到几颗"完全无关 —— 王总第 55 轮澄清「跟几粒饲料 游动 吃食都没关系」。 */
+static uint32_t s_feed_count = 0;
+static void grow_step_all(void);      /* 定义在 do_feed 之后 */
+#ifdef KOI_HOST_PROBE
+/* ★ 第 55 轮：台架判据用——累计"鱼吃到食物"的次数。
+   判"成长跟吃食解耦"必须能同时读到这个数：只有"吃了很多次但 grow 没动"
+   才证明是真解耦，而不是"压根没吃到"。真机不带 KOI_HOST_PROBE ⇒ 不存在。 */
+static uint32_t s_eaten = 0;
+#endif
 
 static void pellets_draw(void)
 {
@@ -3620,6 +3653,33 @@ static void do_feed(void)
         pe->x = pe->tx; pe->y = pe->ty;
         pe->t = 0; pe->dur = 0.36f; pe->delay = rnd_f(0, 0.9f);
         pe->food = 0;
+    }
+
+    /* ★★ 第 55 轮：成长计数 —— **只认这一次按键**，不看撒了几颗、鱼有没有吃到。
+       满 FEED_PER_GROW 次 ⇒ 整池鱼长一档（见上面那组宏的长注释）。
+       ⚠️ 计数器放在 do_feed() 末尾而不是"鱼吃到"里，就是王总那句
+          「跟几粒饲料 游动 吃食都没关系」的字面实现。 */
+    s_feed_count++;
+    if (s_feed_count >= FEED_PER_GROW) {
+        s_feed_count = 0;
+        grow_step_all();
+    }
+}
+
+/* ★★ 第 55 轮：整池鱼成长一档。
+   ⚠️⚠️ **必须**在改完 grow 之后把鱼推回安全区：安全区余量 kh = L·grow·0.55，
+      grow 一档跳 0.15 ⇒ kh 跳 L·0.0825 ≈ **4.5px**（L≈55 的成鱼更多），
+      而第 45 轮量出来的"吃一颗(0.018)造成的 kh 跳变"才 0.68px 就已经越过界了
+      （台架不变量「安全区最大越界」报的就是它）。
+      ⇒ 这里是 8 倍以上的跳变，不 swim_push 一次必然出界。 */
+static void grow_step_all(void)
+{
+    for (int i = 0; i < s_nkoi; i++) {
+        koi_t *k = &s_koi[i];
+        if (k->grow >= GROW_MAX) continue;               /* 到顶了就不长 */
+        float ng = k->grow + GROW_STEP;
+        k->grow = (ng > GROW_MAX) ? GROW_MAX : ng;
+        swim_push(&k->x, &k->y, k->L * k->grow * 0.55f + 3.0f);
     }
 }
 
@@ -3973,8 +4033,15 @@ static void koi_step(koi_t *k, float dt)
         s_satiety = clampf(s_satiety + 0.05f, 0.0f, 1.0f);
         k->eat = 0.6f;
         k->biteT = BITE_T;                                // 啄食停顿：圆灭之前嘴不离开圆
-        k->grow = (k->grow + GROW_PER_PELLET > GROW_MAX) ? GROW_MAX
-                                                         : k->grow + GROW_PER_PELLET;
+#ifdef KOI_HOST_PROBE
+        s_eaten++;        /* ★ 55 轮：只给台架判据数"吃到了几次" */
+#endif
+        /* ★★ 第 55 轮：**这里不再加 grow**（原来每吃一颗 +GROW_PER_PELLET=0.018）。
+           王总原话「喂食时候照常吃食 但是不长体型」——
+           吃归吃（追食、特效、饱食度、啄食停顿全保留），成长只认**按键次数**
+           （见 do_feed 末尾的 s_feed_count 与 grow_step_all）。
+           ⚠️ GROW_PER_PELLET 宏留着没删：它是历史口径，删了以后没法解释
+              旧存档/旧截图为什么鱼长得快。 */
         /* ★ 第 50 轮：rMax / life 改用 EAT_RING_RMAX / EAT_RING_LIFE 两个独立宏
            （原来写死 9 和 BITE_T）。理由见那两个宏上面的长注释：
            —— 帧率 7fps 下 0.42s 的涟漪只画得到 2.9 帧，等于没有特效。
@@ -3991,7 +4058,9 @@ static void koi_step(koi_t *k, float dt)
        ⚠️ 别再想"把上面那次 push 挪到这儿"：上面那次必须留在**吃食判定之前**，
           因为吃食判定用的是推正之后的嘴位置（mx/my）—— 挪下来会让"鱼隔着石头吃到食"。
        ⚠️ 凡是"会改变 kh / k->L 的语句"，都要么放在 push 之前，要么在它后面补一次 push。
-          这条不变量现在只靠这一处维持，改 koi_step 时务必看一眼。 */
+       ★ 第 55 轮：吃食已经**不再改 grow**（成长改成按按键次数），所以这次 push 现在是
+         幂等的（kh 与上面那次完全相同）。**仍保留**：上面那条"凡是改 kh 的语句都要补
+         push"是硬规矩，留着这行将来谁再加"吃食长大"也不会漏；成本只有 6 次内点积。 */
     swim_push(&k->x, &k->y, k->L * k->grow * 0.55f + 3.0f);
 }
 
@@ -4042,7 +4111,10 @@ static int s_first_frame = 1;
 #define KOI_NS          "koipond"
 #define KOI_KEY         "state"
 #define KOI_SAVE_MAGIC  0x4B4F4931u     /* "KOI1" */
-#define KOI_SAVE_VER    1
+/* ★ 第 55 轮：ver 1 → **2**（存档里多了 s_feed_count 这一项）。
+   ⚠️ 判据是 `sv.ver != KOI_SAVE_VER ⇒ return 0`，所以旧的 ver1 存档会被判成
+      "无效" ⇒ **走开局三屏**，是安全的降级（不会读half个结构体出来）。 */
+#define KOI_SAVE_VER    2
 #define KOI_SAVE_SEC    30.0f           /* 自动存盘的检查间隔（秒） */
 
 typedef struct { float x, y, headA, phase, L, grow, hz; } koi_save1_t;
@@ -4051,13 +4123,15 @@ typedef struct {
     uint32_t magic, ver;
     uint8_t  scene, nkoi, pick_n, split_kh, night;
     float    satiety;
+    uint32_t feed_count;   /* ★ 55 轮：玩家按喂食键的累计次数（成长进度） */
     koi_save1_t f[MAX_KOI];
-} koi_save_t;                            /* 4+4 + 5+3pad + 4 + 9×28 = 272 B */
+} koi_save_t;                            /* 4+4 + 5+3pad + 4 + 4 + 9×28 = 276 B */
 
 static int   s_save_ok  = 0;             /* NVS 可用（初始化成功且未降级） */
 static float s_save_acc = 0.0f;          /* 距上次检查的秒数（只在池内累加） */
 static float s_save_grow0 = -1.0f;       /* 上次落盘时的最大 grow */
 static float s_save_sat0  = -1.0f;       /* 上次落盘时的饱食度 */
+static uint32_t s_save_feed0 = 0xFFFFFFFFu;  /* ★ 55 轮：上次落盘时的喂食计数 */
 
 static void koi_save_init(void)
 {
@@ -4084,6 +4158,7 @@ static void koi_save_write(void)
     sv.split_kh = (uint8_t)s_split_kh;
     sv.night    = (uint8_t)(s_nightTarget > 0.5f ? 1 : 0);
     sv.satiety  = s_satiety;
+    sv.feed_count = s_feed_count;      /* ★ 55 轮：成长进度跟着存档走 */
     for (int i = 0; i < s_nkoi; i++) {
         sv.f[i].x     = s_koi[i].x;
         sv.f[i].y     = s_koi[i].y;
@@ -4141,6 +4216,11 @@ static int koi_save_read(void)
         s_koi[i].ay0 = 1e30f; s_koi[i].ay1 = -1e30f;
     }
     s_satiety     = clampf(sv.satiety, 0.0f, 1.0f);
+    /* ★ 55 轮：喂食计数（成长进度）也要恢复 —— 玩家喂了 99 次断电，不能归零。
+       ⚠️ 上限夹到 FEED_PER_GROW−1：否则旧存档里一个越界的大数会让下次按键立刻
+          连跳好几档（虽然 grow_step_all 只跳一档，但计数要保持在合法区间）。 */
+    s_feed_count  = (sv.feed_count >= (uint32_t)FEED_PER_GROW)
+                    ? (uint32_t)(FEED_PER_GROW - 1) : sv.feed_count;
     s_nightTarget = sv.night ? 1.0f : 0.0f;
     s_night       = s_nightTarget;
     s_night_log   = s_nightTarget;                        /* 37 轮：量化档也要跟着走 */
@@ -4179,10 +4259,16 @@ static void step(float dt)
         s_save_acc = 0.0f;
         float gm = 0.0f;
         for (int i = 0; i < s_nkoi; i++) if (s_koi[i].grow > gm) gm = s_koi[i].grow;
+        /* ★ 第 55 轮：判据**必须加上 s_feed_count**。
+           不加会怎样：成长改成"按 100 次喂食才长一档"之后，玩家按了 50 次 ⇒
+           grow 没变、satiety 也可能没变 ⇒ 一次都不落盘 ⇒ 断电后这 50 次**全丢**。
+           这正是"养成进度"最该存的东西，漏了它整个离散成长就白做了。 */
         if (fabsf(gm - s_save_grow0) > 0.001f ||
-            fabsf(s_satiety - s_save_sat0) > 0.01f) {
+            fabsf(s_satiety - s_save_sat0) > 0.01f ||
+            s_feed_count != s_save_feed0) {
             s_save_grow0 = gm;
             s_save_sat0  = s_satiety;
+            s_save_feed0 = s_feed_count;
             koi_save_write();
         }
     }
@@ -5155,6 +5241,7 @@ static void start_pond(void)
     s_nkoi  = s_pick_n;
     pond_init();
     s_nrip = 0; s_npel = 0; s_nfood = 0;
+    s_feed_count = 0;                       /* ★ 55 轮：新开一池，喂食计数从零起算 */
     s_time = 0; s_shakeT = 0;
     s_satiety = 0.55f;
     s_night = 0; s_nightTarget = 0; s_night_log = 0;   /* ★ 37 轮：逻辑值一起归零 */
@@ -5164,7 +5251,8 @@ static void start_pond(void)
     ESP_LOGI(TAG, "开养：%d 条（红白 %d / 御黄金 %d）",
              s_pick_n, s_split_kh, s_pick_n - s_split_kh);
     /* ★ 第 52 轮：选完条数/分色进池的这一刻就落盘 —— 断电后能直接回到这一池。 */
-    s_save_grow0 = -1.0f; s_save_sat0 = -1.0f;      /* 强制写一次，别被"没变"挡掉 */
+    /* 强制写一次，别被"没变"挡掉（55 轮：喂食计数也要一起置成"必然不等"） */
+    s_save_grow0 = -1.0f; s_save_sat0 = -1.0f; s_save_feed0 = 0xFFFFFFFFu;
     koi_save_write();
 }
 
@@ -5178,6 +5266,7 @@ static void reset_to_home(void)
     s_pick_n = PICK_N[0];
     s_split_kh = default_split(s_pick_n);
     s_nrip = s_npel = s_nfood = 0;
+    s_feed_count = 0;                        /* ★ 55 轮：重置回首页，喂食计数一起清零 */
     s_night = s_nightTarget = 0.0f;
     s_night_log = 0.0f;                      /* ★ 37 轮：量化档也要跟着归零 */
     s_shakeT = 0.0f;
@@ -5713,6 +5802,19 @@ int demo_koi_seek_n(void)
         if (s_koi[i].seek) n++;
     return n;
 }
+
+/* ★★ 第 55 轮：离散成长的三个读数。
+   ⚠️ s_eaten 是新加的**只存在于台架**的计数器吗？—— 不是，它也在固件里，
+      但只有 KOI_HOST_PROBE 下才 ++（真机零开销，见 koi_step 里的挂点）。 */
+float demo_koi_maxgrow(void)
+{
+    float g = 0.0f;
+    for (int i = 0; i < s_nkoi; i++) if (s_koi[i].grow > g) g = s_koi[i].grow;
+    return g;
+}
+
+uint32_t demo_koi_feedcnt(void) { return s_feed_count; }
+uint32_t demo_koi_eaten(void)   { return s_eaten; }
 
 /* 池子当前的精确状态（鱼 / 荷 / 脏矩形 / 覆盖率越界计数）。
    ★ 靠截图猜"这条竖道是什么颜色"太慢，直接把真值打出来（铁律 11）。 */

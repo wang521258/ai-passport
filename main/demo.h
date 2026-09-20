@@ -2,6 +2,7 @@
 // 新增一个演示页 = 实现这三个函数 + 在 main.c 的 DEMOS[] 里加一行。
 #pragma once
 
+#include <stdint.h>
 #include "bsp_button.h"
 
 typedef struct {
@@ -50,3 +51,14 @@ int  demo_koi_rip_count_kind(int kind);
    王总第 50 轮核心诉求「鱼应该往饲料方向游动 而不是现在的没感觉」——
    "有没有追"这件事必须数出来，不能靠看 GIF 猜。 */
 int  demo_koi_seek_n(void);
+
+/* ★ 第 55 轮：离散成长的三个读数（台架判据用，真机零开销）。
+     demo_koi_maxgrow()   池里最大的 grow（成长是整池一起长，取最大就够）
+     demo_koi_feedcnt()   玩家按喂食键的累计次数（0..FEED_PER_GROW-1）
+     demo_koi_ eaten()    ★ 累计"鱼吃到食物"的次数
+   为什么三个都要：第 55 轮的口径是「成长只认按键次数，跟吃食无关」，
+   判据必须能**同时**看到"吃了很多次但 grow 没动"和"按满 100 次 grow 跳一档"
+   这两件事 —— 只看 grow 一个数，分不清是"没吃到"还是"真的解耦了"。 */
+float    demo_koi_maxgrow(void);
+uint32_t demo_koi_feedcnt(void);
+uint32_t demo_koi_eaten(void);
