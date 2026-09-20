@@ -42,6 +42,8 @@
 #include "lvgl.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include <math.h>
 #include <string.h>
 #include <stdint.h>
@@ -1998,6 +2000,27 @@ static const float KDEPTH[KSEG + 1] = {KOI_KDEPTH0, 0.90f, 1.00f, 0.78f, 0.55f, 
 #ifndef KOI_WD
 #define KOI_WD          0.175f
 #endif
+
+/* ★★ 第 52 轮：初始体长区间（原写死 rnd_f(17,23)，×KOI_SCALE=2.0 ⇒ 34~46px 基础体长）。
+   ⚠️ 为什么只改这里、不改 grow / KOI_SCALE —— 那两个**都进 vT 速度公式**（见 3285 行）：
+        vT = (...) × (0.62 + 0.46·k->grow) × (...) × KOI_SCALE × KOI_LV_SPD
+      · grow 初始 0.52~0.72 抬到 0.62~0.82 ⇒ 速度跟着 +5%（王总抱怨过"游得快"）；
+      · KOI_SCALE 2.0→2.2 ⇒ 速度 +10%。
+      而 **k->L 既不在 vT 里、也不在速度上限 `34·KOI_SCALE·KOI_LV_SPD` 里**
+      ⇒ 改它 = 纯变大、游速零影响。这是唯一干净的旋钮。
+   实测体长（240×320 屏，grow 0.52~0.72 / 满级 1.35）：
+      17~23 → 开局 17.7~33.1px / 满级 45.9~62.1px   ← 第 45 轮起的现状
+      19~25 → 开局 19.8~36.0px / 满级 51.3~67.5px   ← ★ 第 52 轮现值（+11%）
+      21~27 → 开局 21.9~38.9px / 满级 56.7~72.9px   （更明显，但脏区 +48%，先看帧率）
+   ⚠️ 台架要复验两项：鱼脏盒最大欠缺（现 −4.00px）、真机帧时间（鱼 47ms / 荷 60ms）。
+   ⚠️ 改成宏是为了台架能用 -D 扫档（裸 #define 会被 -D 覆盖后又改回来）。 */
+#ifndef KOI_L0_MIN
+#define KOI_L0_MIN  19.0f
+#endif
+#ifndef KOI_L0_MAX
+#define KOI_L0_MAX  25.0f
+#endif
+
 #define GROW_MAX        1.35f
 #define GROW_PER_PELLET 0.018f
 
@@ -2285,7 +2308,7 @@ static void make_koi(koi_t *k, float x, float y, float g0, uint8_t pat)
     k->x = x; k->y = y;
     k->headA = rnd_f(0, 6.2832f);
     k->phase = rnd_f(0, 6.28f);
-    k->L = rnd_f(17.0f, 23.0f) * KOI_SCALE;
+    k->L = rnd_f(KOI_L0_MIN, KOI_L0_MAX) * KOI_SCALE;   /* ★ 52 轮：17~23 → 19~25 */
     k->grow = g0;
     k->hz = rnd_f(1.5f, 2.4f);
     k->waveAmp = 0.26f;
@@ -3313,11 +3336,14 @@ static void koi_step(koi_t *k, float dt)
        ★★ 第 51 轮：目标**两类都吃**
          ① s_pel[ti] —— 飞行中的颗粒（第 43/50 轮口径，鱼在空中接住）
          ② s_food[fi] —— **落水后漂在水面**的颗粒（第 41 轮口径，本轮加回来）
-       ★★ 判定半径也放大（+3.0 → KOI_EAT_REACH 默认 6.0）：
+       ★★ 判定半径也放大（+3.0 → KOI_EAT_REACH 默认 **10.0**）：
          旧值 = L·grow·0.0805 + 3.0 ≈ **4.9px**（L≈40、grow≈0.6），
-         而真机 7fps 下鱼一帧就走 **3.9px** —— 判定窗口只有 4.9px，
+         而真机 7fps 下鱼一帧就走 **3.9px** —— 判定窗口比步长还窄，
          鱼很容易"擦着饲料游过去"却不算吃到，这正是王总说的
-         「鱼碰到鱼食的几率很小」。放到 ≈7.9px 才对得上鱼一帧的步长。 */
+         「鱼碰到鱼食的几率很小」。
+         中间试过 6.0（≈7.9px，约等于两帧步长）—— 命中仍然偏少；
+         最终定 **10.0**（≈11.9px，约三帧步长）⇒ 一次投喂 9 颗吃到 2~3 颗，
+         正好落在王总「命中率不要太百分百 也不要太太低」那档。 */
     float mx = k->x + fcos_t(k->headA) * k->L * k->grow * KMOUTH;
     float my = k->y + fsin_t(k->headA) * k->L * k->grow * KMOUTH;
     float eatR = k->L * k->grow * 0.0805f + KOI_EAT_REACH;
@@ -3375,12 +3401,190 @@ static void koi_step(koi_t *k, float dt)
      是主机台架的日志"脏区=100.0% rect=0"把它揪出来的（不在板子上也看得见）。 */
 static int s_first_frame = 1;
 
+/* ==========================================================================
+   ★★ 第 52 轮：断电续玩（NVS）
+   --------------------------------------------------------------------------
+   王总原话：「机器上有个电源键，我希望的是在关机重启后还是在鱼池界面里
+              而不是重新开始，除非玩家长按 OK 自己重置」
+
+   为什么必须用 NVS（flash）而不是 RTC memory：
+     那个电源键是**硬断电**，没有任何关机回调可以挂钩 —— RTC memory 只活到
+     deep-sleep，掉电就没了。所以唯一能活过断电的是 flash；而且因为**没有
+     关机事件**，必须**定时自动存**，不能指望"退出时存一次"。
+
+   存什么 / 不存什么：
+     存：scene / 条数 / 分色 / 每条鱼的 位置·朝向·体长·成长度·摆尾频率 /
+         饱食度 / 昼夜 —— 这些是"玩家的进度"。
+     不存：涟漪、飞行中的饲料、池里漂着的饲料、受惊计时 —— 都是瞬时状态，
+           恢复出来只会让开机第一屏莫名其妙地有一堆水花。
+     ⚠️ 红斑 sp[][] **不存**：它由 pond_init() 里的 make_spots 按 pat 生成，
+        而 pat 已由 (pick_n, split_kh) 决定 ⇒ 用存档参数重放 pond_init()
+        就能得到**逐位相同**的红斑（荷叶/波光同理）。这样存档只有 272 B，
+        flash 磨损才扛得住。
+
+   ★ 恢复的做法（关键）：
+       s_pick_n / s_split_kh 先还原 → 调 pond_init()（荷叶/波光/红斑按原参数
+       重放，与断电前逐位相同）→ 再把 grow/L/hz/x/y/headA/phase 覆盖回去。
+       **不重新发明一套建池流程**，所以荷叶位置不会漂。
+
+   ★ flash 磨损（这条不能不算）：
+       NVS 一页 4KB，blob 写入是追加式的，写满才回收（GC = 拷贝 + 擦除）。
+       存档 272B ⇒ 一页约 15 次写入就 GC 一次。
+       预算：每 30s 检查、且**只有真变了才写** ⇒ 一天最多 2880 次写入
+       ÷ 15 ≈ 192 次擦除/天 ⇒ 10 万次擦除寿命 ≈ **1.4 年**。
+       ⚠️ "只在真变了才写"是关键：鱼不动时不写。别改成每帧写。
+
+   ⚠️ ⚠️ 绝对不要 nvs_flash_erase()：nvs 分区(0x9000)里还有**原厂配网数据**，
+       擦了以后灌回原厂固件要重新配网（koi_flash.py 的注释里记着这笔账）。
+       nvs_flash_init() 失败就**降级成不存档**，绝不用擦除来救。
+   ========================================================================== */
+#define KOI_NS          "koipond"
+#define KOI_KEY         "state"
+#define KOI_SAVE_MAGIC  0x4B4F4931u     /* "KOI1" */
+#define KOI_SAVE_VER    1
+#define KOI_SAVE_SEC    30.0f           /* 自动存盘的检查间隔（秒） */
+
+typedef struct { float x, y, headA, phase, L, grow, hz; } koi_save1_t;
+
+typedef struct {
+    uint32_t magic, ver;
+    uint8_t  scene, nkoi, pick_n, split_kh, night;
+    float    satiety;
+    koi_save1_t f[MAX_KOI];
+} koi_save_t;                            /* 4+4 + 5+3pad + 4 + 9×28 = 272 B */
+
+static int   s_save_ok  = 0;             /* NVS 可用（初始化成功且未降级） */
+static float s_save_acc = 0.0f;          /* 距上次检查的秒数（只在池内累加） */
+static float s_save_grow0 = -1.0f;       /* 上次落盘时的最大 grow */
+static float s_save_sat0  = -1.0f;       /* 上次落盘时的饱食度 */
+
+static void koi_save_init(void)
+{
+    esp_err_t e = nvs_flash_init();
+    if (e != ESP_OK) {
+        /* ⚠️ 不擦除：nvs 里还有原厂配网数据。降级成"不存档"，鱼照游。 */
+        ESP_LOGW(TAG, "NVS 不可用(%s)——本次不存档，断电后会回首页", esp_err_to_name(e));
+        s_save_ok = 0;
+        return;
+    }
+    s_save_ok = 1;
+}
+
+static void koi_save_write(void)
+{
+    if (!s_save_ok || s_scene != 1) return;
+    koi_save_t sv;
+    memset(&sv, 0, sizeof(sv));
+    sv.magic    = KOI_SAVE_MAGIC;
+    sv.ver      = KOI_SAVE_VER;
+    sv.scene    = 1;
+    sv.nkoi     = (uint8_t)s_nkoi;
+    sv.pick_n   = (uint8_t)s_pick_n;
+    sv.split_kh = (uint8_t)s_split_kh;
+    sv.night    = (uint8_t)(s_nightTarget > 0.5f ? 1 : 0);
+    sv.satiety  = s_satiety;
+    for (int i = 0; i < s_nkoi; i++) {
+        sv.f[i].x     = s_koi[i].x;
+        sv.f[i].y     = s_koi[i].y;
+        sv.f[i].headA = s_koi[i].headA;
+        sv.f[i].phase = s_koi[i].phase;
+        sv.f[i].L     = s_koi[i].L;
+        sv.f[i].grow  = s_koi[i].grow;
+        sv.f[i].hz    = s_koi[i].hz;
+    }
+    nvs_handle_t h;
+    if (nvs_open(KOI_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    if (nvs_set_blob(h, KOI_KEY, &sv, sizeof(sv)) == ESP_OK) nvs_commit(h);
+    nvs_close(h);
+}
+
+/* 返回 1 = 有存档且已恢复到池内（调用方据此跳过开局三屏） */
+static int koi_save_read(void)
+{
+    if (!s_save_ok) return 0;
+    nvs_handle_t h;
+    if (nvs_open(KOI_NS, NVS_READONLY, &h) != ESP_OK) return 0;
+    koi_save_t sv;
+    size_t len = sizeof(sv);
+    esp_err_t e = nvs_get_blob(h, KOI_KEY, &sv, &len);
+    nvs_close(h);
+    /* ⚠️ 用 `len < sizeof(sv)` 而不是 `!=`：nvs_get_blob 会把 *len 改成**实际**
+       读出的字节数，旧版本存档可能更短；只要够长就认。 */
+    if (e != ESP_OK || len < sizeof(sv)) return 0;
+    if (sv.magic != KOI_SAVE_MAGIC || sv.ver != KOI_SAVE_VER) return 0;
+    if (sv.scene != 1 || sv.nkoi < 1 || sv.nkoi > MAX_KOI) return 0;
+    /* 自洽性校验：条数必须是一档合法选项，分色不能超总数 —— 否则 pond_init
+       会造出一池跟玩家选的对不上的鱼。 */
+    int ok_n = 0;
+    for (int i = 0; i < N_PICK; i++) if (PICK_N[i] == sv.pick_n) { ok_n = 1; break; }
+    if (!ok_n || sv.split_kh > sv.pick_n) return 0;
+
+    /* ★ 用存档参数重放 pond_init：荷叶/波光/红斑与断电前逐位相同 */
+    s_pick_n   = sv.pick_n;
+    s_split_kh = sv.split_kh;
+    s_nkoi     = sv.nkoi;
+    pond_init();
+    for (int i = 0; i < s_nkoi; i++) {
+        s_koi[i].x     = sv.f[i].x;
+        s_koi[i].y     = sv.f[i].y;
+        s_koi[i].headA = sv.f[i].headA;
+        s_koi[i].phase = sv.f[i].phase;
+        s_koi[i].L     = sv.f[i].L;
+        s_koi[i].grow  = clampf(sv.f[i].grow, 0.30f, GROW_MAX);
+        s_koi[i].hz    = sv.f[i].hz;
+        s_koi[i].burst = 1;
+        /* 脏区状态必须重置：否则拿断电前的 AABB 去算本帧脏矩形，会漏画/花屏 */
+        s_koi[i].bx0 = s_koi[i].bx1 = s_koi[i].x;
+        s_koi[i].by0 = s_koi[i].by1 = s_koi[i].y;
+        s_koi[i].ax0 = 1e30f; s_koi[i].ax1 = -1e30f;      /* 空 AABB */
+        s_koi[i].ay0 = 1e30f; s_koi[i].ay1 = -1e30f;
+    }
+    s_satiety     = clampf(sv.satiety, 0.0f, 1.0f);
+    s_nightTarget = sv.night ? 1.0f : 0.0f;
+    s_night       = s_nightTarget;
+    s_night_log   = s_nightTarget;                        /* 37 轮：量化档也要跟着走 */
+    s_nrip = 0; s_npel = 0; s_nfood = 0;                  /* 瞬时状态不恢复 */
+    s_time = 0; s_shakeT = 0; s_save_acc = 0.0f;
+    s_scene       = 1;
+    s_first_frame = 1;
+    s_full        = 1;
+    s_bg_drawn    = -1;                                   /* 45 轮：底图重铺 */
+    ESP_LOGI(TAG, "续玩：%d 条（红白 %d / 御黄金 %d），饱食 %.2f，%s",
+             s_pick_n, s_split_kh, s_pick_n - s_split_kh, s_satiety,
+             s_nightTarget > 0.5f ? "夜" : "昼");
+    return 1;
+}
+
+static void koi_save_clear(void)
+{
+    if (!s_save_ok) return;
+    nvs_handle_t h;
+    if (nvs_open(KOI_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_erase_key(h, KOI_KEY);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
 static void step(float dt)
 {
 #ifdef KOI_HOST_PROBE
     s_step_no++;
 #endif
     s_time += dt;
+
+    /* ★ 第 52 轮：没有关机回调，只能定时刷盘。且**只在真变了才写**（磨损）。 */
+    s_save_acc += dt;
+    if (s_save_acc >= KOI_SAVE_SEC) {
+        s_save_acc = 0.0f;
+        float gm = 0.0f;
+        for (int i = 0; i < s_nkoi; i++) if (s_koi[i].grow > gm) gm = s_koi[i].grow;
+        if (fabsf(gm - s_save_grow0) > 0.001f ||
+            fabsf(s_satiety - s_save_sat0) > 0.01f) {
+            s_save_grow0 = gm;
+            s_save_sat0  = s_satiety;
+            koi_save_write();
+        }
+    }
     if (s_shakeT > 0) s_shakeT -= dt;
 
     /* ★★ 第 37 轮：昼夜过渡量化 —— 修王总「昼夜交换这个有点特别卡顿感」。
@@ -4283,27 +4487,42 @@ void demo_koi_enter(void)
     day_pal_sync();          /* ★ 37 轮：先把"观感档"灌进 s_day，再建调色板 */
     build_palette(0.0f);
 
-    /* 开机从**首页**开始（网页版 scene='setup' / setupStep=0 / pickIdx=0）。
-       池子在这时候先按默认档建好，正式开养时 start_pond() 会按玩家选的条数重建。 */
-    s_scene       = 0;
-    s_setup_step  = 0;
-    s_pick_idx    = 0;
-    s_pick_n      = PICK_N[0];              /* 独占鳌头 */
-    s_split_kh    = default_split(s_pick_n);
-    s_setup_dirty = 1;
+    /* ★★ 第 52 轮：先开 NVS，再决定"续玩"还是"从首页开始"。
+         · koi_save_read() 成功 = 有存档 ⇒ 直接回池内，**跳过开局三屏**；
+         · 只有玩家长按 OK（reset_to_home → koi_save_clear）清过档，才走到 else。
+       ⚠️ koi_save_read() 内部会按存档参数重放 pond_init()，荷叶/波光/红斑不漂。
+       ⚠️ 夜间续玩不用额外处理：tick_cb 帧首的 build_palette(s_night) 会自己发现
+          调色板变了并置 s_full=1（第 43 轮修的就是这个）。 */
+    koi_save_init();
+    int resumed = koi_save_read();
+    if (!resumed) {
+        /* 开机从**首页**开始（网页版 scene='setup' / setupStep=0 / pickIdx=0）。
+           池子在这时候先按默认档建好，正式开养时 start_pond() 会按玩家选的条数重建。 */
+        s_scene       = 0;
+        s_setup_step  = 0;
+        s_pick_idx    = 0;
+        s_pick_n      = PICK_N[0];              /* 独占鳌头 */
+        s_split_kh    = default_split(s_pick_n);
+        s_setup_dirty = 1;
 
-    pond_init();
-    s_nrip = 0; s_npel = 0; s_nfood = 0;
-    s_time = 0; s_shakeT = 0;
-    s_night = 0; s_nightTarget = 0; s_night_log = 0;   /* ★ 37 轮：逻辑值一起归零 */
-    s_satiety = 0.5f;
+        pond_init();
+        s_nrip = 0; s_npel = 0; s_nfood = 0;
+        s_time = 0; s_shakeT = 0;
+        s_night = 0; s_nightTarget = 0; s_night_log = 0;   /* ★ 37 轮：逻辑值一起归零 */
+        s_satiety = 0.5f;
+    }
     s_nrect = 0; s_full = 1; s_first_frame = 1; s_bg_drawn = -1;  /* 45 轮：底图重铺 */
     s_frames = 0; s_log_acc = 0; s_sum_us = 0; s_max_us = 0; s_dirty_acc = 0;
     s_t_last = esp_timer_get_time();
     s_dt_last = 0;              /* ★ 46 轮：子步时钟也从零起（第一帧算 1 子步） */
 
-    ESP_LOGI(TAG, "锦鲤池进入：画布 %dx%d RGB565 = %u B，目标 %d fps；开机=首页，%d 档条数可选",
-             KW, KH, (unsigned)sizeof(s_fb), FPS, N_PICK);
+    if (resumed) {
+        ESP_LOGI(TAG, "锦鲤池进入：画布 %dx%d RGB565 = %u B，目标 %d fps；续玩（读回存档，直接进池）",
+                 KW, KH, (unsigned)sizeof(s_fb), FPS);
+    } else {
+        ESP_LOGI(TAG, "锦鲤池进入：画布 %dx%d RGB565 = %u B，目标 %d fps；开机=首页，%d 档条数可选",
+                 KW, KH, (unsigned)sizeof(s_fb), FPS, N_PICK);
+    }
 
     s_timer = lv_timer_create(tick_cb, 1000 / FPS, NULL);
 }
@@ -4329,6 +4548,9 @@ static void start_pond(void)
     s_bg_drawn = -1;                         /* ★ 45 轮：底图也跟着重铺 */
     ESP_LOGI(TAG, "开养：%d 条（红白 %d / 御黄金 %d）",
              s_pick_n, s_split_kh, s_pick_n - s_split_kh);
+    /* ★ 第 52 轮：选完条数/分色进池的这一刻就落盘 —— 断电后能直接回到这一池。 */
+    s_save_grow0 = -1.0f; s_save_sat0 = -1.0f;      /* 强制写一次，别被"没变"挡掉 */
+    koi_save_write();
 }
 
 /* 长按 OK：清空当前池子并回到首页。事件由 BSP 按键组件直接上送，
@@ -4348,6 +4570,9 @@ static void reset_to_home(void)
     s_full = 1;
     s_setup_dirty = 1;
     s_bg_drawn = -1;                         /* ★ 45 轮：底图也跟着重铺 */
+    /* ★ 第 52 轮：清档。这就是王总说的「除非玩家长按 OK 自己重置」——
+       长按 OK 走的就是这个函数，擦掉存档后下次上电回开局三屏。 */
+    koi_save_clear();
 }
 
 /* 按键分派。逐条对齐网页版的 fire(name)：feed(↑) / tap(↓) / night(OK)。
