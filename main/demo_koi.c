@@ -475,8 +475,17 @@ static int s_bbx0, s_bby0, s_bbx1, s_bby1;
 #ifdef KOI_HOST_PROBE
 static long s_cov_over;
 /* 预测脏盒"不够多少"的最大值（正数 = 那一侧会残留；应 ≤ 0）。
-   它就是 KOI_DIRT_MARGIN 的取值依据 —— 换鱼速 / 转角 / 体长参数后重跑，读数会变。 */
+   它就是 KOI_DIRT_MARGIN 的取值依据 —— 换鱼速 / 转角 / 体长参数后重跑，读数会变。
+   ★★ 第 46 轮：光有一个最大值不够用 —— 真机帧长是**变的**（105ms 均值 / 142ms 峰），
+      而"缺多少"随帧长怎么变是**量出来的**（扫 KOI_FRAMEMS 得：
+      42→1.75 / 105→3.39 / 120→8.00 / 142→10.00，**105~120 之间有个台阶**）。
+      台阶说明不只是"形变随 dt 变大"，还有事件型的东西在推。
+      所以下面把最大值**发生在哪一帧、哪条鱼、哪一侧**也记下来（只给台架）。 */
 static float s_bbox_short = -1e9f;
+static int   s_bs_step = -1, s_bs_koi = -1, s_bs_side = -1;
+static float s_bs_raw = 0.0f, s_bs_grow = 0.0f;
+/* ★ 46 轮 · 活泼度探针累加器（见报脏循环里的注释）。台架最后取平均。 */
+static double s_lv_spd, s_lv_turn, s_lv_curv, s_lv_burst, s_lv_n;
 /* 脏区表追踪窗口（台架排障用）：s_rtrace_from..to 之间把鱼报脏的每一步打出来。
    ★ 为什么需要它：光看"帧末的矩形表"，分不清"没报"和"报了又被并掉/吃掉"。 */
 static int s_rtrace_from = 1 << 30, s_rtrace_to = -(1 << 30);
@@ -1866,11 +1875,43 @@ static void safe_spot(float x, float y)
 static const float KBEND[KSEG] = {0.14f, 0.24f, 0.23f, 0.21f, 0.18f};
 static const float KAMP[KSEG]  = {0.045f, 0.197f, 0.392f, 0.618f, 0.867f};
 #define KPHASE   0.92f
-static const float KDEPTH[KSEG + 1] = {0.50f, 0.90f, 1.00f, 0.78f, 0.55f, 0.30f};
+
+/* ★★ 第 46 轮：头部两个可调量（王总「鱼的最前面 尖尖的 需要稍微打磨下」）
+   --------------------------------------------------------------------------
+   KOI_KDEPTH0 = 第 0 段（头）的半宽 / 腹部半宽。0.50 = 头只有肚子的一半宽。
+   KOI_HEADCAP = 头端圆帽的**伸出量**，单位是头半宽 hw（见 body_pts 的 pt_quad）。
+   量一下这两个数各自管什么（二次贝塞尔 A→C→B，A/B 在纵向 0、横向 ±hw，
+   C 在纵向 cap·hw、横向 0）：
+     · 顶点在 t=0.5 → 纵向伸出 h = cap·hw/2；
+     · 顶点曲率半径 ρ = hw²/(2h) = **hw / cap**。
+   ⇒ **cap 越大，鼻子越尖**（伸得更远、ρ 更小）；cap 越小，越钝越短。
+     ⚠️ 第 41 轮把 cap 从 1.75 加到 2.50 时的注释写的是"让头部更圆" —— 那是**误判**：
+        cap 加大只是把头**拉长**（看起来像穹顶），鼻尖本身反而更锐（ρ 从 0.571hw 掉到 0.400hw）。
+        本轮把它做成阶梯实测，不再靠推。
+   ⚠️ 这两个量都**只影响绘制、不影响物理** —— 所以同一帧号下不同档的鱼位/朝向逐位相同，
+      可以直接拿同一块区域做 A/B（`_tools/noseladder46.py` 就是这么出卡的）。
+   ⚠️ 调大 KDEPTH0 会**加大 AABB**（第 42 轮的注释：cap 2.50 + 深度 0.55 时满体单条脏盒
+      多包几像素、真机退化 ~3ms）。改完必须看台架的「鱼脏盒最大欠缺」与真机帧时间。
+   ★★ 第 46 轮定档：王总「鱼的最前面 尖尖的 需要稍微打磨下」⇒ **cap 2.20 → 1.70**。
+      只动 cap、不动 KDEPTH0（他说的是"最前面"，那就只修鼻子本身，不把整条鱼改胖）。
+      实测（`_tools/noseladder46.py`，同一帧号同一块裁切放大 14 倍）：
+        吻尖厚度 4px → 6px（+50%），吻尖位置基本不动（-1px）
+      —— 这正是"打磨"：**不缩短、只把尖角磨圆**。
+      阶梯卡 `_preview/吻端_档位阶梯46.png` 里 A=2.20(旧) B=1.70(本轮) C=1.10(该构造极限)
+      D/E/F=再叠头加宽。王总若要更钝，改这一个数就行。 */
+#ifndef KOI_KDEPTH0
+#define KOI_KDEPTH0 0.50f
+#endif
+#ifndef KOI_HEADCAP
+#define KOI_HEADCAP 1.70f
+#endif
+
+static const float KDEPTH[KSEG + 1] = {KOI_KDEPTH0, 0.90f, 1.00f, 0.78f, 0.55f, 0.30f};
                                        /* ★ 第 43 轮微调（原 {0.50, 0.90, 0.92, 0.78, 0.55, 0.30}）：
                                           腹部 0.92→1.00（王总要"肚子稍微宽点点"；Wd 同步 0.155→0.175）。
                                           头仍 0.50（round 42 的妥协，不动）。比例 belly/head 从 1.84 → 2.00，
-                                          比 round 40 原版 2.17 略小，仍然不像 r41 那样"头相对夸张"。 */
+                                          比 round 40 原版 2.17 略小，仍然不像 r41 那样"头相对夸张"。
+                                          ★ 第 46 轮：头那一项提成宏 KOI_KDEPTH0（值仍是 0.50）。 */
 /* ★ 第 38 轮：王总「把初始鱼的大小做成现在的 3 倍」→ 2.0 → 6.0。
    ★ 第 39 轮：王总「把鱼做成现在的大小的一半」→ 6.0 → 3.0
    （= 原基线 2.0 的 1.5 倍，开局体长 17~23 × 3.0 = 51~69px）。
@@ -1895,12 +1936,82 @@ static const float KDEPTH[KSEG + 1] = {0.50f, 0.90f, 1.00f, 0.78f, 0.55f, 0.30f}
 #endif
 #define GROW_MAX        1.35f
 #define GROW_PER_PELLET 0.018f
+
+/* ==========================================================================
+   ★★ 第 46 轮：活泼度档位（王总「鱼活泼感一定要弄出来」）
+   --------------------------------------------------------------------------
+   五个乘数，全 1.00 = 第 45 轮上板值（逐位不变，历史对照图不作废）；
+   本轮把默认值改成 **P1**（见下面的实测表），全 1.00 仍然可复现（命令行 -D 全给 1.00）。
+   全部只作用在 `koi_step` 里，且都乘在**已经量出来的标定值**上，
+   所以"全 1.00"与原版逐位等价，档位之间是单调的"更活泼"。
+     · KOI_LV_SPD  ：巡游/抢食速度 vT（连带 `k->v` 上限）
+     · KOI_LV_HZ   ：摆尾频率（滑行 1.5 / 冲刺 2.4 / 抢食 3.0 Hz）
+     · KOI_LV_TURN ：转向响应 4.2 与转向速率 2.9（两个一起乘，只改快慢不改形状）
+     · KOI_LV_WAND ：漫游推力 1.05 + 换目标间隔 3.4~6.4s 的倒数
+                     （越大 = 越主动改方向，是"活泼"最直接的一项）
+     · KOI_LV_GAIT ：步态节奏。burst 时长 ×LV、coast 时长 ÷LV
+                     （>1 = 冲得多、滑得少 —— "飘逸"就是 coast 占比太高）
+   ⚠️ 这几个只改"运动"，不改体量/几何 ⇒ 不需要重跑体量工具。
+   ⚠️ 上限：真机一帧 ~105ms ⇒ 每帧推进 105ms（`frame_dt`，无子步量化）。
+      速度提到 2 倍以上时，先看台架的「安全区最大越界」与真机帧时间再往上加。
+
+   ★★ 第 46 轮定档：**P1「活泼」**（见下），不是全 1.00。
+      为什么不再留全 1.00：全 1.00 = 第 45 轮上板值 = 王总刚说的"不活泼 / 很飘逸"，
+      留着等于没改。他这次的原话是「鱼活泼感**一定要**弄出来」，所以给的是结论不是选项。
+      ⚠️ 但"不活泼"的**主因不是这几个数太小** —— 是**时间膨胀**（见 frame_dt）：
+         物理原来写死 step(1/24s)，真机一帧 105ms ⇒ 鱼速与摆尾频率一起只剩 40%。
+         那是先修的（修完时间膨胀比 1.000）。这五个乘数是在"时间已经对得上"之后
+         再往上加的主观活泼度。
+   --------------------------------------------------------------------------
+   台架实测四档（`_tools/lvsweep46.py`，KOI_FRAMEMS=105，稳态帧·鱼平均）：
+     档位        巡游速度   转头速率   |弯曲|   冲刺占空
+     P0 全1.00   27.1px/s  0.43rad/s  0.150   29.6%   ← 第 45 轮上板值（王总说"不活泼/飘逸"）
+     P1 活泼     47.0      0.69       0.182   50.2%   ← ★ 本轮默认
+     P2 很活泼   58.0      0.82       0.195   57.7%
+     P3 只快不冲 45.0      0.62       0.177   29.7%   ← 对照：证明"快"不等于"活泼"，
+                                                        冲刺占空不动时照样"飘逸"
+   四档的安全区越界都是 0.00px、金标准两条判据（脏区渲染 / 脏区覆盖）全 PASS。
+   ========================================================================== */
+#ifndef KOI_LV_SPD
+#define KOI_LV_SPD      1.35f
+#endif
+#ifndef KOI_LV_HZ
+#define KOI_LV_HZ       1.10f
+#endif
+#ifndef KOI_LV_TURN
+#define KOI_LV_TURN     1.30f
+#endif
+#ifndef KOI_LV_WAND
+#define KOI_LV_WAND     1.40f
+#endif
+#ifndef KOI_LV_GAIT
+#define KOI_LV_GAIT     1.60f
+#endif
 /* ★ 报脏外扩量（第 34 轮）。它要盖住"形状本身的变化"，而不仅仅是位移：
    一帧之内 AABB 还会因为 ① 转身（绕 (x,y) 转 dθ，最远点位移 ≈ R·dθ）
    ② 身体摆动 ③ 吃食长大 而变。位移由"上帧 AABB ∪ 平移副本"覆盖，这三样靠这个 margin。
    值不是拍的：台架里有个自检会逐帧量"真实 AABB 比预测盒超出多少"，
-   取全帧最大值 —— 见 KOI_DIRT_MARGIN 的读数（kb_probe_bbox_short）。 */
-#define KOI_DIRT_MARGIN  4.0f
+   取全帧最大值 —— 见 KOI_DIRT_MARGIN 的读数（kb_probe_bbox_short）。
+   ★★ 第 46 轮：4.0 → **6.0**，起因是**帧长变了**。
+     物理从"每帧固定推进 1/24 秒"改成"按真实经过时间推进"（见 frame_dt）之后，
+     真机一帧 ~105ms 意味着**摆尾相位、曲率、体量在一帧里走得比原来远 2.5 倍**，
+     自检读数从 1.75px 涨到 6.8~14px。
+     ■ 先修的是**算法**（不是先加 margin）：报脏改成"绕头按 ΔheadA 与 ΔheadA+Δcurv
+       各转一次再求并"—— 因为 koi_spine 里 a += curv·KBEND[i] 且 KBEND 之和 = 1.00，
+       尾端绝对角 = headA + curv，旧口径只转了头那一项。这一改把 105ms 的欠缺
+       从 2.77px 打到 0.86px、142ms 从 10.00px 打到 2.28px，**脏区占比几乎不变**。
+     ■ 剩下的 0.86px 用 margin 兜：4.0 → 6.0 覆盖到 ~115ms 帧长。
+     ■ 代价是**量过的**：台架 KOI_FRAMEMS=105 下脏区占比 36.2% → 40.9%，
+       但渲染分项几乎不动（水 0.02 鱼 0.18 荷 0.22 → 水 0.02 鱼 0.18 荷 0.23）——
+       多出来的像素是**水**（memcpy），几乎免费。真机唯一的代价是 SPI：
+       0.4µs/px × 76800 × 4.7% ≈ **1.4ms/帧（105ms 的 1.3%）**。
+     ⚠️ 帧长 >115ms 的偶发帧上自检仍会读到 1~3px 欠缺（抢食冲刺那几帧），
+        但**金标准两条判据（脏区渲染 / 脏区覆盖）在 42~200ms 全帧长下都 PASS** ——
+        没有真实残留（脏矩形合并 + AABB 自带的 −1/+2 余量吃掉了）。
+        这是"最坏情况预检"与"真实残留"的差别，别把预检读数当成拖影。 */
+#ifndef KOI_DIRT_MARGIN
+#define KOI_DIRT_MARGIN  6.0f
+#endif
 #define KMOUTH  (0.175f * 0.46f * 0.875f)
 #define BITE_T    0.42f
 #define BITE_SLOW 0.10f
@@ -2128,13 +2239,16 @@ static void body_pts(void)
                      (_ly[0] - _spy[0]) * (_ly[0] - _spy[0]));
     pt_push(_lx[0], _ly[0]);
     pt_quad(_lx[0], _ly[0],
-            _spx[0] + fcos_t(ha) * hw * 2.20f, _spy[0] + fsin_t(ha) * hw * 2.20f,
+            _spx[0] + fcos_t(ha) * hw * KOI_HEADCAP, _spy[0] + fsin_t(ha) * hw * KOI_HEADCAP,
             _rx[0], _ry[0]);                                 /* ★ 第 42 轮微调：head cap 2.50→2.20。
-                                            第 41 轮 1.75→2.50（让头部更圆，王总要"鱼头有点尖"），
+                                            第 41 轮 1.75→2.50（当时以为是"让头部更圆"，实为**误判**：
+                                            cap 越大鼻子越尖、只是头被拉长 —— 见 KOI_HEADCAP 的注释），
                                             但 +KDEPTH[0]=0.55 一起作用后，满体单条脏盒多包了几像素，
-                                            真机退化 ~3ms。本轮 cap 退回 2.20，仍比 1.75 圆（多包
+                                            真机退化 ~3ms。本轮 cap 退回 2.20，仍比 1.75 长（多包
                                             hw*0.45 vs hw*0.225），但 AABB 增长砍半。
-                                            配合 KDEPTH[0] 0.55→0.50，整体观感仍是"圆头 + 不胖肚"。 */
+                                            配合 KDEPTH[0] 0.55→0.50，整体观感仍是"圆头 + 不胖肚"。
+                                            ★ 第 46 轮：2.20 提成宏 KOI_HEADCAP（值不变），
+                                              供 _tools/noseladder46.py 出档位阶梯。 */
     for (int i = 0; i < KSEG; i++) {
         pt_quad(s_pts[(s_npts - 1) * 2], s_pts[(s_npts - 1) * 2 + 1],
                 _rx[i], _ry[i],
@@ -2407,13 +2521,40 @@ static void koi_draw(koi_t *k)
        ⚠️ 只统计池子里那几条（s_koi）：setup_koi_icon 是拿一个**栈上的临时 koi_t**
           画的，它的 bx0.. 从来没被 step 写过（=0），混进来会读出 176px 这种假欠缺，
           把真读数盖掉（假 FAIL 比 FAIL 更坏，铁律 11）。 */
-    if (k >= s_koi && k < s_koi + MAX_KOI) {
+    if (k >= s_koi && k < s_koi + MAX_KOI && !s_full) {
+        /* ★★ 第 46 轮：**整屏重画帧不计**。
+           为什么：这条判据问的是"这一帧会不会留下上一帧的残影"，而整屏重画
+           （s_full）把 76800 个像素全写一遍 —— 鱼脏盒**根本没被用到**，不可能有残影。
+           实测证据：扫 KOI_FRAMEMS 时 120/142/160/200ms 下的最大值都出现在
+           **步 5~6（刚进池的头几帧，正是整屏重画）**，原始欠缺 12~15px，
+           而同期金标准两条判据（脏区渲染 / 脏区覆盖）全 PASS。
+           把整屏帧算进来 = 用一个**用不到的盒子**去否定一个**没被使用的机制**，
+           读出来的数还会把稳态的真实读数（6~7px）整个盖住 —— 假 FAIL 比 FAIL 更坏。
+           ⚠️ 判据本身没变松：稳态（真正走脏区）的欠缺照样逐帧取最大值。 */
         float d0 = k->bx0 - k->ax0, d1 = k->ax1 - k->bx1;
         float d2 = k->by0 - k->ay0, d3 = k->ay1 - k->by1;
-        if (d0 > s_bbox_short) s_bbox_short = d0;
-        if (d1 > s_bbox_short) s_bbox_short = d1;
-        if (d2 > s_bbox_short) s_bbox_short = d2;
-        if (d3 > s_bbox_short) s_bbox_short = d3;
+        if (s_rtrace_from <= s_step_no && s_step_no <= s_rtrace_to) {
+            printf("    [bs 步%d 鱼%d] 报盒 x[%.1f..%.1f] y[%.1f..%.1f] | "
+                   "真AABB x[%.1f..%.1f] y[%.1f..%.1f] | 缺 %.2f/%.2f/%.2f/%.2f "
+                   "grow=%.3f v=%.2f curv=%.3f headA=%.3f full=%d\n",
+                   s_step_no, (int)(k - s_koi),
+                   k->bx0, k->bx1, k->by0, k->by1,
+                   k->ax0, k->ax1, k->ay0, k->ay1,
+                   d0, d1, d2, d3, k->grow, k->v, k->curv, k->headA, s_full);
+        }
+        /* ★★ 第 46 轮：记下"最大欠缺"的现场（帧号 / 鱼号 / 哪一侧 / 当时的弯曲与体量），
+           否则只有一个数，看不出是"形变随 dt 变大"还是"某个事件推了一把"。 */
+        float dd[4] = {d0, d1, d2, d3};
+        for (int s = 0; s < 4; s++) {
+            if (dd[s] > s_bbox_short) {
+                s_bbox_short = dd[s];
+                s_bs_step = s_step_no;
+                s_bs_koi  = (int)(k - s_koi);
+                s_bs_side = s;
+                s_bs_raw  = s_bbox_short + KOI_DIRT_MARGIN;   /* 未扣 margin 的原始欠缺 */
+                s_bs_grow = k->grow;
+            }
+        }
     }
 #endif
 }
@@ -2761,7 +2902,8 @@ static void koi_step(koi_t *k, float dt)
     } else {
         k->wanderT -= dt;
         if (k->wanderT <= 0) {
-            k->wanderT = rnd_f(3.4f, 6.4f);
+            /* ★ 第 46 轮：换目标间隔 ÷KOI_LV_WAND（越大越勤换 = 越活泼）。 */
+            k->wanderT = rnd_f(3.4f, 6.4f) / KOI_LV_WAND;
             for (int tr = 0; tr < 8; tr++) {
                 /* ★★ 第 45 轮：漫游目标从"以屏幕中心为心的椭圆"改成"安全区里的随机点"。
                    旧椭圆 (KW/2−44−kh, KH/2−54−kh) 是**矩形回避带**时代的残留：
@@ -2788,8 +2930,11 @@ static void koi_step(koi_t *k, float dt)
         float wdd = hypotf(wdx, wdy);
         if (wdd < 36.0f) k->wanderT = 0.0f;              // 到点换目标，别在原点绕圈
         if (wdd < 0.6f) { wdx = 1.0f; wdy = 0.0f; wdd = 1.0f; }
-        vx += wdx / wdd * 1.05f;
-        vy += wdy / wdd * 1.05f;
+        /* ★ 第 46 轮：漫游推力 ×KOI_LV_WAND。
+           1.05 是相对"前进惯性项 fcos(headA)（模长 1.0）"的比值 ——
+           它决定"想去哪"能在多大程度上压过"现在朝哪"。调大 = 更愿意拐弯。 */
+        vx += wdx / wdd * 1.05f * KOI_LV_WAND;
+        vy += wdy / wdd * 1.05f * KOI_LV_WAND;
     }
 
     if (s_shakeT > 0) {                                   // 受惊四散
@@ -2832,21 +2977,33 @@ static void koi_step(koi_t *k, float dt)
     float e = fabsf(err) / 1.15f;
     if (e > 1.0f) e = 1.0f;
     float shaped = powf(e, 1.7f) * (float)(k->turnSide ? k->turnSide : (err < 0 ? -1 : 1));
-    float kk = dt * 4.2f; if (kk > 1.0f) kk = 1.0f;
+    /* ★ 第 46 轮：KOI_LV_TURN 同时乘在"响应速度 4.2"与"转向速率 2.9"上 ——
+       只改拐弯的**快慢**，不改拐弯的**形状**（形状由 powf 1.7 / 死区 2.60 / 1.48 定）。
+       只乘其中一个会把"转头曲线"掰变形（要么起步拖、要么过冲抖）。 */
+    float kk = dt * 4.2f * KOI_LV_TURN; if (kk > 1.0f) kk = 1.0f;
     k->curv += (shaped * 0.40f - k->curv) * kk;
-    k->headA += k->curv * 2.9f * dt;
+    k->headA += k->curv * 2.9f * KOI_LV_TURN * dt;
 
     k->gaitTime -= dt;                                    // 步态 burst / coast
     if (k->gaitTime <= 0) {
-        if (k->burst) { k->burst = 0; k->gaitTime = rnd_f(0.70f, 1.50f); }
-        else          { k->burst = 1; k->gaitTime = rnd_f(0.30f, 0.55f); }
+        /* ★ 第 46 轮：KOI_LV_GAIT —— burst 时长 ×LV、coast 时长 ÷LV。
+           原值 burst 0.30~0.55s / coast 0.70~1.50s ⇒ **滑行占了约 70% 的时间**，
+           这就是王总说的"很飘逸"：大部分时候鱼在滑、不是在游。
+           ⚠️ 除的是**结果**不是 rnd_f 的参数 —— 随机数调用次数与顺序必须保持不变，
+              否则整条随机序列平移，荷叶/波光点全跟着变（第 20 轮踩过）。 */
+        if (k->burst) { k->burst = 0; k->gaitTime = rnd_f(0.70f, 1.50f) / KOI_LV_GAIT; }
+        else          { k->burst = 1; k->gaitTime = rnd_f(0.30f, 0.55f) * KOI_LV_GAIT; }
     }
     int power = k->seek || s_shakeT > 0.0f || fabsf(err) > 1.20f;
     int burst = power || k->burst;
     float ampT = k->seek ? 0.50f : (burst ? 0.38f : 0.24f);
     float wa_t = dt * (burst ? 5.0f : 2.6f); if (wa_t > 1.0f) wa_t = 1.0f;
     k->waveAmp += (ampT - k->waveAmp) * wa_t;
-    float hzT = k->seek ? 3.0f : (burst ? 2.4f : 1.5f);
+    /* ★ 第 46 轮：摆尾频率 ×KOI_LV_HZ。
+       ⚠️ 上限有物理约束：真机 tick 只有 ~8Hz，而摆尾是**振荡**——
+          超过 ~3.5Hz 就会因为采样不足而变成"闪"而不是"摆"（Nyquist 那一套）。
+          所以这个档位别往 2 倍以上加，真要更活就加 KOI_LV_SPD / KOI_LV_WAND。 */
+    float hzT = (k->seek ? 3.0f : (burst ? 2.4f : 1.5f)) * KOI_LV_HZ;
     float hz_t = dt * 3.6f; if (hz_t > 1.0f) hz_t = 1.0f;
     k->hz += (hzT - k->hz) * hz_t;
     k->phase += dt * k->hz * 6.2832f;
@@ -2854,10 +3011,11 @@ static void koi_step(koi_t *k, float dt)
 
     float align = 0.5f + 0.5f * fcos_t(err);
     int biting = (k->biteT > 0);
+    /* ★ 第 46 轮：巡游/抢食速度 ×KOI_LV_SPD。 */
     float vT = (k->seek ? 24.0f : (s_shakeT > 0 ? 26.0f : 19.0f))
              * (0.62f + 0.46f * k->grow)
              * (0.86f + 0.28f * s_satiety)
-             * (0.42f + 0.58f * align) * KOI_SCALE
+             * (0.42f + 0.58f * align) * KOI_SCALE * KOI_LV_SPD
              * (biting ? BITE_SLOW : 1.0f);
     if (burst) {
         float vk = dt * (biting ? 10.0f : 3.8f); if (vk > 1.0f) vk = 1.0f;
@@ -2866,7 +3024,10 @@ static void koi_step(koi_t *k, float dt)
         float vk = dt * 0.72f; if (vk > 1.0f) vk = 1.0f;
         k->v -= k->v * vk;
     }
-    k->v = clampf(k->v, 0.0f, 34.0f * KOI_SCALE);
+    /* ★ 第 46 轮：上限也必须跟着 KOI_LV_SPD 抬 —— 否则提速度档时会先撞上限，
+       表现是"档位调大了但速度没变"（一个很容易看漏的哑档）。
+       量过：vT 名义值 54px/s × 1.9 就会顶到原来的 34×3=102 上限。 */
+    k->v = clampf(k->v, 0.0f, 34.0f * KOI_SCALE * KOI_LV_SPD);
     if (biting) k->biteT -= dt;
 
     /* ★★ 第 45 轮：硬约束从"矩形 clampf"换成"安全区多边形推回"。
@@ -2976,29 +3137,45 @@ static void step(float dt)
           水面变便宜之后它的代价也从"白多填水"变成"白重画好几遍对象"。 */
     for (int i = 0; i < s_nkoi; i++) {
         koi_t *k = &s_koi[i];
-        float ox = k->x, oy = k->y, oa = k->headA;
+        float ox = k->x, oy = k->y, oa = k->headA, oc = k->curv;
         koi_step(k, dt);
         float dx = k->x - ox, dy = k->y - oy;
         float da = k->headA - oa;
+        float dc = k->curv - oc;
         float x0, y0, x1, y1;
         if (k->ax1 >= k->ax0) {
-            /* ★ 上帧 AABB 先**绕 (x,y) 转 Δθ**、再**平移 disp** —— 这两步合起来
-               才精确等于"本帧的包围盒"（鱼体是刚体绕自身 (x,y) 转、再整体平移；
-               摆动相位与体长的残差由 KOI_DIRT_MARGIN 覆盖）。
+            /* ★★ 第 46 轮：**按两个角各转一次再求并**。
+               起因（量出来的）：真机帧长 ~105ms、峰值 142ms 时，"鱼脏盒最大欠缺"
+               从 1.75px（42ms）涨到 6.8~14px。逐帧打现场发现全部落在**弯身**上：
+                 步5 鱼2  curv +0.389 → −0.081（一帧内反向）⇒ 真 AABB 的 x1 比报盒多 6.0px
+               机理：`koi_spine` 里 `a += curv·KBEND[i]`，而 **KBEND 之和 = 1.00**
+                 ⇒ 尾端绝对角 = headA + curv；头端 = headA。
+                 所以一帧之内，**头**转了 ΔheadA，**尾**转了 ΔheadA + Δcurv。
+                 旧代码只绕 (x,y)（= 头）转 ΔheadA ⇒ 尾端那 Δcurv 整段没人管。
+               量级对得上：Δcurv 0.47 × 尾端力臂 ≈ 20px ⇒ 侧向 ~9px，与实测 6~14px 同阶。
+               ■ 修法：把上帧 AABB 绕头**分别按 ΔheadA 与 ΔheadA+Δcurv 转**，两个盒取并。
+                 鱼体对头是**星形**的（头在体内偏后，鼻子只伸出 hw·cap/2），所以
+                 中间角度的姿态夹在这两个极端姿态之间；严格说圆弧还会鼓出
+                 r·Δθ²/8 ≈ 50·0.47²/8 = 1.4px，那点由 AABB 自带的 −1/+2 余量吃掉。
                ⚠️ 只做"平移副本"是不够的：**转身**时包围盒会朝侧向长出去，
-                  平移并集盖不住 —— 台架实测过，一侧欠缺 176px（那样尾巴会残留）。 */
-            float ca = fcos_t(da), sa = fsin_t(da);
+                  平移并集盖不住 —— 台架实测过，一侧欠缺 176px（那样尾巴会残留）。
+               ⚠️ 代价：多 4 个角的旋转（sin/cos 只算两次），脏盒**不会因为这一改就变大**
+                  —— 只有真在弯身的那一帧才多包一点，直游时 dc≈0、与旧口径逐位相同。 */
             float bx[4] = {k->ax0, k->ax1, k->ax0, k->ax1};
             float by[4] = {k->ay0, k->ay0, k->ay1, k->ay1};
             x0 = 1e30f; y0 = 1e30f; x1 = -1e30f; y1 = -1e30f;
-            for (int c = 0; c < 4; c++) {
-                float px = bx[c] - ox, py = by[c] - oy;
-                float rx = ox + px * ca - py * sa + dx;
-                float ry = oy + px * sa + py * ca + dy;
-                if (rx < x0) x0 = rx;
-                if (rx > x1) x1 = rx;
-                if (ry < y0) y0 = ry;
-                if (ry > y1) y1 = ry;
+            for (int pass = 0; pass < 2; pass++) {
+                float ang = pass ? (da + dc) : da;      /* pass0 = 头端角，pass1 = 尾端角 */
+                float ca = fcos_t(ang), sa = fsin_t(ang);
+                for (int c = 0; c < 4; c++) {
+                    float px = bx[c] - ox, py = by[c] - oy;
+                    float rx = ox + px * ca - py * sa + dx;
+                    float ry = oy + px * sa + py * ca + dy;
+                    if (rx < x0) x0 = rx;
+                    if (rx > x1) x1 = rx;
+                    if (ry < y0) y0 = ry;
+                    if (ry > y1) y1 = ry;
+                }
             }
             /* ∪ 上帧自身：这一帧要"擦掉"的范围（旧位置） */
             if (k->ax0 < x0) x0 = k->ax0;
@@ -3013,6 +3190,26 @@ static void step(float dt)
         k->bx1 = x1 + KOI_DIRT_MARGIN; k->by1 = y1 + KOI_DIRT_MARGIN;
         dirty_add_ext(floor_f2i(k->bx0), floor_f2i(k->by0),
                       (int)ceilf(k->bx1), (int)ceilf(k->by1));
+#ifdef KOI_HOST_PROBE
+        /* ★★ 第 46 轮 · 活泼度探针（只给台架）。
+           王总说「鱼的游动……不活泼」「现在游动很飘逸」—— 这两句都是**时间维**的
+           观感，单张图完全看不出来（铁律 14）。而调活泼度的五个乘数（KOI_LV_*）
+           里哪一个在起什么作用，也得有数，否则就是"调完看着好像活泼了点"。
+           这里逐帧累加四个量（只在有脏区的稳态帧上算，整屏帧不计）：
+             · 巡游速度 px/s      —— "游得快不快"
+             · 转头速率 rad/s      —— "转得灵不灵"
+             · |curv|             —— 身体弯不弯（活泼的鱼一直在扭）
+             · burst 占空比        —— "冲得多还是滑得多"（"飘逸" = coast 占比太高）
+           口径：速度用**帧初帧末位置差 / dt**（就是报脏用的那个 disp），
+                 不是 k->v —— k->v 是一阶滞后的目标值，跟真实位移差一截。 */
+        if (!s_full && dt > 0.0f) {
+            float sp = sqrtf(dx * dx + dy * dy) / dt;
+            s_lv_spd += sp; s_lv_turn += fabsf(da) / dt;
+            s_lv_curv += fabsf(k->curv);
+            s_lv_burst += k->burst ? 1.0f : 0.0f;
+            s_lv_n += 1.0f;
+        }
+#endif
 #ifdef KOI_HOST_PROBE
         if (s_rtrace_from <= s_step_no && s_step_no <= s_rtrace_to) {
             printf("    [trace 帧%d] 鱼%d 报 (%d,%d)-(%d,%d) → 表内 %d 个\n",
@@ -3551,6 +3748,72 @@ static void bg_sync_full(void)
     if (wb != s_bg_drawn) { s_full = 1; s_bg_drawn = wb; }
 }
 
+/* ==========================================================================
+   ★★ 第 46 轮：把"每帧固定推进 1/24 秒"改成"按**真实经过时间**推进"
+   --------------------------------------------------------------------------
+   王总：「鱼的游动有点问题 不活泼 … 现在游动很飘逸 微卡顿」。
+   量出来的根因是**时间膨胀**（不是速度参数太小）：
+     · 物理写死 `step(1.0f/FPS)` = 每帧推进 41.7ms；
+     · 但真机一帧要 ~105ms（5 条鱼 + 6 片荷叶），tick 实际只有 ~8Hz。
+     ⇒ 物理时间 / 真实时间 = 41.7 / 105 = **40%**。
+       表现正好是王总说的那两条：
+         · 鱼速只剩设计值的 40%（≈0.45 体长/秒）→「不活泼 / 很飘逸」；
+         · 摆尾频率同样打 4 折（1.5~2.4Hz → 0.6~1.0Hz）→ 从"游"变成"滑"。
+   而且这条 bug **只在慢帧上才显形** —— 第 43 轮 74ms/帧时是 56% 速度，
+   第 44 轮换成照片背景后掉到 6fps，才被王总看出来。
+
+   ■ 修法：`step(dt)` 用**真实经过时间**当步长。
+     ⚠️ 试过、并且**否掉**的方案：按真实 dt 决定"这一帧推进几次 1/24 子步"。
+        理由是"整套运动参数都在 1/24 上标定的，别动步长"。但实测这个方案有个硬伤：
+        105ms ÷ 41.7ms = **2.52 步**，只能取 2 或 3 ⇒ 逐帧在 0.79× 和 1.19× 之间跳，
+        **每帧 ±19% 的速度抖动** —— 那正是王总说的"微卡顿"，等于用一个更显眼的毛病
+        换掉一个不那么显眼的毛病。除非把子步长减半（1/48），但那又会让一阶滞后项
+        的系数从 0.158 掉到 0.079，鱼会变迟钝。**两头都不划算。**
+     直接用真实 dt 没有量化误差：每帧推进的时间**恰好**是真实经过的时间，
+     时间膨胀比 = 1.00，帧间速度也是均匀的。
+     代价是"一阶滞后项"的系数会随帧长浮动（`dt*3.8` 从 0.158 变成 0.40）——
+     但它本来就是"指数逼近"，dt 大只是**逼近得快一点**（速度/曲率在 2~3 帧内到位
+     而不是 5~6 帧），语义没错、也不会过冲（系数都钳在 ≤1）。
+     而这个"更跟手"的副作用，恰好是王总要的"活泼"。
+   ■ KOI_DT_MAX = 0.15s：真机 max=142ms 刚好不被钳。再长的帧（整屏重画那类）
+     就让它慢一点，这是**故意的** —— 否则一次卡顿会让鱼瞬移一大截。
+   ■ KOI_DT_MIN = 1/240s：只用来挡住 dt==0 / NaN，不参与"限速"。
+   ⚠️ 台架必须用 `KOI_FRAMEMS` 复现真机帧长，否则 x86 一帧 1~3ms，
+      台架看到的鱼速跟板子完全不是一回事（见 host_main.c 的合成时钟）。
+   ⚠️ 改这个步长会**改变随机序列的消费节奏**（wanderT 到点才抽随机数），
+      所以鱼位会与第 45 轮不同 —— 这是预期的，不是回归。判据看那几条不变量。 */
+#define KOI_DT_MIN   (1.0f / 240.0f)
+#define KOI_DT_MAX   0.15f
+static int64_t s_dt_last;
+static float   s_dt_last_sec = 1.0f / 24.0f;   /* 最近一帧真正用的 dt（秒） */
+
+static float frame_dt(void)
+{
+    int64_t now = esp_timer_get_time();
+    if (s_dt_last == 0) { s_dt_last = now; s_dt_last_sec = 1.0f / (float)FPS; return s_dt_last_sec; }
+    float dt = (float)(now - s_dt_last) / 1000000.0f;
+    s_dt_last = now;
+    if (!(dt > 0.0f)) dt = KOI_DT_MIN;          /* 也挡住 NaN */
+    if (dt < KOI_DT_MIN) dt = KOI_DT_MIN;
+    if (dt > KOI_DT_MAX) dt = KOI_DT_MAX;       /* 见上面注释：上限是故意的 */
+    s_dt_last_sec = dt;
+    return dt;
+}
+
+#ifdef KOI_HOST_PROBE
+/* ★ 46 轮新增判据：**时间膨胀比** = 物理推进的秒数 ÷ 真实经过的秒数。理想 = 1.00。
+   修之前固定 1/24 步进、真机 8Hz ⇒ 这个数是 **0.40** —— 正是王总说的"不活泼"。
+   修完之后它应当 ≈1.00；小于 1 只可能是"帧长超过 KOI_DT_MAX 被钳住"（慢动作兜底）。
+   ★ 为什么它必须是独立计数器、而不是"用 s_time 算"：s_time 会被 start_pond 清零、
+     而且开局三屏不推进 —— 拿它当分子会得到没有意义的数（判据自己不可靠比没有更坏）。 */
+static float s_dil_sim, s_dil_real;
+float demo_koi_time_dil(void)
+{
+    if (s_dil_real < 1e-3f) return 0.0f;
+    return s_dil_sim / s_dil_real;
+}
+#endif
+
 static void tick_cb(lv_timer_t *t)
 {
     (void)t;
@@ -3575,6 +3838,12 @@ static void tick_cb(lv_timer_t *t)
     int pal_pre = build_palette(s_night);
     PROF_TICK(0);
 
+    /* ★★ 第 46 轮：这一帧的物理步长 = **真实经过时间**（详见 frame_dt 的注释）。
+       每帧都要算（包括开局三屏）—— 开局三屏不跑物理，若那时不更新 s_dt_last，
+       从首页进池的第一帧会看到"在首页停了几十秒"的假 dt（会被 KOI_DT_MAX 钳住，
+       但仍是白送的一次 0.15s 瞬移）。放帧首 = 无论什么场景时钟都连续走。 */
+    float dt = frame_dt();
+
     s_nrect = 0;
     s_full = pal_pre;           // 帧首调色板已变 ⇒ 整屏；否则由 step() 决定
     s_koi_n = 0; s_lily_n = 0;  // 本帧的重复绘制计数，从 0 起
@@ -3584,7 +3853,15 @@ static void tick_cb(lv_timer_t *t)
         PROF_TICK(0);
         if (s_setup_dirty) { s_full = 1; s_setup_dirty = 0; }
     } else {
-        step(1.0f / (float)FPS);
+        /* ★★ 第 46 轮：`step(dt)` —— 真实步长。
+           原来这里是 `step(1.0f / (float)FPS)`（固定 41.7ms），真机 8Hz 时
+           物理只跑到真实时间的 40%，鱼看起来又慢又飘（王总「不活泼 / 很飘逸」）。 */
+        step(dt);
+#ifdef KOI_HOST_PROBE
+        /* 时间膨胀比的分子分母都在**池内**才累加（开局三屏不跑物理，算进去会拉低比值）。 */
+        s_dil_sim  += dt;
+        s_dil_real += s_dt_last_sec;
+#endif
         PROF_TICK(1);
         /* ★★ 第 34 轮修正③：**palette 换档与整屏重画必须同帧**。
            原来 build_palette 挂在 step **之前**，于是"night 前进"与"调色板重建"
@@ -3713,6 +3990,7 @@ void demo_koi_enter(void)
     s_nrect = 0; s_full = 1; s_first_frame = 1; s_bg_drawn = -1;  /* 45 轮：底图重铺 */
     s_frames = 0; s_log_acc = 0; s_sum_us = 0; s_max_us = 0; s_dirty_acc = 0;
     s_t_last = esp_timer_get_time();
+    s_dt_last = 0;              /* ★ 46 轮：子步时钟也从零起（第一帧算 1 子步） */
 
     ESP_LOGI(TAG, "锦鲤池进入：画布 %dx%d RGB565 = %u B，目标 %d fps；开机=首页，%d 档条数可选",
              KW, KH, (unsigned)sizeof(s_fb), FPS, N_PICK);
@@ -4029,6 +4307,22 @@ long demo_koi_cov_over(void) { return s_cov_over; }
 
 /* 预测脏盒的最大欠缺（px）。≤0 = 盒子够大；>0 = 有残留，且这个数就是要补的量。 */
 float demo_koi_bbox_short(void) { return s_bbox_short; }
+
+/* ★★ 第 46 轮：最大欠缺的现场（帧号 / 鱼号 / 0=x0 1=x1 2=y0 3=y1 / 未扣 margin 的原始欠缺 /
+   当时的 grow 与 headA）。用来判断"是形变随 dt 变大"还是"某个事件推了一把"。 */
+int   demo_koi_bs_step(void) { return s_bs_step; }
+int   demo_koi_bs_koi(void)  { return s_bs_koi; }
+int   demo_koi_bs_side(void) { return s_bs_side; }
+float demo_koi_bs_raw(void)  { return s_bs_raw; }
+float demo_koi_bs_grow(void) { return s_bs_grow; }
+
+/* ★★ 第 46 轮 · 活泼度四项读数（稳态帧平均；见报脏循环里的累加注释）。
+   返回 0 表示没有样本。 */
+float demo_koi_lv_speed(void)  { return s_lv_n > 0 ? (float)(s_lv_spd  / s_lv_n) : 0.0f; }
+float demo_koi_lv_turn(void)   { return s_lv_n > 0 ? (float)(s_lv_turn / s_lv_n) : 0.0f; }
+float demo_koi_lv_curv(void)   { return s_lv_n > 0 ? (float)(s_lv_curv / s_lv_n) : 0.0f; }
+float demo_koi_lv_burst(void)  { return s_lv_n > 0 ? (float)(s_lv_burst / s_lv_n) : 0.0f; }
+double demo_koi_lv_n(void)     { return s_lv_n; }
 
 /* ★★ 第 45 轮：安全区自检 —— 帧内所有鱼"离安全区边界的最大越界深度"（px）。
    ≤0 = 全部在区内（这是第三条不变量，前两条是脏区渲染 / 脏区覆盖）。
