@@ -2107,6 +2107,28 @@ static const float KDEPTH[KSEG + 1] = {KOI_KDEPTH0, 0.90f, 1.00f, 0.78f, 0.55f, 
 #define KMOUTH  (0.175f * 0.46f * 0.875f)
 #define BITE_T    0.42f
 #define BITE_SLOW 0.10f
+
+/* ★★ 第 50 轮：吃食涟漪（鱼嘴前那圈"吃到啦"的小圆）的参数**从 BITE_T 里拆出来**。
+   王总第 50 轮原话：「鱼吃到食物了，前面有个跟撒饲料一样的特效 感觉没有」。
+
+   ★ 根因**不是**参数抄错了 —— 固件与网页版逐位相同（r0=1、rMax=9、life=0.42、
+     a0=0.70，见 koi_step 里那次 ripple_add）。真正的差别是**帧率**：
+       · 网页版 60fps：0.42s 的涟漪画 **25 帧**，看得清清楚楚；
+       · 真机 7fps（帧长 143ms）：0.42s 只画得到 **2.9 帧** —— 一闪就没了。
+     所以这两个数必须**按固件的帧率**重新定，照抄网页版在这里是错的。
+
+   ⚠️ 为什么必须独立成宏、不能接着共用 BITE_T：BITE_T 还是"啄食停顿"（k->biteT），
+     它决定鱼吃完在原地停多久。王总这轮明确说「只改波纹，不要改鱼游动」——
+     若把涟漪时长塞进 BITE_T，鱼会跟着停 1 秒，那是改了鱼的行为，不是改特效。
+
+   参考系：撒饲料落水那圈 drop 涟漪是 rMax=rnd(7,14)、life=rnd(0.5,0.75)，
+   王总说要"跟撒饲料一样"，所以往这两个数靠（见 _tools/ripple50.py 的三档阶梯）。 */
+#ifndef EAT_RING_RMAX
+#define EAT_RING_RMAX  12.0f     /* 第 50 轮：9 → 12（对齐落水那圈 drop 的中值） */
+#endif
+#ifndef EAT_RING_LIFE
+#define EAT_RING_LIFE  0.85f     /* 第 50 轮：0.42 → 0.85（真机 7fps 下 ≈ 6 帧） */
+#endif
 /* 尾鳍立度：王总第 25 轮定档「25°」= TAIL_LV[1] */
 #define TK_TL 0.93f
 #define TK_TO 1.04f
@@ -2724,7 +2746,24 @@ static void koi_bbox(const koi_t *k, float *x0, float *y0, float *x1, float *y1)
    9. 涟漪（整数定点环带，与 koi_sim.py 同名函数同式）
    ========================================================================== */
 #define RING_GAP_V  13.0f
-#define RING_LIFE_V 0.40f                                          /* ★ 第 43 轮：0.82→0.40（王总要"拍水后水花需要速度快点 散去"） */
+/* ★ 拍水波列的寿命（秒）。历任取值：
+     0.82  网页版原值（RING_LIFE）
+     0.40  第 43 轮 —— 王总原话「拍水后水花需要速度快点 散去」
+     0.55  ★ 第 50 轮现值 —— 王总改口「拍水按完之后波纹有点太快了 稍微慢一点点」
+     0.70  第 50 轮阶梯里更慢的一档（想再慢就换这个）
+   ★ 真机实测（ripchk50.py，帧长 143ms = 真机 v13 的 7fps）：
+       0.40 → 波纹只存活 **2 帧**（0.29s）  ← 王总觉得"太快"的就是这个
+       0.55 → **3 帧**（0.43s）             ← ★ 现值
+       0.70 → **4 帧**（0.57s）
+     ⚠️ 注意"秒"在这里是个误导单位：真机 7fps 下 0.4 秒只有 2~3 帧，
+        观感由**帧数**决定，不是由秒决定 —— 调这个值要看着帧数调。
+   ⚠️ 第 50 轮只动这一个数（王总：「只改波纹 不要改鱼游动」）——
+      RING_RMAX_V(46) / RING_N_V(3) / RING_GAP_V(13) 都不动，只调快慢。
+   ⚠️ 包成 #ifndef 是为了台架能用 -D 扫档（裸 #define 会被 -D 覆盖后又改回来）。
+      真机上不传 -D 就是下面这个默认值。 */
+#ifndef RING_LIFE_V
+#define RING_LIFE_V 0.55f
+#endif
 #define RING_R0_V   3.0f
 #define RING_RMAX_V 46.0f
 #define RING_F0_V   0.109f
@@ -2880,14 +2919,22 @@ static void do_feed(void)
     for (int i = 0; i < FEED_N; i++) {
         if (s_npel >= MAX_PEL) break;
         const koi_t *near = s_nkoi ? &s_koi[rnd_i(s_nkoi)] : NULL;
-        float tx = near ? clampf(near->x + rnd_f(-40, 40), 16, KW - 16) : rnd_f(16, KW - 16);
-        float ty = near ? clampf(near->y + rnd_f(-40, 40), 20, KH - 28) : rnd_f(20, KH - 28);
+        /* ★ 第 50 轮：撒点范围 ±40 → **±28**，飞行时长 0.34~0.52s → **0.70~1.00s**。
+           为什么：真机 7fps（143ms/帧）下，鱼巡游 ~27px/s = **3.9px/帧**。
+             旧参数：饲料只飞 0.4s ≈ **3 帧** ⇒ 鱼最多挪 12px，而饲料撒在 ±40px 处
+                     ⇒ 追不上。ripchk50.py 实测 45 帧里 seek 只占 13%、eat 涟漪 0 次。
+             新参数：飞行 ≈ 1s ≈ **7 帧** ⇒ 鱼能挪 27px，落点在 ±28px 内
+                     ⇒ 大概率够得到，而且"鱼朝饲料冲"这个过程有 7 帧可看。
+           ⚠️ 王总没说要改饲料速度，但"鱼要往饲料游"这件事在 3 帧里**物理上做不到**，
+              不改这两个数就只能得到"鱼没反应"。飞行慢一点也更像"撒饲料飘落"。 */
+        float tx = near ? clampf(near->x + rnd_f(-28, 28), 16, KW - 16) : rnd_f(16, KW - 16);
+        float ty = near ? clampf(near->y + rnd_f(-28, 28), 20, KH - 28) : rnd_f(20, KH - 28);
         safe_spot(tx, ty); tx = s_spotX; ty = s_spotY;    // 别撒到荷叶上（撒了看不见也吃不到）
         pel_t *pe = &s_pel[s_npel++];
         pe->sx = tx + rnd_f(-14, 14); pe->sy = ty - rnd_f(46, 80);
         pe->tx = tx; pe->ty = ty;
         pe->x = pe->sx; pe->y = pe->sy;
-        pe->t = 0; pe->dur = rnd_f(0.34f, 0.52f); pe->delay = rnd_f(0, 0.55f);
+        pe->t = 0; pe->dur = rnd_f(0.70f, 1.00f); pe->delay = rnd_f(0, 0.55f);
         pe->food = 1;
     }
     for (int k = 0; k < DROP_N; k++) {              // 只出涟漪、不产食物的"雨点"
@@ -3029,14 +3076,24 @@ static void koi_step(koi_t *k, float dt)
     float best = 1e9f;
     /* ★ 第 43 轮：找食目标从 s_food（落地后的颗粒）改为 s_pel（飞行中的颗粒）。
        王总原话"喂食后不需要把食物留停留在水池 其他不落池"——
-       落水那一帧只 ripple_add 不再入 s_food，鱼要吃就在**飞行途中**接住（嘴够到 pe->x,pe->y）。
-       只看 food=1 且 delay≤0 的活颗粒（粒内不捕雨点）。 */
+       落水那一帧只 ripple_add 不再入 s_food，鱼要吃就在**飞行途中**接住。
+    ★★ 第 50 轮补两条（王总：「鱼应该往饲料方向游动 而不是现在的没感觉」）：
+       ① **追落点，不追空中当前位置**（tx/ty 而不是 pe->x/pe->y）。
+          旧写法鱼追的是"饲料这一帧飘到哪儿"，那是个**移动目标**——
+          鱼朝它游，它也在往下掉，鱼永远在追屁股，看着就像"没在追"。
+          落点是固定的，鱼冲过去才是王总说的"往饲料方向游动"。
+       ② **delay>0 的颗粒也算目标**（旧写法 `pe->delay > 0 → continue`）。
+          delay 是 0~0.55s 的"还没落下来"等待期，这段时间鱼**干等着不动**，
+          等它开始落，飞行只剩 dur 那么点时间 —— 真机 7fps 下根本来不及。
+          让它提前出发，可用的时间 = delay + dur ≈ 1.3s（旧写法只有 dur ≈ 0.4s）。
+       ⚠️ 吃食判定**仍然要求 delay ≤ 0**（见下）：可以提前往那儿游，
+          但不能在饲料还没出现时就"吃到"。 */
     for (int m = 0; m < s_npel; m++) {
         const pel_t *pe = &s_pel[m];
-        if (!pe->food || pe->delay > 0) continue;
-        float dx = pe->x - k->x, dy = pe->y - k->y;
+        if (!pe->food) continue;                     /* 不捕雨点 */
+        float dx = pe->tx - k->x, dy = pe->ty - k->y;
         float dd = dx * dx + dy * dy;
-        if (dd < best) { best = dd; ti = m; tx = pe->x; ty = pe->y; }
+        if (dd < best) { best = dd; ti = m; tx = pe->tx; ty = pe->ty; }
     }
     if (ti >= 0 && best > 340.0f * 340.0f) ti = -1;      // 感知半径 ≈ 全屏
     k->seek = (ti >= 0);
@@ -3203,7 +3260,12 @@ static void koi_step(koi_t *k, float dt)
         k->biteT = BITE_T;                                // 啄食停顿：圆灭之前嘴不离开圆
         k->grow = (k->grow + GROW_PER_PELLET > GROW_MAX) ? GROW_MAX
                                                          : k->grow + GROW_PER_PELLET;
-        if (splash_ok(2, mx, my, 3)) ripple_add(mx, my, 1, 9, BITE_T, 0.70f, 2, 1, 0);
+        /* ★ 第 50 轮：rMax / life 改用 EAT_RING_RMAX / EAT_RING_LIFE 两个独立宏
+           （原来写死 9 和 BITE_T）。理由见那两个宏上面的长注释：
+           —— 帧率 7fps 下 0.42s 的涟漪只画得到 2.9 帧，等于没有特效。
+           ⚠️ 别把 life 改回 BITE_T：那是啄食停顿，改它会让鱼吃完停 1 秒。 */
+        if (splash_ok(2, mx, my, 3))
+            ripple_add(mx, my, 1, EAT_RING_RMAX, EAT_RING_LIFE, 0.70f, 2, 1, 0);
     }
 
     /* ★★ 第 45 轮：吃食会让 k->grow 变大 ⇒ 安全区余量 kh = L*grow*0.55 也跟着变大。
@@ -4688,6 +4750,29 @@ int demo_koi_full_redraw_diff(uint16_t *ref)
    于是它报出的差异里有相当一部分坐标**根本不在任何上报矩形内**
    （没被重画的像素不可能自己变）—— 判据坏了，被读成"画面坏了"。
    这正是铁律 11/12 的同一族：**判据自己不可靠时，它给出的数字比没有更坏。** */
+
+/* ★ 第 50 轮：台架查询"当前存活的涟漪数（按 kind）"。
+   kind：0 = 拍水 tap / 1 = 落水 drop / 2 = 吃食 eat。
+   为什么需要它：ripchk50.py 第一版想用"三档画面差分"量涟漪存续帧数，
+   结果 zig cc 对不同 -D 宏的浮点舍入漂移（~3000 像素/帧）把涟漪那点差异
+   整个淹没了 —— 差分这条路走不通。涟漪**数量**是固件自己的真值，
+   直接读它才是独立于被测代码的判据（铁律 11）。
+   ⚠️ 真机不调用，没有开销；只是给台架开的一个读数口。 */
+int demo_koi_rip_count_kind(int kind)
+{
+    int n = 0;
+    for (int i = 0; i < s_nrip; i++)
+        if (s_rip[i].kind == kind) n++;
+    return n;
+}
+
+int demo_koi_seek_n(void)
+{
+    int n = 0;
+    for (int i = 0; i < s_nkoi; i++)
+        if (s_koi[i].seek) n++;
+    return n;
+}
 
 /* 池子当前的精确状态（鱼 / 荷 / 脏矩形 / 覆盖率越界计数）。
    ★ 靠截图猜"这条竖道是什么颜色"太慢，直接把真值打出来（铁律 11）。 */

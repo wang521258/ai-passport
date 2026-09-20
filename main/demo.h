@@ -39,3 +39,14 @@ void demo_low_power_key(bsp_btn_t btn, bsp_btn_ev_t ev);
 // 锦鲤池:全屏自绘(不用 LVGL 控件),240x320 ST7789 竖屏。
 void demo_koi_enter(void);     void demo_koi_exit(void);
 void demo_koi_key(bsp_btn_t btn, bsp_btn_ev_t ev);
+
+/* ★ 第 50 轮：台架专用（KOI_HOST_PROBE 时存在；真机不调，零开销）。
+   返回当前存活的涟漪数，按 kind 分开（0 tap / 1 drop / 2 eat）。
+   ripchk50.py 用它判定"涟漪在真机帧率下能存续几帧"——绕开了"三档画面
+   浮点漂移淹没涟漪差异"那条死路。 */
+int  demo_koi_rip_count_kind(int kind);
+
+/* ★ 第 50 轮：当前**正在追食**（k->seek）的鱼有几条。
+   王总第 50 轮核心诉求「鱼应该往饲料方向游动 而不是现在的没感觉」——
+   "有没有追"这件事必须数出来，不能靠看 GIF 猜。 */
+int  demo_koi_seek_n(void);
