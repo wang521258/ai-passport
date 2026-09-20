@@ -1,12 +1,12 @@
-/* ★ 自动生成，别手改 —— 见 _tools/bgbake43.py
-   王总给的水下光斑图（原图 1086x1448，比例 0.75 == 240/320，等比缩到 240x320）
-   烘成 RGB565：Bayer 4x4 有序抖动
-   尺寸 240x320 = 76800 px，153600 B（2 B/px）—— 进 .rodata，占 flash 不占 RAM。
+/* ★ 自动生成，别手改 —— 见 _tools/bgbake45.py
+   王总给的水下光斑图（白天，不压暗）
+   原图 1086x1448，比例 0.75 == 240/320，等比缩到 240x320；Bayer 4x4 有序抖动
+   尺寸 240x320 = 76800 px，153600 B —— 进 .rodata，占 flash 不占 RAM。
    ⚠️ 别改成 RLE/索引：这是照片，颜色分布广，索引表 + 调色板省不下来多少，
       而且铁律 22 记着「名字与内容不符的常量」那个坑。直接 RGB565 数组，
       固件侧一行 memcpy 就能按行取。 */
-#ifndef KOI_BG_HEADER_GUARD
-#define KOI_BG_HEADER_GUARD
+#ifndef KOI_BG_HDR_KOI_BG
+#define KOI_BG_HDR_KOI_BG
 
 #define KOI_BG_W 240
 #define KOI_BG_H 320
@@ -4814,4 +4814,4 @@ static const uint16_t koi_bg[KOI_BG_W * KOI_BG_H] = {
 0x4be6,0x4b85,0x4bc5,0x4be5,0x4be5,0x4be5,0x4be6,0x3b66,0x2aa5,0x2aa5,0x2aa4,0x2ac3,0x3304,0x2aa4,0x2a85,0x1a25,
 };
 
-#endif /* KOI_BG_HEADER_GUARD */
+#endif /* KOI_BG_HDR_KOI_BG */

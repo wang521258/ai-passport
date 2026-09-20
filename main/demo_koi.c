@@ -133,6 +133,30 @@ static inline int32_t floor_f2i(float v)
    ⚠️ 它进 .rodata（flash），**不占 RAM** —— C3 只有 ~320KB DRAM，而 s_fb 已经吃掉 153,600 B
       （铁律 21）。所以"背景备份一份到 RAM"这条路是死的，必须从 flash 读。 */
 #include "koi_bg.h"
+/* ★★ 第 45 轮：**夜间**底图 = 王总给的平静水面（240x320 RGB565，153,600 B）。
+   由 _tools/bgbake45.py 烘焙，**勿手改**。
+
+   ■ 为什么要有第二张图
+     王总原话：「给你的图片是我需要在昼夜替换的时候晚上换成给你的这个图片」——
+     夜里要换成这张（没有光斑的平静水面），不是把白天那张调暗。
+
+   ■ ★ 为什么这张图是**预先压暗**好的（这是本轮的核心修正）
+     王总原话：「并且是当晚上时候整个屏幕暗 / 现在是按昼夜晚上的时候只是单独鱼和荷叶
+               变暗了 这个不对的」。
+     根因：第 44 轮把水面从"程序化纵向渐变（走调色板 PI_WTOP/PI_WBOT，夜里自动乘 k）"
+           换成"照片（bg_rect 里直接 memcpy）"之后，**底图就绕过了调色板** ——
+           build_palette 只改 s_pal[]，而 bg_rect 一个字节都不看 s_pal。
+           于是夜里：鱼、荷叶、涟漪、波光都暗了，**水面没暗**。
+     修法两条路，选了后者：
+       (甲) bg_rect 逐像素乘 k —— 每像素 3 次拆位/乘/回装，整屏 76800 px 约 15~20ms，
+            而且脏矩形每帧都要重付；在 160MHz 无 FPU 的 C3 上是白送的开销。
+       (乙) 离线把 k 烘进图里 —— 运行时还是**一条 memcpy**，零额外开销（本方案）。
+     ⚠️ 因此：**改固件的 NIGHT_DIM 就必须重跑 _tools/bgbake45.py**，否则背景与
+        鱼/荷叶的亮度对不上（背景按旧 k 压的，鱼按新 k 压的）。
+        烘焙脚本会把当时的 NIGHT_DIM/k 写进头文件注释里，便于对账。
+     ⚠️ 压暗系数必须与 build_palette 里**同一个式子** `(v * k) >> 8`，
+        k = 256 - (int)((1-NIGHT_DIM)*256+0.5)。别在这里"顺手"写成浮点乘。 */
+#include "koi_bg_night.h"
 
 static const char *TAG = "koi";
 
@@ -1084,6 +1108,24 @@ static uint16_t s_water_row[KH];
       这与第 37 轮"档 0 = 改动前逐字节等价"是同一套做法（铁律 14）。 */
 static int s_bg_photo = 1;
 
+/* ★★ 第 45 轮：当前**已经铺进 s_fb** 的底图是哪一份。
+   0 = 白天 koi_bg，1 = 夜间 koi_bg_night，-1 = 还没铺过（第一帧必然整屏）。
+   --------------------------------------------------------------------------
+   为什么单独记一个变量，而不是渲染时现算 `s_night > 0.5f`：
+     ① s_night 会在**帧外**被按键回调直接改（第 43 轮"OK 键昼夜瞬切"就是
+        `s_night = s_nightTarget`，一步到位）。底图该不该换，取决于
+        "**上一帧铺的是哪份**"，而不是"s_night 现在是多少"—— 前者才是能比较的实体。
+     ② 换底图那一帧**必须整屏重画**，否则会出现"上半屏白天图、下半屏夜间图"
+        （脏矩形只会把鱼动过的那几块换成新底图）。这是铁律 13 那一族：
+        状态变了但没人重建。
+   所以用法固定为：渲染前比对一次 → 不一致就 s_full = 1 并同步过去；
+   绝不在别处零散地 `if (s_night > 0.5f) s_full = 1;`（漏一处就是半屏混色）。 */
+static int s_bg_drawn = -1;
+
+/* 底图该用哪一份 —— **唯一**的判定口。bg_rect 与"是否要整屏"都走它，
+   免得两处各写一遍 `s_night > 0.5f` 然后慢慢跑偏（铁律 8 那一族）。 */
+static int bg_want_night(void) { return (s_night > 0.5f) ? 1 : 0; }
+
 static void water_row_build(void)
 {
     const uint8_t *wt = s_pal[PI_WTOP], *wb = s_pal[PI_WBOT];
@@ -1130,6 +1172,9 @@ static int build_palette(float night)
    ⚠️ 别把分发写进调用点（scene_draw / 开局屏各写一次 if）—— 两处早晚跑偏，
       而且"漏改一处"的表现是"某一屏还是老水色"，很难定位。 */
 static void spark_overlay(int x0, int y0, int x1, int y1);   /* 第 44 轮抽出的公共叠加层 */
+/* ★ 第 45 轮：安全区多边形推回。定义在 12a 节（第 12 节之前），但出生点
+   pond_init() 要用它，所以在这里先声明一次。 */
+static int  swim_push(float *px, float *py, float m);
 static KOI_HOT void bg_rect(int x0, int y0, int x1, int y1);
 static KOI_HOT void water_rect_proc(int x0, int y0, int x1, int y1);
 
@@ -1163,13 +1208,20 @@ static KOI_HOT void water_rect_proc(int x0, int y0, int x1, int y1)
       x0..x1 在这一行里也是连续的，一行就是一次 memcpy —— 比逐像素少 240 倍的循环开销。
    ⚠️ koi_bg 在 flash（memory-mapped，过 cache），不在 RAM：C3 的 DRAM 装不下第二份 153,600 B
       （铁律 21）。所以这里是"从 flash 读"，不是"从 RAM 备份读"。
-   ⚠️ 别把这段搬进"每帧整屏重画"：它只在**脏矩形**里被调用，面积通常 15%~35%。 */
+   ⚠️ 别把这段搬进"每帧整屏重画"：它只在**脏矩形**里被调用，面积通常 15%~35%。
+
+   ★★ 第 45 轮：这里多了一个"选哪份底图"的分支 —— 白天 koi_bg / 夜间 koi_bg_night。
+   两份都是**同一尺寸同一行主序**的 RGB565，所以除了源指针，后面的 memcpy 一模一样；
+   夜间那份的压暗已经烘进图里（见 koi_bg_night.h 的说明），运行时**零额外开销**。
+   ⚠️ 选源只走 bg_want_night()，别在这儿内联 `s_night > 0.5f` —— 整屏判定要用同一个口，
+      两边写两遍迟早对不上（表现就是"换夜那一帧只有脏矩形换了底图"）。 */
 static KOI_HOT void bg_rect(int x0, int y0, int x1, int y1)
 {
     demo_koi_who(1, -1);                          /* 归属探针：这一片是"背景" */
+    const uint16_t *bg = bg_want_night() ? koi_bg_night : koi_bg;
     int n = (x1 - x0 + 1) * 2;
     for (int y = y0; y <= y1; y++) {
-        memcpy(&s_fb[y * KW + x0], &koi_bg[y * KW + x0], (size_t)n);
+        memcpy(&s_fb[y * KW + x0], &bg[y * KW + x0], (size_t)n);
 #ifdef KOI_HOST_PROBE
         for (int x = x0; x <= x1; x++) WHO_PUT(x, y);
 #endif
@@ -1984,10 +2036,15 @@ static void pond_init(void)
     pick_colors(pats, s_nkoi, s_split_kh);
     for (int i = 0; i < s_nkoi; i++) {
         float ia = rnd_f(0, 6.2832f), ir = rnd_f(0.10f, 0.68f);
-        make_koi(&s_koi[i],
-                 (float)KW * 0.5f + cosf(ia) * ((float)KW * 0.5f - 46.0f) * ir,
-                 (float)KH * 0.5f + sinf(ia) * ((float)KH * 0.5f - 64.0f) * ir,
-                 rnd_f(0.52f, 0.72f), pats[i]);
+        float kx = (float)KW * 0.5f + cosf(ia) * ((float)KW * 0.5f - 46.0f) * ir;
+        float ky = (float)KH * 0.5f + sinf(ia) * ((float)KH * 0.5f - 64.0f) * ir;
+        /* ★★ 第 45 轮：出生点也必须在安全区里 —— 否则第一帧就被 swim_push "啪"地
+           推回来，看起来像鱼出生时跳了一下。
+           ⚠️ swim_push **不抽随机数**，所以插在这里不会平移后面荷叶/波光点的随机
+              序列（这一点很关键，见下面荷叶那段注释）。若哪天它开始抽随机数，
+              必须把出生点改成"先算完所有随机数、最后统一推回"。 */
+        swim_push(&kx, &ky, 40.0f);      /* 出生时给 40px 余量：鱼还要长大 */
+        make_koi(&s_koi[i], kx, ky, rnd_f(0.52f, 0.72f), pats[i]);
     }
 
     /* 荷叶：环形散布 + 最小间距检查，避免叠成一片。
@@ -2559,6 +2616,121 @@ static void do_feed(void)
 /* ==========================================================================
    12. 推进
    ========================================================================== */
+
+/* ==========================================================================
+   12a. ★★ 第 45 轮：鱼可游区域 Safe Swim Polygon
+   --------------------------------------------------------------------------
+   王总第 45 轮原话：
+     「鱼可游区域 Safe Swim Polygon：(42, 20) (198, 20) (211, 48) (216, 90)
+       (213, 145) (218, 205) (210, 263) (192, 298) (48, 298) (29, 267)
+       (23, 220) (27, 170) (23, 115) (29, 62)
+       我给到你的数据是鱼可有用的区域」
+
+   这 14 个点是**王总直接给的数值**，不是从图上描的 —— 所以它是最权威口径，
+   下面 SWIM_PT[] 与 _tools/swimpoly45.py 的 POLY **逐点一致**（那边是唯一真源）。
+   坐标口径已核对为 **240x320 屏幕像素**：关于 x=120 近似镜像（240-42=198、
+   240-29=211、240-48=192），y 范围 20..298（距上边 20px、下边 22px）。
+
+   ■ 为什么不用"矩形回避带"（第 38~44 轮那套 m2 + clampf）
+     旧写法是四条轴向软推力 + 一个 m2 = 26+kh 的回避带，再钳到 0.40*KW。
+     它是**矩形**的：池子四角是圆的（石头堆出来的），矩形在角上会把鱼往石头里推；
+     而且 m2 钳到 96 之后左右推力在 240px 宽的屏上方向打架，鱼会原地抖
+     （第 38 轮为这个打过一次补丁）。王总这次直接把安全区画出来了，就该用他的。
+
+   ■ ★ 这个多边形**不是凸的**（量过：叉积符号集 = {+1, -1}）
+     右缘 (216,90)→(213,145)→(218,205) 和左缘 (23,115)→(27,170)→(23,220)
+     各有一个 4~5px 的内凹。所以"逐边半平面推回"不能直接套 —— 它对非凸多边形
+     不收敛。验证过的替代方案（见 _tools/swimpoly45.py 的 halfplane_region）：
+       **取 14 条边各自的内向半平面求交**。交集天然是凸的，而且实测它
+       ⊆ 原多边形（数值扫描 194,615 个采样点，落在多边形外的 291 个点
+         全部位于边界线上，是射线法在边界上的固有误判），
+       代价是两处内凹被切掉 —— 最大收缩 5.5px，而鱼的边界余量是 54px，
+       肉眼完全看不出来。**保守方向**（切掉的是多边形内部那一侧，
+       绝不会把鱼放到石头上），可以接受。
+     ⚠️ 王总若改了这 14 个点，必须重跑 swimpoly45.py 重新验证
+        "半平面交 ⊆ 多边形"与"内缩后非空"这两条，别想当然。
+     ⚠️ 别为了"用回凸算法"去取凸包 —— 凸包比原多边形**大**，
+        会把鱼放进被王总划掉的那两个凹口里。
+
+   ■ 为什么用"逐边投影迭代"而不是"算最近边界点再推"
+     交集是凸的 ⇒ 逐边投影（P ⟵ P − d·n，d<0 时）几轮就收敛，只用乘加，无 sqrt；
+     而"最近边界点"要先遍历 14 条边算距离再开方，还得分内外，贵且难写对。
+     实测 3 轮足够（凸集上每轮至少消掉一条违规边）。 */
+#define SWIM_N 14
+
+/* ★ 王总给的 14 点，原文照抄、一个数没动。顺序 = 上边左→右、右缘自上而下、
+   下边右→左、左缘自下而上（屏幕坐标下是顺时针）。 */
+static const float SWIM_PT[SWIM_N][2] = {
+    { 42.0f,  20.0f}, {198.0f,  20.0f}, {211.0f,  48.0f}, {216.0f,  90.0f},
+    {213.0f, 145.0f}, {218.0f, 205.0f}, {210.0f, 263.0f}, {192.0f, 298.0f},
+    { 48.0f, 298.0f}, { 29.0f, 267.0f}, { 23.0f, 220.0f}, { 27.0f, 170.0f},
+    { 23.0f, 115.0f}, { 29.0f,  62.0f},
+};
+
+/* 每条边的**内向**单位法线，以及多边形外接框。都是常数，开机建一次。 */
+static float SWIM_NRM[SWIM_N][2];
+static float SWIM_BB[4];                 /* x0, y0, x1, y1 —— 外接框 */
+static int   SWIM_ready = 0;
+
+static void swim_init(void)
+{
+    if (SWIM_ready) return;
+    SWIM_ready = 1;
+
+    SWIM_BB[0] = SWIM_BB[1] =  1e9f;
+    SWIM_BB[2] = SWIM_BB[3] = -1e9f;
+    float cx = 0.0f, cy = 0.0f;
+    for (int i = 0; i < SWIM_N; i++) {
+        float x = SWIM_PT[i][0], y = SWIM_PT[i][1];
+        cx += x; cy += y;
+        if (x < SWIM_BB[0]) SWIM_BB[0] = x;
+        if (y < SWIM_BB[1]) SWIM_BB[1] = y;
+        if (x > SWIM_BB[2]) SWIM_BB[2] = x;
+        if (y > SWIM_BB[3]) SWIM_BB[3] = y;
+    }
+    cx /= (float)SWIM_N; cy /= (float)SWIM_N;
+
+    /* 内向法线：先取边的一个法线，再用重心（一定在内部）判该不该翻向。
+       多边形关于重心是星形的（王总这 14 点如此），所以这个判法够用。 */
+    for (int i = 0; i < SWIM_N; i++) {
+        const float *a = SWIM_PT[i], *b = SWIM_PT[(i + 1) % SWIM_N];
+        float dx = b[0] - a[0], dy = b[1] - a[1];
+        float nx =  dy, ny = -dx;
+        float L = sqrtf(nx * nx + ny * ny);
+        if (L < 1e-6f) { SWIM_NRM[i][0] = 0.0f; SWIM_NRM[i][1] = 0.0f; continue; }
+        nx /= L; ny /= L;
+        if ((cx - a[0]) * nx + (cy - a[1]) * ny < 0.0f) { nx = -nx; ny = -ny; }
+        SWIM_NRM[i][0] = nx; SWIM_NRM[i][1] = ny;
+    }
+}
+
+/* 把点 (*px,*py) 推回"多边形内缩 m 像素"的区域。返回 1 = 真的推过。
+   ⚠️ 只在**凸**的交集上成立；非凸多边形要先用 halfplane 求交（本文件上面那套）。
+   ⚠️ 轮数不是拍脑袋的：台架第 45 轮实测（demo_koi_swim_worst，第三条不变量）
+        3 轮 → 残差 0.67px（有鱼在角上擦出界 0.67px，亚像素，肉眼看不到但不达标）
+        6 轮 → 残差 ≤0（见 _tools/_host45c.log 的「安全区最大越界」读数）
+      **别往回调到 3** —— "凸集上 3 轮就够"是估计，不是量出来的，实测不够。
+      代价几乎为零：绝大多数调用第一轮就没有违规、直接 break，
+      只有真出界的那几次才会跑满 6 轮（6×14 次乘加）。
+   ⚠️ 别改成"推一轮就返回"：一轮只消掉当前最违规的那条边，角上要好几轮才收敛。 */
+static int swim_push(float *px, float *py, float m)
+{
+    swim_init();
+    float x = *px, y = *py;
+    int moved = 0;
+    for (int it = 0; it < 6; it++) {
+        int hit = 0;
+        for (int i = 0; i < SWIM_N; i++) {
+            const float *a = SWIM_PT[i], *n = SWIM_NRM[i];
+            float d = (x - a[0]) * n[0] + (y - a[1]) * n[1] - m;
+            if (d < 0.0f) { x -= d * n[0]; y -= d * n[1]; hit = 1; moved = 1; }
+        }
+        if (!hit) break;
+    }
+    if (moved) { *px = x; *py = y; }
+    return moved;
+}
+
 static void koi_step(koi_t *k, float dt)
 {
     float kh = k->L * k->grow * 0.55f;
@@ -2591,16 +2763,23 @@ static void koi_step(koi_t *k, float dt)
         if (k->wanderT <= 0) {
             k->wanderT = rnd_f(3.4f, 6.4f);
             for (int tr = 0; tr < 8; tr++) {
-                float wa = rnd_f(0, 6.2832f), wr = sqrtf(rnd_f(0.10f, 1.0f));
-                /* ★ 第 38 轮：体量 ×3 后 kh 最大 ≈103px，KW/2−44−kh 会变**负**
-                   → 目标点被甩到中心对面、鱼来回抽搐。加下限即可：
-                   kh 小的时候（开局）这里读数和改动前**逐位相同**，只有大 kh 才起作用。 */
-                float rwx = (float)KW * 0.5f - 44.0f - kh;
-                float rwy = (float)KH * 0.5f - 54.0f - kh;
-                if (rwx < 4.0f) rwx = 4.0f;
-                if (rwy < 4.0f) rwy = 4.0f;
-                k->wx = (float)KW * 0.5f + fcos_t(wa) * rwx * wr;
-                k->wy = (float)KH * 0.5f + fsin_t(wa) * rwy * wr;
+                /* ★★ 第 45 轮：漫游目标从"以屏幕中心为心的椭圆"改成"安全区里的随机点"。
+                   旧椭圆 (KW/2−44−kh, KH/2−54−kh) 是**矩形回避带**时代的残留：
+                   池子四角是圆的（石头堆的），椭圆在角上照样能把目标甩到石头里。
+                   新做法三步，全部只用乘加：
+                     ① 在安全区**外接框**里均匀取一点；
+                     ② swim_push 把它拉进安全区（交集是凸的 ⇒ 3 轮投影必收敛）；
+                     ③ 与当前位置做一次随机**凸组合** —— 凸集内的凸组合仍在集合内，
+                        所以目标点 100% 落在安全区里；而且不会老贴在边界上。
+                   ⚠️ 步骤③不能省。省了的话：②的结果一定落在**内缩后的边界上**，
+                      于是目标永远是"贴着某条边的一个点"，鱼就变成朝最近的边界冲刺、
+                      到边掉头 —— 看起来像在池子里来回弹，而不是在游。 */
+                float txx = SWIM_BB[0] + rnd_f(0.0f, 1.0f) * (SWIM_BB[2] - SWIM_BB[0]);
+                float tyy = SWIM_BB[1] + rnd_f(0.0f, 1.0f) * (SWIM_BB[3] - SWIM_BB[1]);
+                swim_push(&txx, &tyy, kh + 3.0f);
+                float tt = rnd_f(0.30f, 1.0f);
+                k->wx = k->x + (txx - k->x) * tt;
+                k->wy = k->y + (tyy - k->y) * tt;
                 if (hypotf(k->wx - k->x, k->wy - k->y) >= 48.0f &&
                     fabsf(angdiff(atan2f(k->wy - k->y, k->wx - k->x), k->headA)) <= 1.92f) break;
             }
@@ -2620,15 +2799,21 @@ static void koi_step(koi_t *k, float dt)
         vy += (k->y - s_shakeY) / sd * 3.0f;
     }
 
-    float m2 = 26.0f + kh;                                // 边界回避带（随体量缩放）
-    /* ★ 第 38 轮：体量 ×3 后 m2 会超过半屏宽，左右两侧推力方向打架 → 鱼原地抖。
-       钳到 0.40*KW（=96）以内，与下面 clamp 的可达区间一致。
-       kh 小的时候（开局）m2 远小于这个上限，**读数与改动前逐位相同**。 */
-    if (m2 > (float)KW * 0.40f) m2 = (float)KW * 0.40f;
-    if (k->x < m2)              vx += (m2 - k->x) / m2 * 3.2f;
-    if (k->x > KW - m2)         vx -= (k->x - (KW - m2)) / m2 * 3.2f;
-    if (k->y < m2 + 6.0f)       vy += (m2 + 6.0f - k->y) / m2 * 3.2f;
-    if (k->y > KH - m2 - 20.0f) vy -= (k->y - (KH - m2 - 20.0f)) / m2 * 3.2f;
+    /* ★★ 第 45 轮：边界回避带（矩形 m2 + 四条轴向推力）→ 安全区多边形的**软推**。
+       做法与下面那次硬约束**共用同一个 swim_push**：把"位置"推回区内，
+       推回向量就是转向力（越界越远、推得越狠，天然等价于旧的 m2 比例推力）。
+       ⚠️ 与硬约束共用同一个函数是刻意的：两边各写一套的话，迟早出现
+          "软推认 A 区、硬夹认 B 区"，表现是鱼贴着某条边原地高频抖。
+       ⚠️ 系数 3.2 沿用旧值不动 —— 它是第 38 轮量出来的（太小顶不住 seek 的 2.2
+          冲刺，太大会让鱼在边界上抖），没有理由跟着形状一起改。 */
+    {
+        float bx = k->x, by = k->y;
+        if (swim_push(&bx, &by, kh + 3.0f)) {
+            float ox = bx - k->x, oy = by - k->y;
+            float od = hypotf(ox, oy);
+            if (od > 0.6f) { vx += ox / od * 3.2f; vy += oy / od * 3.2f; }
+        }
+    }
 
     float sepW = k->seek ? 0.34f : 0.85f;                 // 抢食时别互推
     for (int o = 0; o < s_nkoi; o++) {
@@ -2684,8 +2869,14 @@ static void koi_step(koi_t *k, float dt)
     k->v = clampf(k->v, 0.0f, 34.0f * KOI_SCALE);
     if (biting) k->biteT -= dt;
 
-    k->x = clampf(k->x + fcos_t(k->headA) * k->v * dt, kh + 3.0f, KW - kh - 3.0f);
-    k->y = clampf(k->y + fsin_t(k->headA) * k->v * dt, kh + 3.0f, KH - kh - 3.0f);
+    /* ★★ 第 45 轮：硬约束从"矩形 clampf"换成"安全区多边形推回"。
+       clampf 是**矩形**的，而池子四角是圆的（石头堆出来的）—— 鱼在角上会被夹进
+       石头里，这正是王总这次把安全区画出来的原因。swim_push 只在越界时才动，
+       界内时连一次赋值都没有，所以"鱼本来就在区里"的那些帧**逐位不变**。
+       ⚠️ 别再退回 clampf：那等于把安全区当矩形用，四个角全废。 */
+    k->x += fcos_t(k->headA) * k->v * dt;
+    k->y += fsin_t(k->headA) * k->v * dt;
+    swim_push(&k->x, &k->y, kh + 3.0f);
 
     /* 吃食：判定点 = 吻端 → 吃食圆也落在嘴上（第 18 轮口径）。
        第 43 轮起吃的是 s_pel[ti]（飞行中的颗粒），不再走 s_food。 */
@@ -2705,6 +2896,17 @@ static void koi_step(koi_t *k, float dt)
                                                          : k->grow + GROW_PER_PELLET;
         if (splash_ok(2, mx, my, 3)) ripple_add(mx, my, 1, 9, BITE_T, 0.70f, 2, 1, 0);
     }
+
+    /* ★★ 第 45 轮：吃食会让 k->grow 变大 ⇒ 安全区余量 kh = L*grow*0.55 也跟着变大。
+       上面那次 swim_push 用的是**吃之前**的 kh，所以这里必须按**吃之后**的 kh 再推一次。
+       量出来的漏子：GROW_PER_PELLET(0.018) × L_max(69) × 0.55 = **0.68px**，
+       正好等于台架第三条不变量「安全区最大越界」报的 0.67px —— 不是迭代没收敛
+       （3 轮和 6 轮读数一模一样就是证据），是余量在推完之后又变了。
+       ⚠️ 别再想"把上面那次 push 挪到这儿"：上面那次必须留在**吃食判定之前**，
+          因为吃食判定用的是推正之后的嘴位置（mx/my）—— 挪下来会让"鱼隔着石头吃到食"。
+       ⚠️ 凡是"会改变 kh / k->L 的语句"，都要么放在 push 之前，要么在它后面补一次 push。
+          这条不变量现在只靠这一处维持，改 koi_step 时务必看一眼。 */
+    swim_push(&k->x, &k->y, k->L * k->grow * 0.55f + 3.0f);
 }
 
 /* 需要整屏重画的两种情形：开机第一帧（缓冲还是空的），以及昼夜过渡期
@@ -3335,6 +3537,20 @@ static int64_t     s_t_last, s_sum_us, s_max_us, s_dirty_acc;
 static int64_t     s_koi_acc, s_lily_acc;          // 重复绘制计数的窗口累计
 static int         s_frames, s_log_acc;
 
+/* ★★ 第 45 轮：底图换源（白天 koi_bg ⇄ 夜间 koi_bg_night）⇒ 本帧必须整屏。
+   **只允许在 render() 正前方调一次**（tick_cb 里那一处），别在帧首再判一遍。
+   理由：s_night 有两个来源 ——
+     · 帧外：按键回调直接 `s_night = s_nightTarget`（第 43 轮"OK 键瞬切"）；
+     · 帧中：step() 里的昼夜 ramp 推进。
+   放在 render() 前 = 两种来源在**同一处**被裁决。若改到帧首，只能覆盖帧外那种，
+   帧中那种就漏了；而"两处各判一次"迟早会漏一处，表现就是换夜那一帧只有脏矩形
+   换了底图（半屏白天图半屏夜间图）—— 铁律 13 那一族（状态变了但没人重建）。 */
+static void bg_sync_full(void)
+{
+    int wb = bg_want_night();
+    if (wb != s_bg_drawn) { s_full = 1; s_bg_drawn = wb; }
+}
+
 static void tick_cb(lv_timer_t *t)
 {
     (void)t;
@@ -3388,6 +3604,16 @@ static void tick_cb(lv_timer_t *t)
         if (build_palette(s_night)) s_full = 1;
         PROF_TICK(0);
     }
+    /* ★★ 第 45 轮：底图换源（白天 koi_bg ⇄ 夜间 koi_bg_night）⇒ 本帧必须整屏。
+       位置很讲究：**必须紧贴 render()**，不能挪到帧首。
+         · 帧首 `s_full = pal_pre;` 那行是**赋值**不是置位 —— 写在它前面会被冲掉
+           （第 44 轮就是在这一步栽过：pal_pre 的返回值被后面的 s_full = 0 冲掉）；
+         · 更要紧的是：s_night 在**帧中**还会被 step() 里的昼夜 ramp 推进，
+           帧首判一次、帧中变了就漏了。放在这里 = 帧外（按键瞬切）与帧中（ramp）
+           两种来源在**同一处**裁决，不会出现"两处判定、漏一个"。
+       ⚠️ 别和上面 pal_pre 合并成一个 if —— "调色板重建"与"底图换源"是两件事，
+          恰好同时发生只是通常情形，不是必然（day_pal_sync 会强制重建调色板但底图没换）。 */
+    bg_sync_full();
     render();                   // 内部自己 PROF_TICK(2)/(3..8)
     s_koi_acc += s_koi_n; s_lily_acc += s_lily_n;
 
@@ -3484,7 +3710,7 @@ void demo_koi_enter(void)
     s_time = 0; s_shakeT = 0;
     s_night = 0; s_nightTarget = 0; s_night_log = 0;   /* ★ 37 轮：逻辑值一起归零 */
     s_satiety = 0.5f;
-    s_nrect = 0; s_full = 1; s_first_frame = 1;
+    s_nrect = 0; s_full = 1; s_first_frame = 1; s_bg_drawn = -1;  /* 45 轮：底图重铺 */
     s_frames = 0; s_log_acc = 0; s_sum_us = 0; s_max_us = 0; s_dirty_acc = 0;
     s_t_last = esp_timer_get_time();
 
@@ -3512,6 +3738,7 @@ static void start_pond(void)
     s_night = 0; s_nightTarget = 0; s_night_log = 0;   /* ★ 37 轮：逻辑值一起归零 */
     s_first_frame = 1;                       /* 进池第一帧整屏画一次 */
     s_full = 1;
+    s_bg_drawn = -1;                         /* ★ 45 轮：底图也跟着重铺 */
     ESP_LOGI(TAG, "开养：%d 条（红白 %d / 御黄金 %d）",
              s_pick_n, s_split_kh, s_pick_n - s_split_kh);
 }
@@ -3532,6 +3759,7 @@ static void reset_to_home(void)
     s_first_frame = 1;
     s_full = 1;
     s_setup_dirty = 1;
+    s_bg_drawn = -1;                         /* ★ 45 轮：底图也跟着重铺 */
 }
 
 /* 按键分派。逐条对齐网页版的 fire(name)：feed(↑) / tap(↓) / night(OK)。
@@ -3801,6 +4029,32 @@ long demo_koi_cov_over(void) { return s_cov_over; }
 
 /* 预测脏盒的最大欠缺（px）。≤0 = 盒子够大；>0 = 有残留，且这个数就是要补的量。 */
 float demo_koi_bbox_short(void) { return s_bbox_short; }
+
+/* ★★ 第 45 轮：安全区自检 —— 帧内所有鱼"离安全区边界的最大越界深度"（px）。
+   ≤0 = 全部在区内（这是第三条不变量，前两条是脏区渲染 / 脏区覆盖）。
+   ■ 为什么要单独验：swim_push 只迭代 3 轮（凸集上够用），但"够用"是推的，
+     得量。残差一旦 >0，表现是**鱼在某个角上擦着石头过**，肉眼很难发现，
+     可一旦发生就是"鱼进了石头里"这种一眼假的画面。
+   ■ ★ 判据必须**独立于被测代码**：这里重新逐边算一遍 signed distance，
+     绝不复用 swim_push 的返回值/中间量 —— 复用的话它只会重复被测代码的 bug，
+     绿得毫无意义（铁律 11/12：判据自己不可靠时，它给出的数字比没有更坏）。
+   ■ 量的是"半平面交"而不是原多边形：因为固件实际约束的就是这个凸交集
+     （原多边形非凸，见 12a 节）。若要验原多边形，得另写射线法。 */
+float demo_koi_swim_worst(void)
+{
+    if (s_scene != 1) return -1e9f;
+    float worst = -1e9f;
+    for (int i = 0; i < s_nkoi; i++) {
+        const koi_t *k = &s_koi[i];
+        float m = k->L * k->grow * 0.55f + 3.0f;
+        for (int e = 0; e < SWIM_N; e++) {
+            const float *a = SWIM_PT[e], *n = SWIM_NRM[e];
+            float d = (k->x - a[0]) * n[0] + (k->y - a[1]) * n[1] - m;
+            if (-d > worst) worst = -d;
+        }
+    }
+    return worst;
+}
 
 /* 把一个像素分三类：
      '.'  = 正好等于该行纯净水色        （s_water_row[y]）
