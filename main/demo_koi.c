@@ -2772,9 +2772,15 @@ static float _lx[KSEG + 1], _ly[KSEG + 1], _rx[KSEG + 1], _ry[KSEG + 1];
    ⚠️⚠️ 绝不能用 rnd_f —— 那会消耗全局随机数，整池鱼后续 wander / burst /
        phase 全跟着错位，800 帧混沌放大后安全区越界从 0.00 漂到 −2.34px
       （铁律 20，第 63 轮实测过两次）。整数哈希是纯函数，不碰随机序列。 */
-static float spot_h(int a, int b)
+/* ★ v37：加第三个参数 **seed = 鱼的身份**。
+   旧版 spot_h(s, v) 只依赖斑索引 s 和顶点号 v ⇒ **所有鱼的第 0 个斑形状
+   完全相同**（王总："每条鱼不同"）。现在 (seed, s, v) 三者一起哈希
+   ⇒ 每条鱼、每块斑、每个顶点都独立。
+   ⚠️ seed 必须来自**已有字段**（k->phase / k->L），绝不能调 rnd_f（铁律 20）。 */
+static float spot_h(int a, int b, int c)
 {
-    uint32_t h = (uint32_t)a * 374761393u + (uint32_t)b * 668265263u;
+    uint32_t h = (uint32_t)a * 374761393u + (uint32_t)b * 668265263u
+               + (uint32_t)c * 2246822519u;
     h = (h ^ (h >> 13)) * 1274126177u;
     h ^= h >> 16;
     return (float)(h & 0xFFFFu) / 65536.0f;
@@ -2922,25 +2928,32 @@ static void make_spots(koi_t *k)
        记一句当时的观察，免得下次重新踩：体长缩到 25px 之后，小斑 sl=0.052~0.072
        只剩 1.3px，在屏上就是一粒噪点 —— 也就是说"小斑"这个设计只在
        L≈40px 以上才读得出来，是**跟体量强耦合**的。真要把鱼缩小，这条必须一起改。 */
-    int n = (k->pat == 2) ? (3 + (rnd_f(0, 1) < 0.5f ? 0 : 1))
-                          : (2 + (rnd_f(0, 1) < 0.75f ? 1 : 0));
+    /* ★ v37：只出 **2 或 3 块**（王总"需要两块或者三块分布着"）。
+       旧式会出到 4 块，而大斑全长 ≈10.7px、段长只有 ≈5.7px ⇒ 4 块必然连成一片
+       ⇒ 正是王总说的"鱼身上都是单一一块"。
+       ⚠️ rnd_f 调用次数仍是 1 次（铁律 20），只是把取值改成 2/3。 */
+    int n = (rnd_f(0, 1) < 0.55f) ? 2 : 3;
     float head = rnd_f(0, 0.6f);
     k->ns = n;
     for (int i = 0; i < n; i++) {
         int big = (i % 2 == 0);
-        /* ★ v36b：斑**不落在段0（头）**。
-           旧式 `(int)(head + i/n·(KSEG−0.4))` 在 i=0 时 sg = (int)head 恒定 = 0
-           ⇒ 37% 的斑堆在头段；而大斑半长 ≈1.04~1.14 段、段0 的 tt 上限只有
-           0.90 ⇒ **头段根本放不下**，p_lo 必被 clamp ⇒ 半边顶点挤在一点
-           ⇒ 斑被削成长条（v36a 收紧 tt 后仍剩 3.3% 截断，全来自段0）。
-           ⇒ sg 收进 [1, KSEG−2] = [1, 3]：段1~3 半宽 0.78~1.00，撑得开色块。
-             sg=1, tt≥0.18 ⇒ p_lo = 1.18 − 1.14 = +0.04 > 0 ✓
-             sg=3, tt≤0.82 ⇒ p_hi = 3.82 + 1.14 = 4.96 < 5  ✓
-           ⚠️ 只改系数与 clamp 界，rnd_f 调用次数一字未动（铁律 20）。 */
-        int sg = 1 + (int)(head + ((float)i / (float)n) * (KSEG - 2.6f));
+        /* ★ v37：斑心**沿弧长均匀铺开**（治"糊成一块"）。
+           v36 的写法会让 n=3 时出现 sg = 1,1,2（两块落在同一段），
+           而大斑全长 ≈10.7px > 段长 ≈5.7px ⇒ 必然重叠成一片。
+           现在直接按**弧长** u（单位=段）均匀分：
+             u = 1.15 + (i + 0.5 + 抖动)/n × 2.70   ∈ [1.15, 3.85]
+             n=2 ⇒ 两块中心相距 ≈1.35 段
+             n=3 ⇒ 相邻相距 ≈0.90 段（原来可能同段）
+           区间 [1.15, 3.85] 是"离两端 ≥1.15 段"—— 给斑半长 ~1.1 段留地方，
+           保证 p 不会被端点 clamp（v36 实测 CLIP → 0）。 */
+        float u = 1.15f + ((float)i + 0.5f + (head - 0.30f)) / (float)n * 2.70f;
+        if (u < 1.15f) u = 1.15f;
+        if (u > 3.85f) u = 3.85f;
+        int sg = (int)u;
         if (sg > KSEG - 2) sg = KSEG - 2;
         if (sg < 1) sg = 1;
         float tt = clampf(rnd_f(0.18f, 0.82f), 0.10f, 0.90f);
+        tt = clampf(u - (float)sg, 0.10f, 0.90f);
         /* ★ v36：**斑心别贴着头/尾端点**（治"长线"）。
            i=0 时 sg 恒 = 0（头段），而 p = sg + tt + rx/segl 里 rx 最远 ±0.85 段，
            tt=0.18 ⇒ p_lo = −0.67 ⇒ clamp 到 0 ⇒ **半边顶点全挤在同一点**
@@ -2964,7 +2977,13 @@ static void make_spots(koi_t *k)
            为什么敢拉这么长：下面绘制时横向会**跟着曲面收窄**（sc = hw_p/hwc），
            斑往头/尾延伸时自动变窄 ⇒ 不会捅出轮廓，见 koi_draw ③红斑。 */
         float sl = big ? rnd_f(0.124f, 0.160f) : rnd_f(0.065f, 0.088f);
-        float so = rnd_f(-0.13f, 0.13f);
+        /* ★ v37：相邻斑**交替长在脊线两侧**（治"糊成一块"）。
+           真实红白锦鲤的绯盘就是沿脊线两侧交替分布的，中间露出白底 ⇒
+           即使纵向有一点重叠，左右错开也能看出是**分开的几块**。
+           旧式 so ∈ ±0.13（≈±0.65px）几乎全压在脊线上 ⇒ 视觉上糊成一整块。
+           ⇒ 符号按 i 交替（确定性），幅度 ±(0.12~0.30) 随机。
+           ⚠️ 只改 rnd_f 的区间（±0.13 → 0.12~0.30），调用次数不变（铁律 20）。 */
+        float so = ((i % 2) == 0 ? 1.0f : -1.0f) * rnd_f(0.12f, 0.30f);
         float hw = KDEPTH[sg] + (KDEPTH[sg + 1] - KDEPTH[sg]) * tt;
         /* ★★★ 第 63 轮修复：红斑横向**溢出鱼身轮廓**。
            王总：「红白鱼的红斑设定也需要修改成现在鱼的形状对吧 不然有的红色出去了」
@@ -3498,6 +3517,10 @@ static void koi_draw(koi_t *k)
         float ay = _spy[sg] + (_spy[sg + 1] - _spy[sg]) * tt;
         float off = k->sp[s][4] * Wd;
         float ph  = (float)s * 1.7f;
+        /* ★ v37：每条鱼的**独立形状种子**（详见 spot_h 的注释）。
+           k->phase ∈ [0, 2π) 是 make_koi 里已设好的字段，再异或 L 的整数化，
+           ⇒ 每条鱼一个不同的整数，且**完全不消耗 rnd_f**（铁律 20）。 */
+        int fseed = (int)(k->phase * 977.0f) ^ (int)(k->L * 13.0f);
         /* ★ 第 51 轮：红斑尺寸整体缩放（王总「红色我需要在鱼身上覆盖的稍微再多点占比」）。
            ⚠️ 只改**尺寸**，不改 k->sp[][] 里那些随机系数 —— 动它们会改随机序列
               （铁律 20），整池鱼的位置/斑的分布全跟着变。
@@ -3545,7 +3568,7 @@ static void koi_draw(koi_t *k)
         for (int v = 0; v < SEGS; v++) {
             /* 每顶点两个独立噪声（都不消费 rnd_f）：一个给 ang 抖、一个给 v_mid 相位
                （v_hi 用 spot_h(s, v+31)，见下面 r 公式；bit 不要与上面的 nz 重复算） */
-            float nz  = spot_h(s, v);
+            float nz  = spot_h(fseed, s, v);
             /* ★ 角度抖动 ⇒ 顶点间距不再等分（等分是"规则感"的主要来源） */
             float ang = ph + ((float)v + KOI_SPOT_AJIT * (nz - 0.5f))
                         * (6.2832f / (float)SEGS);
@@ -3592,9 +3615,12 @@ static void koi_draw(koi_t *k)
                  · 凸出硬上限改 1.10（让头部/腹部窄段允许的小尖角保留下来）。
                ⚠️ 这版是回归"分叶团块"的算力版，面积大致回到 v33 量级，
                  形状仍是真不规则（v_mid+v_hi 的非周期相位 + 每顶点独立 hash）。 */
+            /* ★ v37：v_mid 0.30→0.40、v_hi 0.05→0.08 —— 王总"彻底避免圆形和椭圆形"。
+               ⚠️ 只有 v_mid / v_hi 这种**每顶点独立 hash**（与 θ 无关）才真能打破椭圆；
+                  v_low 那种 cos(θ) 是轴对称的，加再大也还是椭圆（v34 已验证）。 */
             float v_low = 0.10f * fcos_t(ang * 1.7f + ph * 1.3f);   /* ∈[-0.10,+0.10]，双向保大致椭圆 */
-            float v_mid = 0.30f * (spot_h(s, v + 17) - 0.5f);       /* ∈[-0.15,+0.15]，双向 hash 不规则 */
-            float v_hi  = 0.05f * (spot_h(s, v + 31) * 2.0f - 1.0f);/* ∈[-0.05,+0.05]，高频锯齿 */
+            float v_mid = 0.40f * (spot_h(fseed, s, v + 17) - 0.5f);       /* ∈[-0.15,+0.15]，双向 hash 不规则 */
+            float v_hi  = 0.08f * (spot_h(fseed, s, v + 31) * 2.0f - 1.0f);/* ∈[-0.05,+0.05]，高频锯齿 */
             float bite  = v_low + v_mid + v_hi;
             float r     = 1.0f - bite;                              /* 均值 ≈ 1.0（不再单向缩水） */
             float sin_a = fabsf(fsin_t(ang));
@@ -3710,7 +3736,16 @@ static void koi_draw(koi_t *k)
              两条轴叠起来 = 斑既有自己的明暗，又跟着身体的曲面走。
            ⚠️ 边缘的"轻微凹凸、大小不同"由上面的**双频径向扰动**给
               （KOI_SPOT_SEGS 8→11 + JIT 双频），不是靠再叠一圈描边。 */
-        fill_poly(s_poly, s_npts, s_pal[PI_KSPOT], NULL, 236);   // 0.92 底：主体朱红
+        /* ★ v37：每块斑的**色调微调**（王总"颜色有轻微深浅层次"）。
+           旧代码所有斑共用同一套三遍 fill 参数 ⇒ 深浅完全一样、看不出块。
+           用 spot_h 给每块斑一个 tone ∈[0,1)：偏小 ⇒ 偏深红，偏大 ⇒ 偏亮朱红。
+           ⚠️ **不新增 fill_poly**，只调现有三遍的 alpha ⇒ 真机零额外开销
+             （v36 斑已占 36ms/帧，不能再加一遍全多边形填充）。 */
+        float tone = spot_h(fseed, s, 7);
+        int   base_a = 236 + (int)((tone - 0.5f) * 44.0f);
+        if (base_a > 256) base_a = 256;
+        if (base_a < 200) base_a = 200;
+        fill_poly(s_poly, s_npts, s_pal[PI_KSPOT], NULL, base_a);  // 底：主体朱红
 
         grad_t gs;
         /* 亮：斑心受光 → 较亮朱红 #F25A45 */
@@ -3719,8 +3754,8 @@ static void koi_draw(koi_t *k)
         gs.cx = (int32_t)rne_f2i(cax * 256.0f);
         gs.cy = (int32_t)rne_f2i(cay * 256.0f);
         gs.s0 = (int32_t)(-0.55f * sw * 256.0f); gs.a0 = 0;
-        gs.s1 = (int32_t)(-0.08f * sw * 256.0f); gs.a1 = KSPOT_LT_A;
-        gs.s2 = (int32_t)( 0.08f * sw * 256.0f); gs.a2 = KSPOT_LT_A;
+        gs.s1 = (int32_t)(-0.08f * sw * 256.0f); gs.a1 = (int)(KSPOT_LT_A * (0.70f + tone * 0.60f));
+        gs.s2 = (int32_t)( 0.08f * sw * 256.0f); gs.a2 = (int)(KSPOT_LT_A * (0.70f + tone * 0.60f));
         gs.s3 = (int32_t)( 0.55f * sw * 256.0f); gs.a3 = 0;
         fill_poly(s_poly, s_npts, s_pal[PI_KSPOT_LT], &gs, 256);
 
@@ -3734,10 +3769,12 @@ static void koi_draw(koi_t *k)
             gs.uy = (int32_t)rne_f2i(ny2 * 256.0f);
             gs.cx = (int32_t)rne_f2i(_spx[mid2] * 256.0f);
             gs.cy = (int32_t)rne_f2i(_spy[mid2] * 256.0f);
-            gs.s0 = (int32_t)(-Wq2 * 0.92f * 256.0f); gs.a0 = KSPOT_DK_A;
+            /* ★ v37：暗的程度也跟着 tone 走（tone 大 = 偏亮 ⇒ 少压点深红） */
+            int dk_a = (int)(KSPOT_DK_A * (1.30f - tone * 0.60f));
+            gs.s0 = (int32_t)(-Wq2 * 0.92f * 256.0f); gs.a0 = dk_a;
             gs.s1 = (int32_t)(-Wq2 * 0.30f * 256.0f); gs.a1 = 0;
             gs.s2 = (int32_t)( Wq2 * 0.30f * 256.0f); gs.a2 = 0;
-            gs.s3 = (int32_t)( Wq2 * 0.92f * 256.0f); gs.a3 = KSPOT_DK_A;
+            gs.s3 = (int32_t)( Wq2 * 0.92f * 256.0f); gs.a3 = dk_a;
             fill_poly(s_poly, s_npts, s_pal[PI_KSPOT_DK], &gs, 256);
         }
     }
