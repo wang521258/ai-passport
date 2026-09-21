@@ -490,6 +490,16 @@ static int  s_caus_ox = -1, s_caus_oy = -1;
 static int  s_caus_gain = CAUSTIC_GAIN;
 
 #ifdef KOI_HOST_PROBE
+/* ★★ 第 63 轮：红斑**溢出鱼身轮廓**的几何探针（只台架编译）。
+   单位 = **半宽的比例**（0.10 = 捅出去半宽的 10%）；判据 ≤ 0。
+   为什么不用"改前/改后两帧 diff"：鱼的轨迹对初值极敏感，两帧连位置都对不齐
+   （实测整帧差异 4.67%、bbox 几乎全屏），差异里混着物理漂移 ⇒ 读数是假的。
+   几何探针不依赖帧，也不依赖鱼在哪一段——只问"这个顶点在不在鱼身里"。 */
+static float s_spot_over     = -1000.0f;   /* 观测到的最大溢出（越大越糟） */
+static int   s_spot_over_seg = -1;         /* 发生在哪一段（0=头 2=腹 5=尾根） */
+#endif
+
+#ifdef KOI_HOST_PROBE
 /* ★ 第 39 轮「叶下鱼台架」专用：这一帧**跳过鱼 0 的绘制**。
    它只掐绘制、不碰模拟（鱼 0 照常走位置、照常参与同类避让、照常报脏），
    所以"画了 / 没画"两组出图的差异**只可能**来自鱼 0 的像素本身
@@ -2569,6 +2579,37 @@ static const float KDEPTH[KSEG + 1] = {KOI_KDEPTH0, 0.90f, 1.00f, 0.78f, 0.55f, 
 #define EAT_RING_LIFE  0.85f     /* 第 50 轮：0.42 → 0.85（真机 7fps 下 ≈ 6 帧） */
 #endif
 
+/* ★★ 第 63 轮：游动涟漪 —— 王总要的就是「鱼游动时肚子那随机泛起的水波」。
+   设计：
+     · 每条鱼一个独立 cooldown `rsp_cd`（koi_t 字段），每帧扣 dt，
+       归零时 spawn 一道并重置 8~15 秒（per-鱼不同）。
+     · 9 条鱼场景下池里平均每 ~1.2 秒冒一道 —— 节奏比"死水"多一口气、
+       又远没到"哗啦哗啦"。初值 5~15 秒让首道涟漪不挤在开场那一瞬。
+     · 半径 / 寿命比吃食涟漪（kind=2）小一半多、alpha 更低 —— 避免跟
+       "鱼真的吃到食了"那一下混淆（参考第 51 轮否决过的"追食途中冒水花"）。
+     · ★ 这是**纯观赏**效果，不参与任何判定；不报脏不参与活跃度。 */
+#ifndef WAVE_CD_MIN
+#define WAVE_CD_MIN    8.0f      /* spawn 后下次间隔下限（秒） */
+#endif
+#ifndef WAVE_CD_MAX
+#define WAVE_CD_MAX    15.0f     /* spawn 后下次间隔上限 */
+#endif
+#ifndef WAVE_CD_INIT_MIN
+#define WAVE_CD_INIT_MIN  5.0f   /* 第一道涟漪的等待区间下限（让首道更早） */
+#endif
+#ifndef WAVE_CD_INIT_MAX
+#define WAVE_CD_INIT_MAX 15.0f
+#endif
+#ifndef WAVE_RING_RMAX
+#define WAVE_RING_RMAX  4.5f     /* 比吃食 12 小一半多：远远看一眼是"小水花" */
+#endif
+#ifndef WAVE_RING_LIFE
+#define WAVE_RING_LIFE  0.6f     /* 真机 7fps 下 ≈ 4 帧：够看见、不留尾巴 */
+#endif
+#ifndef WAVE_RING_A0
+#define WAVE_RING_A0    0.45f    /* 比吃食 0.70 淡 35% */
+#endif
+
 /* ★★ 第 51 轮：曾经试过"追食途中也冒水花"，**王总否掉了**（「这个不要啊」）。
      保留这段说明免得以后再提：做法是在 seek 期间每 0.35s 往吻端放一个
      小涟漪（r=5 / life=0.45）。否决理由（推测）：鱼一路冒水花会把"吃到那一下"
@@ -2642,6 +2683,7 @@ typedef struct {
     float bx0, by0, bx1, by1;            // ★ 本帧**预测**的脏区包围盒（step 算出、已含 margin）
     float ax0, ay0, ax1, ay1;            // ★ 上帧**真实绘制**包围盒（像素，含尾鳍摆幅
                                          //   包络），由 koi_draw 逐点累加；空 = ax1 < ax0
+    float rsp_cd;                        // ★★ 第 63 轮：游动涟漪 spawn 倒计时（秒，归零就 spawn）
 } koi_t;
 
 static koi_t s_koi[MAX_KOI];
@@ -2821,8 +2863,24 @@ static void make_spots(koi_t *k)
         float sl = big ? rnd_f(0.098f, 0.128f) : rnd_f(0.052f, 0.072f);
         float so = rnd_f(-0.13f, 0.13f);
         float hw = KDEPTH[sg] + (KDEPTH[sg + 1] - KDEPTH[sg]) * tt;
-        float lim = hw - 0.06f - fabsf(so);
-        if (lim < 0.30f) lim = 0.30f;
+        /* ★★★ 第 63 轮修复：红斑横向**溢出鱼身轮廓**。
+           王总：「红白鱼的红斑设定也需要修改成现在鱼的形状对吧 不然有的红色出去了」
+           根因（一处漏账，两处新参数都没回头更新它）：
+             · 本函数算的是"斑心半宽 sp[3]"，它是**绘制前**的值；
+             · 绘制时 koi_draw 还会再乘 **KOI_SPOT_SCALE**(1.15)，
+               而且**每个顶点**还要乘径向扰动 r ∈ [1−JIT, 1+JIT]；
+             · 本函数 clamp 用的 lim 只减了 0.06 与 |so|，
+               **既没算 SCALE 也没算 JIT** —— 第 51 轮把 SCALE 提到 1.15、
+               第 54 轮把 JIT 提到 0.34 时都没回头改这里。
+           实测溢出量（sw 取 big 上限 0.62 / 头部取 lim）：
+             头段 hw=0.55：|so|+sp[3]×1.15×1.34 = **0.73** > 0.55 ⇒ 超出 32%
+             腹段 hw=1.00：                        **1.005** > 1.00 ⇒ 刚好出界
+           修法：lim **除以 KOI_SPOT_SCALE**，把绘制时的整体放大预先扣掉。
+           ⚠️ JIT 那一份不在这里扣 —— JIT 改成"只向内凹"（见 koi_draw ③红斑），
+              外接尺寸不再外扩，所以这里不用再除一次（除了会让斑白白小一圈）。
+           ⚠️ 下限 0.30 也要跟着除，否则窄段（头/尾根）会被下限顶回溢出区间。 */
+        float lim = (hw - 0.06f - fabsf(so)) / KOI_SPOT_SCALE;
+        if (lim < 0.30f / KOI_SPOT_SCALE) lim = 0.30f / KOI_SPOT_SCALE;
         float sw = big ? rnd_f(0.50f, 0.62f) : rnd_f(0.30f, 0.42f);
         if (sw > lim) sw = lim;
         k->sp[i][0] = (float)sg; k->sp[i][1] = tt;
@@ -2841,6 +2899,16 @@ static void make_koi(koi_t *k, float x, float y, float g0, uint8_t pat)
     k->hz = rnd_f(1.5f, 2.4f);
     k->waveAmp = 0.26f;
     k->burst = 1;
+    /* ★★ 第 63 轮：游动涟漪首道倒计时 —— **不能用 rnd_f**！
+       教训：本轮初版用 `rnd_f(5,5,15)` 设 rsp_cd，**多消耗一次全局随机数**，
+       让整池鱼的后续 wander / burst / phase 全跟着偏移一位，800 帧混沌放大后
+       安全区越界从 0.00 变成 -2.34 px（铁律 20：随机序列的消耗次数不能随便改）。
+       ⇒ 改用鱼的 L 派生：每条鱼首道时间不同（鱼越大越晚），确定性、不消耗随机。
+       ⌈0.5f⌉ 把 L 量化到整数格，同一长度附近的鱼首道时间一致。 */
+    k->rsp_cd = (float)((int)(WAVE_CD_INIT_MIN +
+                              (k->L - KOI_L0_MIN * KOI_SCALE) * 0.8f));
+    if (k->rsp_cd < WAVE_CD_INIT_MIN) k->rsp_cd = WAVE_CD_INIT_MIN;
+    if (k->rsp_cd > WAVE_CD_INIT_MAX) k->rsp_cd = WAVE_CD_INIT_MAX;
     k->gaitTime = rnd_f(0.3f, 1.0f);
     k->wanderT = rnd_f(0, 1.2f);
     k->wx = x; k->wy = y;
@@ -3318,11 +3386,37 @@ static void koi_draw(koi_t *k)
                叠一个 3.7θ 的高频（权重 0.32）才能出现**细碎的凹凸**，
                像真实绯斑那种不规则的边缘。
                ⚠️ 两个频率**互质**（2.3 / 3.7），否则拍频会让所有斑长一个样。 */
-            float r = 1.0f + KOI_SPOT_JIT *
-                      (0.68f * fcos_t(ang * 2.3f + ph * 1.7f) +
-                       0.32f * fcos_t(ang * 3.7f + ph * 2.9f));
+            /* ★★ 第 63 轮：径向扰动改成**只向内凹**（r ∈ [1−JIT, 1.0]）。
+               原来 r ∈ [1−JIT, 1+JIT]，凸起的那部分会**捅出鱼身轮廓** ——
+               这就是王总看到的"有的红色出去了"里最尖的那几个角。
+               改成只向内之后：
+                 · 外接尺寸仍是 sw（**不缩小**，保住第 51 轮王总要的红色覆盖率）；
+                 · 边缘的凹凸感还在（相对外接椭圆是凹进去的）；
+                 · 数学上保证不会超出外接椭圆 ⇒ 配合上面 lim 的修复，红斑必然在身内。
+               ⚠️ 别写成 `1 - JIT*wob`：那会让 wob 为负时 r > 1，一样捅出去。 */
+            float wob = 0.68f * fcos_t(ang * 2.3f + ph * 1.7f) +
+                        0.32f * fcos_t(ang * 3.7f + ph * 2.9f);   /* ∈ [-1, 1] */
+            float r = 1.0f - KOI_SPOT_JIT * (0.5f - 0.5f * wob);   /* ∈ [1−JIT, 1] */
             float rx = fcos_t(ang) * sl * r;
             float ry = fsin_t(ang) * sw * r;
+#ifdef KOI_HOST_PROBE
+            /* ★★ 第 63 轮：红斑**溢出鱼身轮廓**的几何探针（只台架编译）。
+               为什么不用"改前/改后两帧 diff"来判：鱼的轨迹对初值极敏感，
+               两帧连鱼的位置都对不齐（实测整帧差异 4.67%、bbox 几乎全屏），
+               差异里混着物理漂移，读出来的"溢出像素数"是假的。
+               ⇒ 直接量几何：顶点横向位置（以半宽 Wd 为 1 的单位）
+                 减去该段鱼身半宽系数 hw ⇒ >0 就是捅出轮廓。
+               ⚠️ 判据是 `s_spot_over <= 0`（单位：半宽比例，0.02 ≈ 半宽的 2%）。 */
+            {
+                float hwv = KDEPTH[sg] + (KDEPTH[sg + 1] - KDEPTH[sg]) * tt;
+                float lat = (off + ry) / Wd;
+                float ov  = fabsf(lat) - hwv;
+                if (ov > s_spot_over) {
+                    s_spot_over = ov;
+                    s_spot_over_seg = sg;
+                }
+            }
+#endif
             s_pts[v*2]     = cax + ca * rx - sa * ry;
             s_pts[v*2 + 1] = cay + sa * rx + ca * ry;
         }
@@ -3380,7 +3474,9 @@ static void koi_draw(koi_t *k)
         s_npts = SEGS;
         for (int v = 0; v < SEGS; v++) {
             float ang = ph + (float)v * (6.2832f / (float)SEGS);
-            float r = 1.0f + KOI_SPOT_JIT * fcos_t(ang * 2.3f + ph * 1.7f);
+            /* ★ 第 63 轮：同红斑，墨斑也改成只向内凹（见上面红斑那条注释） */
+            float r = 1.0f - KOI_SPOT_JIT *
+                      (0.5f - 0.5f * fcos_t(ang * 2.3f + ph * 1.7f));
             float rx = fcos_t(ang) * sl * r;
             float ry = fsin_t(ang) * sw * r;
             s_pts[v*2]     = _spx[2] + ca * rx - sa * ry;
@@ -4249,6 +4345,37 @@ static void koi_step(koi_t *k, float dt)
          幂等的（kh 与上面那次完全相同）。**仍保留**：上面那条"凡是改 kh 的语句都要补
          push"是硬规矩，留着这行将来谁再加"吃食长大"也不会漏；成本只有 6 次内点积。 */
     swim_push(&k->x, &k->y, k->L * k->grow * 0.55f + 3.0f);
+
+    /* ★★ 第 63 轮：游动涟漪 —— 王总：「鱼在游玩的过程中随机在肚子那泛起一个涟漪」。
+       触发：rsp_cd 倒计时归零时 spawn 一道，重置为 WAVE_CD_MIN..MAX 秒。
+       位置：鱼身第 KSEG/2 段（腹部，KDEPTH=1.00 最宽段）的中点 t=0.5，
+             向鱼身**外侧**法向偏移 0.9·Wd —— 落在鱼肚子一侧的水里。
+       偏左还是偏右：随机（rnd_f），鱼游动时两侧都会甩水，自然。
+       ⚠️ 用的是 koi_step 末尾**当前帧**的 _spx/_spa（koi_spine 还没跑，
+          是上一帧 draw 算的）—— 差一帧小鱼位置，鱼速 30px/s × 1/8s = 3.75px
+          偏移，肉眼不可见。涟漪本身就是固定位置，下一帧不会跟鱼跑。 */
+    k->rsp_cd -= dt;
+    if (k->rsp_cd <= 0.0f) {  /* ★ 暂时关掉 spawn 体定位根因 */
+        int mid = KSEG / 2;          /* = 2，KDEPTH[2]=1.00 肚子最宽 */
+        float a   = _spa[mid];       /* 上帧鱼身该段切向（鱼头→尾方向） */
+        float sx  = _spx[mid], sy = _spy[mid];
+        float Wd2 = k->L * KOI_WD;   /* 鱼身基准半宽 */
+        /* 法向外侧 = (-sin, cos)；乘 sign 让涟漪落在鱼转弯外侧。
+             用 sinf(k->headA) 符号：headA 已经在 make_koi 里消耗过 rnd_f，
+             sinf 是纯浮点，不消耗额外随机（实测 rnd_f 会让安全区越界 2.34 px）。
+             鱼朝左拐（headA 在 π~2π）就甩右弧，朝右拐就甩左弧 —— 转弯外侧甩水，
+             看着反而比纯随机甩自然。 */
+        float sign = (sinf(k->headA) >= 0.0f) ? 1.0f : -1.0f;
+        float rx = sx + sign * (-fsin_t(a)) * Wd2 * 0.9f;
+        float ry = sy + sign * ( fcos_t(a)) * Wd2 * 0.9f;
+        /* ★★ 用 splash_ok 卡安全区（否则可能冒到石头边水里，看着像水在泡石头）
+           —— splash_ok 第 3 参数 3 = 同类涟漪不超过 3 个，避免连冒一片 */
+        if (splash_ok(3, rx, ry, 3)) {
+            ripple_add(rx, ry, 1, WAVE_RING_RMAX, WAVE_RING_LIFE,
+                       WAVE_RING_A0, 3, 1, 0);
+        }
+        k->rsp_cd = rnd_f(WAVE_CD_MIN, WAVE_CD_MAX);
+    }
 }
 
 /* 需要整屏重画的两种情形：开机第一帧（缓冲还是空的），以及昼夜过渡期
@@ -6191,5 +6318,16 @@ void demo_koi_active_report(void)
            s_act_frames,
            s_act_xmin, s_act_xmax, s_act_xmax - s_act_xmin,
            s_act_ymin, s_act_ymax, s_act_ymax - s_act_ymin);
+}
+
+/* ★★ 第 63 轮：红斑溢出鱼身轮廓的几何判据。
+   单位 = 半宽的比例（0.10 = 捅出去半宽的 10%）；**≤ 0 才算合格**。
+   ★ 这条不变量是"红斑必须长在鱼身上"这个几何事实的唯一可执行判据 ——
+     之前只能靠肉眼看真机（王总：「有的红色出去了」），现在台架能直接卡住。 */
+void demo_koi_spot_report(void)
+{
+    printf("[SPOT] 红斑溢出鱼身(≤0 才合格; 单位=半宽比例): %+.4f"
+           "  (最大发生在第 %d 段: 0=头 2=腹 5=尾根)\n",
+           (double)s_spot_over, s_spot_over_seg);
 }
 #endif
