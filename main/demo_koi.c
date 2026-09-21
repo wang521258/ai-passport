@@ -515,6 +515,10 @@ static float s_wave_rad = -1.0f;
 static double s_spot_area = 0.0;
 static long   s_spot_n    = 0;
 static double s_body_area = 0.0;
+/* ★ v36 诊断：量化"斑为什么小 / 为什么是长线" */
+static double s_d_sl = 0.0, s_d_sw = 0.0, s_d_r = 0.0, s_d_limr = 0.0;
+static long   s_d_vn = 0, s_d_clip = 0;
+static long   s_d_seg[8];          /* KSEG 此处还没定义，用固定容量 */
 static long   s_body_n    = 0;
 #endif
 
@@ -2570,7 +2574,7 @@ static const float KDEPTH[KSEG + 1] = {KOI_KDEPTH0, 0.90f, 1.00f, 0.78f, 0.55f, 
         没有真实残留（脏矩形合并 + AABB 自带的 −1/+2 余量吃掉了）。
         这是"最坏情况预检"与"真实残留"的差别，别把预检读数当成拖影。 */
 #ifndef KOI_DIRT_MARGIN
-#define KOI_DIRT_MARGIN  6.0f
+#define KOI_DIRT_MARGIN  7.5f
 #endif
 #define KMOUTH  (0.175f * 0.46f * 0.875f)
 #define BITE_T    0.42f
@@ -2790,7 +2794,17 @@ static float spot_h(int a, int b)
    ⚠️ 别搞错顺序：王总原话是「先弄喂食特效」然后「红斑占比要再多点」——
       **两件都要**，不是"做了喂食就不要红斑"。我曾误读成后者回滚过一次。 */
 #ifndef KOI_SPOT_SCALE
-#define KOI_SPOT_SCALE  1.15f
+#define KOI_SPOT_SCALE  1.32f
+#endif
+/* ★ v36：斑心离头/尾端点至少要留的**段数**。
+   绘制时 p = sg + tt + rx/segl，rx 最远 ±1.10·sl（大斑 ≈ ±0.85 段）；
+   sg=0 且 tt=0.18 时 p_lo = 0.18 − 0.85 = −0.67 ⇒ 被 clamp 到 0，
+   半边顶点全挤在一点 ⇒ 斑被削成长条（实测 9.6% 顶点被截断，全是段0）。
+   ⇒ 斑心离 [0, KSEG] 两端至少留这么多段，就不会截断。
+   0.85 = 大斑半长的段数上界（sl_max·L·SCALE / (L/KSEG) ≈ 0.16·1.15·5 ≈ 0.92，
+          取 0.85 留一点余量给摆动导致的 segl 变短）。 */
+#ifndef KOI_SPOT_SEG_ROOM
+#define KOI_SPOT_SEG_ROOM  0.85f
 #endif
 
 /* ★★ 第 53 轮：御黄金金属层次的**四个渐变强度**（0..256）。
@@ -2914,10 +2928,37 @@ static void make_spots(koi_t *k)
     k->ns = n;
     for (int i = 0; i < n; i++) {
         int big = (i % 2 == 0);
-        int sg = (int)(head + ((float)i / (float)n) * (KSEG - 0.4f));
-        if (sg > KSEG - 1) sg = KSEG - 1;
-        if (sg < 0) sg = 0;
+        /* ★ v36b：斑**不落在段0（头）**。
+           旧式 `(int)(head + i/n·(KSEG−0.4))` 在 i=0 时 sg = (int)head 恒定 = 0
+           ⇒ 37% 的斑堆在头段；而大斑半长 ≈1.04~1.14 段、段0 的 tt 上限只有
+           0.90 ⇒ **头段根本放不下**，p_lo 必被 clamp ⇒ 半边顶点挤在一点
+           ⇒ 斑被削成长条（v36a 收紧 tt 后仍剩 3.3% 截断，全来自段0）。
+           ⇒ sg 收进 [1, KSEG−2] = [1, 3]：段1~3 半宽 0.78~1.00，撑得开色块。
+             sg=1, tt≥0.18 ⇒ p_lo = 1.18 − 1.14 = +0.04 > 0 ✓
+             sg=3, tt≤0.82 ⇒ p_hi = 3.82 + 1.14 = 4.96 < 5  ✓
+           ⚠️ 只改系数与 clamp 界，rnd_f 调用次数一字未动（铁律 20）。 */
+        int sg = 1 + (int)(head + ((float)i / (float)n) * (KSEG - 2.6f));
+        if (sg > KSEG - 2) sg = KSEG - 2;
+        if (sg < 1) sg = 1;
         float tt = clampf(rnd_f(0.18f, 0.82f), 0.10f, 0.90f);
+        /* ★ v36：**斑心别贴着头/尾端点**（治"长线"）。
+           i=0 时 sg 恒 = 0（头段），而 p = sg + tt + rx/segl 里 rx 最远 ±0.85 段，
+           tt=0.18 ⇒ p_lo = −0.67 ⇒ clamp 到 0 ⇒ **半边顶点全挤在同一点**
+           ⇒ 斑被削掉一大半，剩下的沿鱼身轴拉成一条（实测 9.6% 顶点被截断）。
+           ⇒ 把 tt 收进 [ROOM − sg, KSEG − ROOM − sg]：
+             · sg=0 ⇒ tt ∈ [0.85, 0.90]（斑心移到头段末端、紧邻腹部，不截断且够宽）
+             · sg=1~3 ⇒ 区间不变，原样
+             · sg=4 ⇒ tt ∈ [0.10, 0.15]
+           ⚠️ 只改 clampf 的界，rnd_f 调用次数一字未动（铁律 20）。 */
+        {
+            float rm = KOI_SPOT_SEG_ROOM;
+            float tlo = rm - (float)sg;
+            float thi = (float)KSEG - rm - (float)sg;
+            if (tlo < 0.10f) tlo = 0.10f;
+            if (thi > 0.90f) thi = 0.90f;
+            if (thi < tlo) thi = tlo;
+            tt = clampf(tt, tlo, thi);
+        }
         /* ★ 第 64 轮：**拉长**（长宽比 1.15/0.98 → 1.9/1.6，去"圆点感"）。
            ⚠️ 只改 rnd_f 的**区间**，调用次数一字未动（铁律 20）。
            为什么敢拉这么长：下面绘制时横向会**跟着曲面收窄**（sc = hw_p/hwc），
@@ -2949,7 +2990,17 @@ static void make_spots(koi_t *k)
            ⇒ sw 上限 0.46 × 1.15 × 1.05 = 0.555 < 腹部 lim 0.70-0.13 = 0.57
              —— 头部临界，所以配合绘制处每个顶点的 lim_r clamp 一起保安全。 */
         float sw = big ? rnd_f(0.36f, 0.46f) : rnd_f(0.22f, 0.30f);
-        if (sw > lim) sw = lim;
+        /* ★ v36：**等比缩放**，别只压 sw（治"长线"）。
+           旧代码 `if (sw > lim) sw = lim;` 只压横向 —— 段3（hw≈0.6）处
+           lim≈0.35，sw 从 0.41 压到 0.35，sl 却纹丝不动 ⇒ 长宽比 +17%，
+           窄段的斑越长越像一条线（王总原话"背部有的是长线"）。
+           ⇒ sw 被压多少，sl 跟着压多少：**形状不变，只是整体小一点**。
+           宁可斑小一点，也不要变成长条。 */
+        if (sw > lim) {
+            float kfit = lim / sw;
+            sw *= kfit;
+            sl *= kfit;
+        }
         k->sp[i][0] = (float)sg; k->sp[i][1] = tt;
         k->sp[i][2] = sl;        k->sp[i][3] = sw; k->sp[i][4] = so;
     }
@@ -3467,12 +3518,18 @@ static void koi_draw(koi_t *k)
            ⚠️ 切向用 _spa 线性插值而不是 atan2：相邻段夹角只有 KBEND≈0.2rad，
               线性插值足够，还省掉每顶点一次 atan2（ESP32-C3 上不便宜）。 */
         float hwc  = KDEPTH[sg] + (KDEPTH[sg + 1] - KDEPTH[sg]) * tt;
+#ifdef KOI_HOST_PROBE
+        s_d_seg[sg]++;
+#endif
         float segl = hypotf(_spx[sg + 1] - _spx[sg], _spy[sg + 1] - _spy[sg]);
         if (segl < 0.5f) segl = 0.5f;
-        /* ★ v35：斑沿轴能伸到的段范围 ⇒ 取其中**最窄**的半宽系数做保守限位。
-           撤销 v34 的 sc 之后，端部顶点不再被"局部半宽"缩放，防溢出的责任
-           全落到 lim_r 上 —— lim_r 必须用整个跨度里**最窄**的那一处，
-           否则斑伸进尾根（hw=0.30）时就会捅出去。
+        /* ★ v35 装的、★ v36 起**不再用于 lim_r**：
+           斑沿轴跨度内最窄那一处的半宽系数。v35 用它做 lim_r 的分母基准，
+           但实测是**过度保守** —— 横向位移大的顶点必然在斑心附近
+           （sin²θ+cos²θ=1 的自然配对：sinθ≈1 ⇒ cosθ≈0 ⇒ rx≈0 ⇒ p≈斑心），
+           用"跨度内最窄"会把远端窄段白算进来，白白压扁横向 ⇒ 占比上不去。
+           ⇒ v36 的 lim_r 改回用斑心的 hwc（量纲仍是 v35 修好的像素口径）。
+           ⚠️ 这段保留是因为 hw_min 仍可用于**端部溢出的兜底判断**，暂不删。
            ⚠️ 1.10 是下面 r 的凸出硬上限，所以 |rx| ≤ 1.10·sl。 */
         float p_lo = (float)sg + tt - 1.10f * sl / segl;
         float p_hi = (float)sg + tt + 1.10f * sl / segl;
@@ -3554,7 +3611,28 @@ static void koi_draw(koi_t *k)
                    实算 腹部 ≈1.53（>硬上限，不再 clamp）、头部 ≈1.00 ⇒ r 回到 ~1.0。
                ⚠️ hw_min 是斑跨度内最窄处（不是斑心 hwc）：撤销 sc 后
                   端部不再被局部半宽缩放，必须按最窄处限，否则尾部会捅出去。 */
-            float lim_r = ((hw_min - 0.06f) * Wd - fabsf(off))
+            /* ★★ v36b：lim_r 用「**这个顶点自己方向**上、r 取上界 1.10 时
+               最远轴位置处」的半宽 hw_probe —— 既不整体保守、也不漏判。
+               三种取法的取舍（v35 / v36a / 本版实测过）：
+                 · hw_min（v35，整个跨度内最窄）
+                     ⇒ **所有方向一律收紧**：连横向顶点（其实在斑心附近、
+                       cosθ≈0 ⇒ p≈斑心）也被按最远端窄段压 ⇒ 占比上不去。
+                 · hwc（v36a，只认斑心）
+                     ⇒ 往**变窄**方向（往尾）偏的顶点**完全不受限**
+                       ⇒ 实测溢出 +0.0135（判据要 ≤0，不合格）。
+                 · hw_probe（本版）
+                     ⇒ 横向顶点 cosθ≈0 ⇒ p_probe≈斑心 ⇒ hw_probe≈hwc（宽松 ✓）
+                       往尾偏   cosθ>0 且 KDEPTH 递减 ⇒ p_probe 更远
+                                ⇒ hw_probe 更小 ⇒ 收紧 ✓
+               数学上必然保守：实际 rx = sl·r·cosθ，r ≤ 1.10
+                 ⇒ 实际 p 偏移 ≤ probe 偏移 ⇒ 真实 hw_p ≥ hw_probe。 */
+            float p_probe = (float)sg + tt + (sl * 1.10f * fcos_t(ang)) / segl;
+            if (p_probe < 0.0f) p_probe = 0.0f;
+            if (p_probe > (float)KSEG) p_probe = (float)KSEG;
+            int   pi_p = (int)p_probe; if (pi_p > KSEG - 1) pi_p = KSEG - 1;
+            float pf_p = p_probe - (float)pi_p;
+            float hw_probe = KDEPTH[pi_p] + (KDEPTH[pi_p + 1] - KDEPTH[pi_p]) * pf_p;
+            float lim_r = ((hw_probe - 0.06f) * Wd - fabsf(off))
                           / (sw * sin_a + 1e-3f);
             if (lim_r < 0.0f) lim_r = 0.0f;
             if (r > 1.10f)        r = 1.10f;     /* 凸出硬上限 10% */
@@ -3564,8 +3642,14 @@ static void koi_draw(koi_t *k)
             float ry = fsin_t(ang) * sw * r;
             /* ★ 弧长位置 p（单位=段）⇒ 该处半宽 / spine 点 / 切向 */
             float p = (float)sg + tt + rx / segl;
+            float p_raw = p;
             if (p < 0.0f) p = 0.0f;
             if (p > (float)KSEG) p = (float)KSEG;
+#ifdef KOI_HOST_PROBE
+            s_d_sl += sl; s_d_sw += sw; s_d_r += r; s_d_limr += lim_r;
+            s_d_vn++;
+            if (p != p_raw) s_d_clip++;
+#endif
             int   pi = (int)p; if (pi > KSEG - 1) pi = KSEG - 1;
             float pf = p - (float)pi;
             float hw_p = KDEPTH[pi] + (KDEPTH[pi + 1] - KDEPTH[pi]) * pf;
@@ -6579,6 +6663,19 @@ void demo_koi_spot_report(void)
                (double)(s_body_area / (double)s_body_n), s_body_n);
         printf("[SPOT-COV ] 红斑占鱼身面积: %.2f%%\n",
                (double)(100.0 * s_spot_area / s_body_area));
+    }
+    if (s_d_vn > 0) {
+        printf("[SPOT-DIM ] 平均半长 sl=%.2fpx 半宽 sw=%.2fpx  长宽比=%.2f\n",
+               s_d_sl / s_d_vn, s_d_sw / s_d_vn,
+               s_d_sl / (s_d_sw > 0.0 ? s_d_sw : 1.0));
+        printf("[SPOT-R   ] 平均 r=%.3f  平均 lim_r=%.3f  (lim_r<1 就是横向被压)\n",
+               s_d_r / s_d_vn, s_d_limr / s_d_vn);
+        printf("[SPOT-CLIP] p 被端点截断的顶点: %.1f%%  (%ld/%ld)\n",
+               100.0 * (double)s_d_clip / (double)s_d_vn, s_d_clip, s_d_vn);
+        printf("[SPOT-SEG ] 斑所在段分布  ");
+        for (int q = 0; q <= KSEG - 1; q++)
+            printf("段%d=%ld  ", q, s_d_seg[q]);
+        printf("\n");
     }
 }
 #endif
