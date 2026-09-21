@@ -509,6 +509,13 @@ static int   s_wave_n = 0;
    「看着有，但不明显」—— 位置对不对必须量化。 */
 static float s_wave_ang = -1.0f;
 static float s_wave_rad = -1.0f;
+/* ★ 第 64 轮：红斑**几何面积**探针（鞋带公式，单位 px²）。
+   只统计**有红斑的鱼**（k->ns > 0）—— 黄金鲤没斑，算进分母会把覆盖率稀释掉。
+   覆盖率 = s_spot_area / s_body_area（两边鱼数相同，直接除即可）。 */
+static double s_spot_area = 0.0;
+static long   s_spot_n    = 0;
+static double s_body_area = 0.0;
+static long   s_body_n    = 0;
 #endif
 
 #ifdef KOI_HOST_PROBE
@@ -2735,10 +2742,35 @@ static float _lx[KSEG + 1], _ly[KSEG + 1], _rx[KSEG + 1], _ry[KSEG + 1];
 #define KOI_SPOT_SEGS   11
 #endif
 #ifndef KOI_SPOT_JIT
-/* ★ 第 54 轮：0.30 → 0.34。扰动现在是**双频叠加**（0.68·cos2.3θ + 0.32·cos3.7θ），
-   两个频率同时取到峰的概率很低 ⇒ 实际起伏比单频小，所以要补一点幅度回来。 */
-#define KOI_SPOT_JIT    0.34f
+/* ★ 第 64 轮：0.34 → 0.42。
+   别看数值变大了，**实际咬深反而变小**：咬深公式从 `bite` 改成 `bite²×噪声`
+   （见 koi_draw ③红斑），bite² 的均值是 1/3 而不是 1/2，再乘每顶点噪声
+   ⇒ 平均咬深 0.42×(1/3)×0.675 ≈ 0.095（旧的是均匀 0.34×0.5 = 0.17）。
+   放到大的是**峰值**咬深（波峰 + 噪声同取大时最深到 0.42）⇒ 局部缺口更明显，
+   但绝大部分边缘贴着外接椭圆 ⇒ **面积捞回来**，形状还更不规则。 */
+#define KOI_SPOT_JIT    0.42f
 #endif
+
+/* ★ 第 64 轮：顶点**角度**抖动幅度（∈ 单位角距的比例）。
+   0 = 顶点等分（旧观感，读着是正多边形）；0.30 = 本轮默认。
+   ⚠️ 上限 0.45：再大相邻顶点可能越过彼此 ⇒ 多边形自交、fill 出洞。
+   为什么需要：真色块的边缘没有"等距的角"，等分顶点是"规则感"的主要来源之一，
+   光靠径向扰动压不掉它。 */
+#ifndef KOI_SPOT_AJIT
+#define KOI_SPOT_AJIT   0.30f
+#endif
+
+/* ★★ 第 64 轮：每顶点独立的**确定性**噪声 ∈ [0,1)。
+   ⚠️⚠️ 绝不能用 rnd_f —— 那会消耗全局随机数，整池鱼后续 wander / burst /
+       phase 全跟着错位，800 帧混沌放大后安全区越界从 0.00 漂到 −2.34px
+      （铁律 20，第 63 轮实测过两次）。整数哈希是纯函数，不碰随机序列。 */
+static float spot_h(int a, int b)
+{
+    uint32_t h = (uint32_t)a * 374761393u + (uint32_t)b * 668265263u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h ^= h >> 16;
+    return (float)(h & 0xFFFFu) / 65536.0f;
+}
 
 /* ★ 第 51 轮：红斑的**整体尺寸**倍率（王总「红色在鱼身上覆盖的稍微再多点占比」）。
      1.00 = 第 47 轮定下的形状（8 顶点 + 0.30 径向扰动）原尺寸
@@ -2882,7 +2914,11 @@ static void make_spots(koi_t *k)
         if (sg > KSEG - 1) sg = KSEG - 1;
         if (sg < 0) sg = 0;
         float tt = clampf(rnd_f(0.18f, 0.82f), 0.10f, 0.90f);
-        float sl = big ? rnd_f(0.098f, 0.128f) : rnd_f(0.052f, 0.072f);
+        /* ★ 第 64 轮：**拉长**（长宽比 1.15/0.98 → 1.9/1.6，去"圆点感"）。
+           ⚠️ 只改 rnd_f 的**区间**，调用次数一字未动（铁律 20）。
+           为什么敢拉这么长：下面绘制时横向会**跟着曲面收窄**（sc = hw_p/hwc），
+           斑往头/尾延伸时自动变窄 ⇒ 不会捅出轮廓，见 koi_draw ③红斑。 */
+        float sl = big ? rnd_f(0.124f, 0.160f) : rnd_f(0.065f, 0.088f);
         float so = rnd_f(-0.13f, 0.13f);
         float hw = KDEPTH[sg] + (KDEPTH[sg + 1] - KDEPTH[sg]) * tt;
         /* ★★★ 第 63 轮修复：红斑横向**溢出鱼身轮廓**。
@@ -2903,7 +2939,11 @@ static void make_spots(koi_t *k)
            ⚠️ 下限 0.30 也要跟着除，否则窄段（头/尾根）会被下限顶回溢出区间。 */
         float lim = (hw - 0.06f - fabsf(so)) / KOI_SPOT_SCALE;
         if (lim < 0.30f / KOI_SPOT_SCALE) lim = 0.30f / KOI_SPOT_SCALE;
-        float sw = big ? rnd_f(0.50f, 0.62f) : rnd_f(0.30f, 0.42f);
+        /* ★ 第 64 轮：**收窄**半宽（×0.80）配合上面拉长，面积基本持平
+           但形状从"圆点"变"沿鱼身延展的色块"。
+           ⇒ 附带好处：头部/尾根那些窄段的 lim 不再削那么狠，
+              头上的斑也能保住长条形状（原来被 clamp 完就剩一小粒圆点）。 */
+        float sw = big ? rnd_f(0.40f, 0.50f) : rnd_f(0.24f, 0.34f);
         if (sw > lim) sw = lim;
         k->sp[i][0] = (float)sg; k->sp[i][1] = tt;
         k->sp[i][2] = sl;        k->sp[i][3] = sw; k->sp[i][4] = so;
@@ -3159,6 +3199,17 @@ static void koi_draw(koi_t *k)
     PROF2_TICK(1);                                           /* 1 = ①水下投影 */
 
     /* ② 鱼身 + 体缘暗线（复用上面那一份点列，不再 body_pts） */
+#ifdef KOI_HOST_PROBE
+    if (k->ns > 0) {        /* ★ 只统计有红斑的鱼：黄金鲤没斑，进来会稀释覆盖率 */
+        double a2 = 0.0;
+        for (int v = 0; v < s_npts; v++) {
+            int w = (v + 1) % s_npts;
+            a2 += (double)s_pts[v*2] * s_pts[w*2+1] - (double)s_pts[w*2] * s_pts[v*2+1];
+        }
+        s_body_area += fabs(a2) * 0.5;
+        s_body_n++;
+    }
+#endif
     to_q8(s_npts, 0.0f, 0.0f);
     fill_poly(s_poly, s_npts, bodyCol, NULL, 256);
 
@@ -3401,8 +3452,25 @@ static void koi_draw(koi_t *k)
         float cax = ax - sa * off, cay = ay + ca * off;
         const int SEGS = KOI_SPOT_SEGS;
         s_npts = SEGS;
+        /* ★★ 第 64 轮：斑**贴在鱼身曲面上**（王总"沿鱼身体曲面分布"）。
+           旧画法：整块斑共用斑心的 (ca, sa, off) ⇒ 斑是刚性椭圆，
+                   跟鱼身的弯曲、收窄毫无关系，拉长之后两端就会戳出去。
+           新画法：每个顶点按自己的**弧长位置 p**（单位 = 段）取该处的
+                   半宽 hw_p、spine 位置 (bx,by)、切向 a2，再放上去。
+           hwc  = 斑心处半宽系数（横向缩放的基准）
+           segl = 斑心所在段的像素长度（把"沿轴像素偏移 rx"折成"段偏移"要用）
+           ⚠️ 切向用 _spa 线性插值而不是 atan2：相邻段夹角只有 KBEND≈0.2rad，
+              线性插值足够，还省掉每顶点一次 atan2（ESP32-C3 上不便宜）。 */
+        float hwc  = KDEPTH[sg] + (KDEPTH[sg + 1] - KDEPTH[sg]) * tt;
+        float segl = hypotf(_spx[sg + 1] - _spx[sg], _spy[sg + 1] - _spy[sg]);
+        if (segl < 0.5f) segl = 0.5f;
         for (int v = 0; v < SEGS; v++) {
-            float ang = ph + (float)v * (6.2832f / (float)SEGS);
+            /* 每顶点两个独立噪声：一个抖角度、一个抖咬深（都不消费 rnd_f） */
+            float nz  = spot_h(s, v);
+            float nz2 = spot_h(s, v + 64);
+            /* ★ 角度抖动 ⇒ 顶点间距不再等分（等分是"规则感"的主要来源） */
+            float ang = ph + ((float)v + KOI_SPOT_AJIT * (nz - 0.5f))
+                        * (6.2832f / (float)SEGS);
             /* ★★ 第 54 轮：径向扰动改**双频**（王总："边缘有轻微凹凸"）。
                单频 cos(2.3θ) 只在两个方向上鼓出来，读着还是"橄榄球"；
                叠一个 3.7θ 的高频（权重 0.32）才能出现**细碎的凹凸**，
@@ -3418,9 +3486,33 @@ static void koi_draw(koi_t *k)
                ⚠️ 别写成 `1 - JIT*wob`：那会让 wob 为负时 r > 1，一样捅出去。 */
             float wob = 0.68f * fcos_t(ang * 2.3f + ph * 1.7f) +
                         0.32f * fcos_t(ang * 3.7f + ph * 2.9f);   /* ∈ [-1, 1] */
-            float r = 1.0f - KOI_SPOT_JIT * (0.5f - 0.5f * wob);   /* ∈ [1−JIT, 1] */
+            /* ★★ 第 64 轮：咬深从"均匀缩水"改成"局部深缺口"。
+               旧 d = 0.5−0.5·wob：**每个顶点都咬一样深** ⇒ 面积均匀掉 31%，
+                     而且余弦是周期的 ⇒ 读出来是**规则齿轮**，不是自然色块。
+               新 d = bite² × (0.35 + 0.65·nz)：
+                 · bite²  ⇒ 只有低频波峰附近咬得深，其余边缘贴着外接椭圆
+                            （bite∈[0,1]，平方后均值 1/3，且把大半区间压到近 0）
+                 · ×噪声  ⇒ 每个顶点的深浅都不一样 ⇒ 边缘不再有周期性
+               ⇒ 大部分轮廓饱满（**面积捞回来**）+ 局部有缺口（**真不规则**）。
+               ⚠️ 仍保持"只向内"（r ≤ 1）：向外会捅出鱼身，v31 的教训。 */
+            float bite = 0.5f - 0.5f * wob;                        /* ∈ [0, 1] */
+            float d    = bite * bite * (0.35f + 0.65f * nz2);
+            float r    = 1.0f - KOI_SPOT_JIT * d;                  /* ∈ [1−JIT, 1] */
             float rx = fcos_t(ang) * sl * r;
             float ry = fsin_t(ang) * sw * r;
+            /* ★ 弧长位置 p（单位=段）⇒ 该处半宽 / spine 点 / 切向 */
+            float p = (float)sg + tt + rx / segl;
+            if (p < 0.0f) p = 0.0f;
+            if (p > (float)KSEG) p = (float)KSEG;
+            int   pi = (int)p; if (pi > KSEG - 1) pi = KSEG - 1;
+            float pf = p - (float)pi;
+            float hw_p = KDEPTH[pi] + (KDEPTH[pi + 1] - KDEPTH[pi]) * pf;
+            float sc = hw_p / hwc;                    /* 横向跟着曲面收窄/放宽 */
+            float bx = _spx[pi] + (_spx[pi + 1] - _spx[pi]) * pf;
+            float by = _spy[pi] + (_spy[pi + 1] - _spy[pi]) * pf;
+            float a2 = _spa[pi] + (_spa[pi + 1] - _spa[pi]) * pf;
+            float c2 = fcos_t(a2), s2 = fsin_t(a2);
+            float lat = (off + ry) * sc;              /* 横向：整体按局部半宽缩放 */
 #ifdef KOI_HOST_PROBE
             /* ★★ 第 63 轮：红斑**溢出鱼身轮廓**的几何探针（只台架编译）。
                为什么不用"改前/改后两帧 diff"来判：鱼的轨迹对初值极敏感，
@@ -3430,18 +3522,31 @@ static void koi_draw(koi_t *k)
                  减去该段鱼身半宽系数 hw ⇒ >0 就是捅出轮廓。
                ⚠️ 判据是 `s_spot_over <= 0`（单位：半宽比例，0.02 ≈ 半宽的 2%）。 */
             {
-                float hwv = KDEPTH[sg] + (KDEPTH[sg + 1] - KDEPTH[sg]) * tt;
-                float lat = (off + ry) / Wd;
-                float ov  = fabsf(lat) - hwv;
+                /* ★ 判据升级：不再用**斑心**那一处的半宽（旧版有盲区 ——
+                   斑拉长之后，端部会伸进相邻段，那儿鱼身可能更窄，
+                   只按斑心段算会漏判）。现在按**这个顶点自己所在的弧长位置**算。 */
+                float lat_u = lat / Wd;
+                float ov    = fabsf(lat_u) - hw_p;
                 if (ov > s_spot_over) {
                     s_spot_over = ov;
                     s_spot_over_seg = sg;
                 }
             }
 #endif
-            s_pts[v*2]     = cax + ca * rx - sa * ry;
-            s_pts[v*2 + 1] = cay + sa * rx + ca * ry;
+            s_pts[v*2]     = bx - s2 * lat;
+            s_pts[v*2 + 1] = by + c2 * lat;
         }
+#ifdef KOI_HOST_PROBE
+        {
+            double a2 = 0.0;
+            for (int v = 0; v < SEGS; v++) {
+                int w = (v + 1) % SEGS;
+                a2 += (double)s_pts[v*2] * s_pts[w*2+1] - (double)s_pts[w*2] * s_pts[v*2+1];
+            }
+            s_spot_area += fabs(a2) * 0.5;
+            s_spot_n++;
+        }
+#endif
         to_q8(s_npts, 0.0f, 0.0f);
         /* ★★ 第 54 轮：红斑**不再是平涂一个色**（王总："不要使用一个颜色。
            红斑应该是不规则自然色块…主体朱红 #E5392D，受光 #F25A45，
@@ -6398,5 +6503,16 @@ void demo_koi_spot_report(void)
            (double)s_wave_ang);
     printf("[WAVE-RAD] 涟漪心 vs 吻端 最大距离偏差(px，理论 0): %.4f\n",
            (double)s_wave_rad);
+    /* ★ 第 64 轮：红斑覆盖率（**几何面积**，不是像素阈值统计）。
+       第 51 轮那个整屏像素判据实测只抓到 红104/白275 px，鱼身被漏掉九成，
+       改前改后比不出真实变化 —— 这条才是可靠的相对量。 */
+    if (s_body_area > 0.0 && s_spot_n > 0 && s_body_n > 0) {
+        printf("[SPOT-AREA] 平均单斑面积: %.2f px^2  (斑数 %ld)\n",
+               (double)(s_spot_area / (double)s_spot_n), s_spot_n);
+        printf("[SPOT-BODY] 平均鱼身面积: %.2f px^2  (有斑的鱼 %ld 次)\n",
+               (double)(s_body_area / (double)s_body_n), s_body_n);
+        printf("[SPOT-COV ] 红斑占鱼身面积: %.2f%%\n",
+               (double)(100.0 * s_spot_area / s_body_area));
+    }
 }
 #endif
