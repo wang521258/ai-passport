@@ -3720,35 +3720,40 @@ static void grow_step_all(void)
      实测 3 轮足够（凸集上每轮至少消掉一条违规边）。 */
 #define SWIM_N 8
 
-/* ★★ 第 58 轮：整块换成**按实测石头边界反推**的 8 点凸多边形。
+/* ★★★ 第 59 轮：左右长边直接贴屏边（x=0 / x=240）。
+   ■ 王总原话：「我希望左侧和右侧那个区域到屏幕边缘」（57 轮最后一条）
+   ■ v24（上一版）虽然用了 8 点凸多边形、零侵入，但左右长边只到 x=7/x=233，
+     离屏边还差 7px。王总觉得还不够大，要求左右直接贴边。
 
-   ■ 为什么换：第 45 轮那 14 点是王总按图给的一版；第 57 轮王总重画了边界
-     （4 角石头 + 中间全可游），并指出 v23「左下角和左上角的区域没完整把石头
-     排除完」—— 逐行量下来确实如此（见 _tools/swimview58b.py）：
-       · 第 45 轮 14 点在 y=115 处左缘 x=23，实测石头到 x=27 ⇒ 鱼游区吃进石头 4px
-       · 第 45 轮 14 点在 y=277 处左缘 x=29，实测石头到 x=46 ⇒ 吃进石头 **17px**
-     ⇒ 那 14 点**不是**"避开石头"的边界，只是当时肉眼对齐的一版。
-
-   ■ 这 8 点怎么来的（可复现，不是拍的）
+   ■ 这 8 点怎么来的（_tools/swimfit59.py 自动求解，不是拍的）
      1) 用**干净背景** koi_bg[]（王总给的水下光斑图，画面里没有鱼干扰）逐行量
         贴屏边的连续非水段 ⇒ 得到每行石头的内缘 SL[y] / SR[y]；
-     2) 关键实测结论：**y=80..210 中段左右两侧完全没有石头**（SL=0 / SR=239），
-        石头只堆在 y<70 与 y>220 的两头 ⇒ 所以 4 条长边可以贴屏边走；
-     3) 4 条 chamfer 取**石头内缘的外包直线** + 5px 余量，
-        保证整条边都在石头外侧 —— 不是 45° 斜线（实测石头根本不是 45°）。
+     2) 关键实测结论：**y=70..214 中段左右两侧完全没有石头**（SL=-1 / SR=240），
+        4 角石头只堆在 y<70 与 y>220 的两头 ⇒ 4 条长边可以贴屏边走；
+     3) 4 条 chamfer 各 1 个自由度（另一端点）用**解析式**求出
+        "仍在石头外侧 +5px"的最外端点 —— 不靠试；
+     4) 4 个"长边端点 y"做网格搜索，取面积最大且逐行验证零侵入 + 凸的解。
 
-   ■ 验证（_tools/swimview58b.py，逐行扫 320 行）
+   ■ ★ 厚度过滤 THICK=10
+     中段零星有厚度 ≤9px 的孤立"薄尖"（水草剪影 / 暗边 / 抗锯齿噪声），
+     不是真石头。4 角真石头厚度都 ≥10 ⇒ 滤掉薄尖后中段才连成
+     一整条无石头带，左右长边才能真正贴屏边。
+     鱼身 margin = kh+3 ≈ 54px，远大于被滤薄尖的 10px，零安全风险。
+
+   ■ 这 8 点的实测验证（_tools/swimfit59.py 网格搜索最优解）
      · 多边形侵入石头的行数 = **0**，最大侵入深度 0.0px
-     · 叉积符号集 = {+1} ⇒ **凸**，逐边半平面推回直接收敛（不再需要半平面交那套）
-     · 面积 58760 px²（v22 50958 / v23 54713）
-     · 鱼身余量：swim_push 的 margin = kh+3 ≈ 54，而这里 chamfer 又留了 5px，
-       ⇒ 满级鱼的鱼身离石头至少 5px。
+     · 叉积符号集 = {+1} ⇒ **凸**，逐边半平面推回直接收敛
+     · 面积 60363 px²（v24 58760，+2.7%）—— 不多是因为顶/底 chamfer
+       端点（88,0 / 70,315）受 4 角石头底端薄尖限制收紧；
+       但**水平方向**可游范围从 226 (v24) 涨到 **240**，整整多出 14px。
+     · 鱼身余量：swim_push margin ≈ 54，长边处鱼身离石头 ≥ 54px。
 
-   ⚠️ 顺序 = 顶边左→右、右上 chamfer、右中长边、右下 chamfer、底边右→左、
-      左下 chamfer、左中长边、左上 chamfer（屏幕坐标下顺时针）。 */
+   ⚠️ 顺序 = 顶边左→右、右上 chamfer、右中长边（贴屏 x=240）、
+      右下 chamfer、底边右→左、左下 chamfer、左中长边（贴屏 x=0）、
+      左上 chamfer（屏幕坐标下顺时针）。 */
 static const float SWIM_PT[SWIM_N][2] = {
-    { 57.0f,   0.0f}, {183.0f,   0.0f}, {233.0f, 110.0f}, {227.0f, 220.0f},
-    {173.0f, 315.0f}, { 67.0f, 315.0f}, { 13.0f, 220.0f}, {  7.0f, 110.0f},
+    { 88.0f,   0.0f}, {177.0f,   0.0f}, {240.0f, 118.0f}, {240.0f, 206.0f},
+    {178.0f, 315.0f}, { 70.0f, 315.0f}, {  0.0f, 184.0f}, {  0.0f,  81.0f},
 };
 
 /* 每条边的**内向**单位法线，以及多边形外接框。都是常数，开机建一次。 */
@@ -5122,6 +5127,16 @@ static void tick_cb(lv_timer_t *t)
     bg_sync_full();
     render();                   // 内部自己 PROF_TICK(2)/(3..8)
     s_koi_acc += s_koi_n; s_lily_acc += s_lily_n;
+#ifdef KOI_HOST_PROBE
+    /* ★ 第 58 轮：鱼活动 bbox 探针 —— 每帧把每条鱼的 (x,y) 累计到 4 个 min/max，
+       跑完一段后 demo_koi_active_report() 把整个观测窗口里的"鱼到过的最远范围"
+       打出来。用来回答"v24 鱼游区域是不是真的扩大了"这种纯几何问题，
+       不用逐帧 diff bin。 */
+    {
+        extern void demo_koi_track_active(void);
+        demo_koi_track_active();
+    }
+#endif
 
     if (s_full) {
         lv_obj_invalidate(s_canvas);
@@ -5952,5 +5967,45 @@ void demo_koi_who_lily0(void)
     printf("      ★ 判读：「荷身」若明显少于实体总数 ⇒ 叶身 α256 那一笔**没填满**，"
            "底下是半透明的影/光 ⇒ 鱼就从那儿透出来；\n");
     printf("              若「荷身」≈总数 ⇒ 叶身填满了，差异只能来自 α<256 的笔画（脉/光）叠在鱼上。\n");
+}
+#endif
+
+#ifdef KOI_HOST_PROBE
+/* === 第 58 轮：鱼活动 bbox 探针 === */
+static float s_act_xmin =  1e9f;
+static float s_act_xmax = -1e9f;
+static float s_act_ymin =  1e9f;
+static float s_act_ymax = -1e9f;
+static int   s_act_frames = 0;
+
+void demo_koi_track_active(void)
+{
+    for (int i = 0; i < s_nkoi; i++) {
+        const koi_t *k = &s_koi[i];
+        if (k->x < s_act_xmin) s_act_xmin = k->x;
+        if (k->x > s_act_xmax) s_act_xmax = k->x;
+        if (k->y < s_act_ymin) s_act_ymin = k->y;
+        if (k->y > s_act_ymax) s_act_ymax = k->y;
+    }
+    s_act_frames++;
+}
+
+void demo_koi_active_reset(void)
+{
+    s_act_xmin =  1e9f; s_act_xmax = -1e9f;
+    s_act_ymin =  1e9f; s_act_ymax = -1e9f;
+    s_act_frames = 0;
+}
+
+void demo_koi_active_report(void)
+{
+    if (s_act_frames == 0) {
+        printf("[ABBOX] (no frames observed)\n");
+        return;
+    }
+    printf("[ABBOX] 观测 %d 帧  x=[%.1f, %.1f]  宽 %.1f  y=[%.1f, %.1f]  高 %.1f\n",
+           s_act_frames,
+           s_act_xmin, s_act_xmax, s_act_xmax - s_act_xmin,
+           s_act_ymin, s_act_ymax, s_act_ymax - s_act_ymin);
 }
 #endif
