@@ -497,6 +497,18 @@ static int  s_caus_gain = CAUSTIC_GAIN;
    几何探针不依赖帧，也不依赖鱼在哪一段——只问"这个顶点在不在鱼身里"。 */
 static float s_spot_over     = -1000.0f;   /* 观测到的最大溢出（越大越糟） */
 static int   s_spot_over_seg = -1;         /* 发生在哪一段（0=头 2=腹 5=尾根） */
+/* ★★ 第 63 轮：游动涟漪 spawn 累计计数 —— 涟漪寿命 0.85s，
+   真机 2s 统计窗口里大概率捕不到，不计数根本看不出频率。
+   ★ v32：kind 由 3 改成 2（与吃食同道），名字里的 kind 注释就不再写死。 */
+static int   s_wave_n = 0;
+/* ★ v32 追加两条**位置几何探针**（王总连改三次位置，得有硬证据）：
+     s_wave_ang = 涟漪方位与 headA 的最大夹角（度）—— 理论 0（正前方）
+     s_wave_rad = 涟漪到鱼心距离 与 L·grow·KMOUTH 的最大偏差（px）—— 理论 0
+   为什么不用"看一眼画面"：涟漪寿命 0.85s、spawn 间隔 15~30s，
+   798 帧里只有 23 次，肉眼在真机上根本等不到；而且王总上一轮就是
+   「看着有，但不明显」—— 位置对不对必须量化。 */
+static float s_wave_ang = -1.0f;
+static float s_wave_rad = -1.0f;
 #endif
 
 #ifdef KOI_HOST_PROBE
@@ -2579,35 +2591,45 @@ static const float KDEPTH[KSEG + 1] = {KOI_KDEPTH0, 0.90f, 1.00f, 0.78f, 0.55f, 
 #define EAT_RING_LIFE  0.85f     /* 第 50 轮：0.42 → 0.85（真机 7fps 下 ≈ 6 帧） */
 #endif
 
-/* ★★ 第 63 轮：游动涟漪 —— 王总要的就是「鱼游动时肚子那随机泛起的水波」。
-   设计：
-     · 每条鱼一个独立 cooldown `rsp_cd`（koi_t 字段），每帧扣 dt，
-       归零时 spawn 一道并重置 8~15 秒（per-鱼不同）。
-     · 9 条鱼场景下池里平均每 ~1.2 秒冒一道 —— 节奏比"死水"多一口气、
-       又远没到"哗啦哗啦"。初值 5~15 秒让首道涟漪不挤在开场那一瞬。
-     · 半径 / 寿命比吃食涟漪（kind=2）小一半多、alpha 更低 —— 避免跟
-       "鱼真的吃到食了"那一下混淆（参考第 51 轮否决过的"追食途中冒水花"）。
-     · ★ 这是**纯观赏**效果，不参与任何判定；不报脏不参与活跃度。 */
+/* ★★ 第 63 轮（v31）：游动涟漪 —— 王总「鱼游动时肚子那随机泛起一个涟漪」。
+   ★★★★ 第 63 轮 v2（v32，本轮）：王总看了 v31 真机后说
+       「这个涟漪去掉吧 因为不明显 然后改成 游的过程中随机再出现个别鱼
+         **跟吃到鱼食一样**的涟漪」
+     ⇒ 不是删功能，是**把那道小涟漪换成跟吃食那道一样大的**：
+        v31 是 4.5px / 0.60s / alpha 0.45（小水花，真机上几乎看不见）；
+        v32 起**直接复用 EAT_RING_* 的那组数**（12px / 0.85s / alpha 0.70），
+        视觉上和"鱼吃到饲料"那一圈**完全一致**。
+        为什么**引用而不是抄数**：王总要的是"一样"，抄一份迟早两边跑偏
+        （铁律 8 那一族：同一件事只能有一个真身）。
+     ⇒ 同时把频率**调稀**（8~15s → 15~30s / 鱼）：大涟漪显眼得多，
+        再按原来的密度就是满池冒泡了。6 条鱼场景 ≈ 每 4~6 秒一道。
+
+   ★ kind 仍是 3（不复用 kind=2）：视觉一样但**内部不混** ——
+     · splash_ok 按 kind 计数，混了会让真吃食那道被"游动涟漪"挤掉（cap=3）；
+     · 台架 `[WAVE]` 也能单独数出游动涟漪 spawn 了几次。
+
+   · 每条鱼一个独立 cooldown `rsp_cd`（koi_t 字段），每帧扣 dt，归零时 spawn。
+   · ★ 这是**纯观赏**效果，不参与任何判定；不报脏不参与活跃度。 */
 #ifndef WAVE_CD_MIN
-#define WAVE_CD_MIN    8.0f      /* spawn 后下次间隔下限（秒） */
+#define WAVE_CD_MIN    15.0f     /* spawn 后下次间隔下限（秒）—— v32：8 → 15 */
 #endif
 #ifndef WAVE_CD_MAX
-#define WAVE_CD_MAX    15.0f     /* spawn 后下次间隔上限 */
+#define WAVE_CD_MAX    30.0f     /* spawn 后下次间隔上限 —— v32：15 → 30 */
 #endif
 #ifndef WAVE_CD_INIT_MIN
-#define WAVE_CD_INIT_MIN  5.0f   /* 第一道涟漪的等待区间下限（让首道更早） */
+#define WAVE_CD_INIT_MIN  10.0f  /* 第一道涟漪的等待区间下限 —— v32：5 → 10 */
 #endif
 #ifndef WAVE_CD_INIT_MAX
-#define WAVE_CD_INIT_MAX 15.0f
+#define WAVE_CD_INIT_MAX 30.0f   /* v32：15 → 30 */
 #endif
 #ifndef WAVE_RING_RMAX
-#define WAVE_RING_RMAX  4.5f     /* 比吃食 12 小一半多：远远看一眼是"小水花" */
+#define WAVE_RING_RMAX  EAT_RING_RMAX   /* ★ v32：跟吃食那道同半径（12） */
 #endif
 #ifndef WAVE_RING_LIFE
-#define WAVE_RING_LIFE  0.6f     /* 真机 7fps 下 ≈ 4 帧：够看见、不留尾巴 */
+#define WAVE_RING_LIFE  EAT_RING_LIFE   /* ★ v32：跟吃食那道同寿命（0.85） */
 #endif
 #ifndef WAVE_RING_A0
-#define WAVE_RING_A0    0.45f    /* 比吃食 0.70 淡 35% */
+#define WAVE_RING_A0    0.70f           /* ★ v32：跟吃食那道同 alpha（0.70） */
 #endif
 
 /* ★★ 第 51 轮：曾经试过"追食途中也冒水花"，**王总否掉了**（「这个不要啊」）。
@@ -4346,34 +4368,71 @@ static void koi_step(koi_t *k, float dt)
          push"是硬规矩，留着这行将来谁再加"吃食长大"也不会漏；成本只有 6 次内点积。 */
     swim_push(&k->x, &k->y, k->L * k->grow * 0.55f + 3.0f);
 
-    /* ★★ 第 63 轮：游动涟漪 —— 王总：「鱼在游玩的过程中随机在肚子那泛起一个涟漪」。
-       触发：rsp_cd 倒计时归零时 spawn 一道，重置为 WAVE_CD_MIN..MAX 秒。
-       位置：鱼身第 KSEG/2 段（腹部，KDEPTH=1.00 最宽段）的中点 t=0.5，
-             向鱼身**外侧**法向偏移 0.9·Wd —— 落在鱼肚子一侧的水里。
-       偏左还是偏右：随机（rnd_f），鱼游动时两侧都会甩水，自然。
-       ⚠️ 用的是 koi_step 末尾**当前帧**的 _spx/_spa（koi_spine 还没跑，
-          是上一帧 draw 算的）—— 差一帧小鱼位置，鱼速 30px/s × 1/8s = 3.75px
-          偏移，肉眼不可见。涟漪本身就是固定位置，下一帧不会跟鱼跑。 */
+    /* ★★ 第 63 轮 v32：游动涟漪 —— 王总原话（三条，逐条落地）：
+         ① 「把这个涟漪去掉吧 因为不明显」→ 不是删功能，是 v31 那道
+            4.5px / 0.6s / alpha 0.45 的**小涟漪**太弱、看不出来 ⇒ 放大。
+         ② 「肚子那去掉啊 就是去掉 然后 改成跟吃鱼食一样 的在鱼前面」
+            → v31 冒在**腹部**（KSEG/2 段法向外侧 0.9·Wd），已废弃；
+              改冒在**嘴前方**，坐标公式与吃食那道**逐字符相同**。
+         ③ 「涟漪大小动作都一样」
+            → WAVE_RING_RMAX / WAVE_RING_LIFE / WAVE_RING_A0 全部改为
+              **直接引用** EAT_RING_*（不抄数字，防止将来改吃食又漏同步）；
+              r0=1 / cn=1 / cg=0 本来就和吃食一致；ripple_draw 不读 kind，
+              所以外观（半径曲线 pow(p,0.82)、alpha 衰减 pow(1-p,0.85)）完全一致。
+       ★★ kind 也跟着改成 **2**（与吃食同道）：kind 只进 splash_ok 的
+          分类记账与 do_tap 的清理（清的是 kind==0），**不参与绘制**。
+          改成 2 之后两种涟漪共享同一个 cap=3 配额和 26px 近邻去重 ——
+          吃食正热闹时游动涟漪自然让位，不会叠成一团；这在语义上也正是
+          「跟吃到鱼食一样的涟漪」最彻底的写法。
+       ⚠️ 位置公式必须放在**两次 swim_push 之后**（此处 k->x/k->y 已是推正后的
+          最终值，与上面吃食判定的 mx/my 同一口径），否则会冒到石头里。 */
     k->rsp_cd -= dt;
-    if (k->rsp_cd <= 0.0f) {  /* ★ 暂时关掉 spawn 体定位根因 */
-        int mid = KSEG / 2;          /* = 2，KDEPTH[2]=1.00 肚子最宽 */
-        float a   = _spa[mid];       /* 上帧鱼身该段切向（鱼头→尾方向） */
-        float sx  = _spx[mid], sy = _spy[mid];
-        float Wd2 = k->L * KOI_WD;   /* 鱼身基准半宽 */
-        /* 法向外侧 = (-sin, cos)；乘 sign 让涟漪落在鱼转弯外侧。
-             用 sinf(k->headA) 符号：headA 已经在 make_koi 里消耗过 rnd_f，
-             sinf 是纯浮点，不消耗额外随机（实测 rnd_f 会让安全区越界 2.34 px）。
-             鱼朝左拐（headA 在 π~2π）就甩右弧，朝右拐就甩左弧 —— 转弯外侧甩水，
-             看着反而比纯随机甩自然。 */
-        float sign = (sinf(k->headA) >= 0.0f) ? 1.0f : -1.0f;
-        float rx = sx + sign * (-fsin_t(a)) * Wd2 * 0.9f;
-        float ry = sy + sign * ( fcos_t(a)) * Wd2 * 0.9f;
-        /* ★★ 用 splash_ok 卡安全区（否则可能冒到石头边水里，看着像水在泡石头）
-           —— splash_ok 第 3 参数 3 = 同类涟漪不超过 3 个，避免连冒一片 */
-        if (splash_ok(3, rx, ry, 3)) {
+    if (k->rsp_cd <= 0.0f) {
+        /* 与吃食那道**同一处**：吻端前方 k->L·grow·KMOUTH */
+        float rx = k->x + fcos_t(k->headA) * k->L * k->grow * KMOUTH;
+        float ry = k->y + fsin_t(k->headA) * k->L * k->grow * KMOUTH;
+        /* splash_ok 卡安全区 + 同类不超过 3 个 + 26px 近邻去重 */
+        if (splash_ok(2, rx, ry, 3)) {
+#ifdef KOI_HOST_PROBE
+            {   /* ★ 位置几何探针：只问两件事，都不依赖鱼在哪、在哪一帧 */
+                float dx = rx - k->x, dy = ry - k->y;
+                float d  = hypotf(dx, dy);
+                float dr = fabsf(d - k->L * k->grow * KMOUTH);   /* 该在吻端 */
+                if (dr > s_wave_rad) s_wave_rad = dr;
+                if (d > 0.001f) {
+                    float dot = (dx / d) * fcos_t(k->headA) + (dy / d) * fsin_t(k->headA);
+                    if (dot >  1.0f) dot =  1.0f;
+                    if (dot < -1.0f) dot = -1.0f;
+                    float ang = acosf(dot) * 57.2957795f;        /* 与正前方的夹角 */
+                    if (ang > s_wave_ang) s_wave_ang = ang;
+                }
+                s_wave_n++;
+            }
+#endif
             ripple_add(rx, ry, 1, WAVE_RING_RMAX, WAVE_RING_LIFE,
-                       WAVE_RING_A0, 3, 1, 0);
+                       WAVE_RING_A0, 2, 1, 0);
+#ifdef KOI_HOST_PROBE
+            {   /* ★ 位置几何探针：只问两件事，都不依赖鱼在哪、在哪一帧 */
+                float dx = rx - k->x, dy = ry - k->y;
+                float d  = hypotf(dx, dy);
+                float dr = fabsf(d - k->L * k->grow * KMOUTH);   /* 该在吻端 */
+                if (dr > s_wave_rad) s_wave_rad = dr;
+                if (d > 0.001f) {
+                    float dot = (dx / d) * fcos_t(k->headA) + (dy / d) * fsin_t(k->headA);
+                    if (dot >  1.0f) dot =  1.0f;
+                    if (dot < -1.0f) dot = -1.0f;
+                    float ang = acosf(dot) * 57.2957795f;        /* 与正前方的夹角 */
+                    if (ang > s_wave_ang) s_wave_ang = ang;
+                }
+                s_wave_n++;
+            }
+#endif
         }
+        /* ⚠️ 这里调 rnd_f 是**安全的**：它在倒计时归零那一刻才跑，次数取决于
+           物理时间而非鱼条数，且 v31 实测「安全区越界 0.00」。
+           ⚠️ 但 **make_koi 里的 rsp_cd 初值绝不能调 rnd_f**（铁律 20）——
+              那里每新增一条鱼就多吃一次全局随机数，全池后续序列整体错位，
+              800 帧混沌放大后安全区越界会从 0.00 漂到 **−2.34 px**（实测过）。 */
         k->rsp_cd = rnd_f(WAVE_CD_MIN, WAVE_CD_MAX);
     }
 }
@@ -6329,5 +6388,15 @@ void demo_koi_spot_report(void)
     printf("[SPOT] 红斑溢出鱼身(≤0 才合格; 单位=半宽比例): %+.4f"
            "  (最大发生在第 %d 段: 0=头 2=腹 5=尾根)\n",
            (double)s_spot_over, s_spot_over_seg);
+    /* ★ 第 63 轮：游动涟漪 spawn 累计次数 —— 涟漪寿命只有 0.85s，
+       真机 2s 统计窗口里大概率捕不到，"波=0" 不代表没 spawn，只能靠这个数。 */
+    printf("[WAVE] 游动涟漪 spawn 总数 (本轮观测): %d\n", s_wave_n);
+    /* ★ v32：位置几何判据 —— 证明它冒在**嘴正前方**、且公式与吃食那道同源。
+       ANG 理论 0.000°（涟漪方位 == headA）；RAD 理论 0.000px（距离 == L·grow·KMOUTH）。
+       两行都必须是 0 —— 只要不是 0，就说明位置公式跟吃食那处**已经不同步了**。 */
+    printf("[WAVE-ANG] 涟漪方位 vs 鱼头朝向 最大夹角(度，理论 0): %.4f\n",
+           (double)s_wave_ang);
+    printf("[WAVE-RAD] 涟漪心 vs 吻端 最大距离偏差(px，理论 0): %.4f\n",
+           (double)s_wave_rad);
 }
 #endif
