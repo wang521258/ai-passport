@@ -3469,6 +3469,22 @@ static void koi_draw(koi_t *k)
         float hwc  = KDEPTH[sg] + (KDEPTH[sg + 1] - KDEPTH[sg]) * tt;
         float segl = hypotf(_spx[sg + 1] - _spx[sg], _spy[sg + 1] - _spy[sg]);
         if (segl < 0.5f) segl = 0.5f;
+        /* ★ v35：斑沿轴能伸到的段范围 ⇒ 取其中**最窄**的半宽系数做保守限位。
+           撤销 v34 的 sc 之后，端部顶点不再被"局部半宽"缩放，防溢出的责任
+           全落到 lim_r 上 —— lim_r 必须用整个跨度里**最窄**的那一处，
+           否则斑伸进尾根（hw=0.30）时就会捅出去。
+           ⚠️ 1.10 是下面 r 的凸出硬上限，所以 |rx| ≤ 1.10·sl。 */
+        float p_lo = (float)sg + tt - 1.10f * sl / segl;
+        float p_hi = (float)sg + tt + 1.10f * sl / segl;
+        if (p_lo < 0.0f) p_lo = 0.0f;
+        if (p_hi > (float)KSEG) p_hi = (float)KSEG;
+        int q_lo = (int)p_lo;
+        int q_hi = (int)p_hi + 1;
+        if (q_lo < 0) q_lo = 0;
+        if (q_hi > KSEG) q_hi = KSEG;
+        float hw_min = KDEPTH[q_lo];
+        for (int q = q_lo + 1; q <= q_hi; q++)
+            if (KDEPTH[q] < hw_min) hw_min = KDEPTH[q];
         for (int v = 0; v < SEGS; v++) {
             /* 每顶点两个独立噪声（都不消费 rnd_f）：一个给 ang 抖、一个给 v_mid 相位
                （v_hi 用 spot_h(s, v+31)，见下面 r 公式；bit 不要与上面的 nz 重复算） */
@@ -3525,12 +3541,25 @@ static void koi_draw(koi_t *k)
             float bite  = v_low + v_mid + v_hi;
             float r     = 1.0f - bite;                              /* 均值 ≈ 1.0（不再单向缩水） */
             float sin_a = fabsf(fsin_t(ang));
-            float lim_r = (hwc - 0.06f - fabsf(off) / Wd)
-                          / (sw * 1.15f * sin_a + 1e-3f);
+            /* ★★ v35 修复：旧公式**量纲错了**，这是王总 v34「太小了」的真正根因。
+               旧：lim_r = (hwc - 0.06 - |off|/Wd) / (sw * 1.15 * sin_a)
+                   分子 = 半宽比例（无量纲），分母 sw = **像素**，两者差一个 Wd(≈7.9)
+                   ⇒ 腹部 lim_r ≈ 0.168、头部 ≈ 0.075，而紧跟其后
+                     `if (r < 0.25f) r = 0.25f;` 又把 r 顶回 0.25
+                   ⇒ **横向顶点半径被死死压在 0.25**（纵向 sin_a≈0 的方向 lim_r
+                      巨大不 clamp）⇒ 斑退化成沿鱼身轴的**细横条**。
+               新：统一到**像素**口径
+                     |off| + sw·r·|sinθ| ≤ (hw_min − 0.06)·Wd
+                   ⇒ r ≤ ((hw_min − 0.06)·Wd − |off|) / (sw·|sinθ|)
+                   实算 腹部 ≈1.53（>硬上限，不再 clamp）、头部 ≈1.00 ⇒ r 回到 ~1.0。
+               ⚠️ hw_min 是斑跨度内最窄处（不是斑心 hwc）：撤销 sc 后
+                  端部不再被局部半宽缩放，必须按最窄处限，否则尾部会捅出去。 */
+            float lim_r = ((hw_min - 0.06f) * Wd - fabsf(off))
+                          / (sw * sin_a + 1e-3f);
             if (lim_r < 0.0f) lim_r = 0.0f;
             if (r > 1.10f)        r = 1.10f;     /* 凸出硬上限 10% */
-            if (r > lim_r)        r = lim_r;     /* 不溢出鱼身 */
             if (r < 0.25f)        r = 0.25f;     /* 向内最深 75% */
+            if (r > lim_r)        r = lim_r;     /* ★ 不溢出鱼身：lim_r 有最终决定权 */
             float rx = fcos_t(ang) * sl * r;
             float ry = fsin_t(ang) * sw * r;
             /* ★ 弧长位置 p（单位=段）⇒ 该处半宽 / spine 点 / 切向 */
@@ -3540,12 +3569,16 @@ static void koi_draw(koi_t *k)
             int   pi = (int)p; if (pi > KSEG - 1) pi = KSEG - 1;
             float pf = p - (float)pi;
             float hw_p = KDEPTH[pi] + (KDEPTH[pi + 1] - KDEPTH[pi]) * pf;
-            float sc = hw_p / hwc;                    /* 横向跟着曲面收窄/放宽 */
+            /* ★ v35：删掉 `float sc = hw_p / hwc;`（v34 用它把 lat 整体缩放）。
+               sc 是**尺寸**缩放不是"曲面贴合" —— 尾部 hw_p/hwc≈0.3 ⇒ 斑端被压扁
+               到 30%，这是"太小"的次要成因。真正的曲面贴合是**顶点位置**
+               (bx,by,a2) 按弧长 p 取，那部分完全保留，与 sc 无关。
+               防溢出改由上面的 lim_r（按 hw_min 保守限）负责。 */
             float bx = _spx[pi] + (_spx[pi + 1] - _spx[pi]) * pf;
             float by = _spy[pi] + (_spy[pi + 1] - _spy[pi]) * pf;
             float a2 = _spa[pi] + (_spa[pi + 1] - _spa[pi]) * pf;
             float c2 = fcos_t(a2), s2 = fsin_t(a2);
-            float lat = (off + ry) * sc;              /* 横向：整体按局部半宽缩放 */
+            float lat = (off + ry);               /* ★ v35：不再乘 sc（局部半宽缩放） */
 #ifdef KOI_HOST_PROBE
             /* ★★ 第 63 轮：红斑**溢出鱼身轮廓**的几何探针（只台架编译）。
                为什么不用"改前/改后两帧 diff"来判：鱼的轨迹对初值极敏感，
