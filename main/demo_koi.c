@@ -135,6 +135,9 @@ static inline int32_t floor_f2i(float v)
    ⚠️ 它进 .rodata（flash），**不占 RAM** —— C3 只有 ~320KB DRAM，而 s_fb 已经吃掉 153,600 B
       （铁律 21）。所以"背景备份一份到 RAM"这条路是死的，必须从 flash 读。 */
 #include "koi_bg.h"
+/* ★★ 第 63 轮：动态水面光网（caustic）模板 128×128 8-bit alpha（16,384 B）。
+   由 _tools/gen_caustic.py 一次性烘成，**勿手改**。进 .rodata（flash），不占 RAM。 */
+#include "koi_caustic.h"
 /* ★★ 第 45 轮：**夜间**底图 = 王总给的平静水面（240x320 RGB565，153,600 B）。
    由 _tools/bgbake45.py 烘焙，**勿手改**。
 
@@ -207,7 +210,7 @@ static const char *TAG = "koi";
 #ifdef KOI_HOST_PROBE
 static long long s_c_px, s_c_span, s_c_fp, s_c_fpinc, s_c_fpedge, s_c_fpdrop,
                  s_c_pts, s_c_sl, s_c_sqrt, s_c_lrint, s_c_quad, s_c_trig,
-                 s_c_floor, s_c_koi, s_c_lily;
+                 s_c_floor, s_c_koi, s_c_lily, s_c_caus;   /* ★ 63 轮：caustic 实际混合的像素数 */
 #define PCNT(k)       do { s_c_##k++; } while (0)
 #define PCNT_N(k, n)  do { s_c_##k += (n); } while (0)
 #else
@@ -430,6 +433,29 @@ static int     s_pal_ver   = 0;     // ★ 52 轮：调色板版本号（荷叶�
                                                 ΔG=10（≈5 级台阶 / 每 64 行一跳）应远低于"足球场"阈值。 */
 #define LOOK_SPARK_DEF  2    /* ★ 第 41 轮：关掉波光点（王总原话"星星点点的跟星星一样的是啥东西啊 去掉他"；第 37 轮默认开是为了"水面提亮版"观感，现在宁可干净） */
 #define LOOK_TAIL_DEF   0
+/* ★★ 第 63 轮：动态水面光网 caustic（王总：「水面只是图形的形式的动态光影
+     能不能把这个图里的光影给做成动态的」+ 给了张水池俯视图，水面是网状 caustic）。
+   档位：0 = 关（回到第 62 轮及以前的静态水面）；1 = 开（默认）。
+   ⚠️ 开这一档的代价是**水面每帧整池重画**（caustic 要"流动"，不能只在脏矩形里更新，
+      否则会看到"鱼周围在动、别处静止"的碎裂感）—— 见 render() 里的注释与台架实测。 */
+#define LOOK_CAUSTIC_DEF 1
+#define CAUSTIC_MIN_A    16   /* 模板 alpha ≤ 16 的暗区直接跳过：模板里约 3 成的像素在这个
+                                 量级，跳过它们省下的逐像素混合是实打实的 CPU */
+#define CAUSTIC_GAIN     112  /* 模板 alpha 的整体缩放，0..256（112 ≈ 44%）。
+                                 ★★ 第 63 轮第 6 版（domain-warp + sin 阈值切割）
+                                    4 档对比后选的"强"档：
+                                      · 关/弱(40)：caustic 几乎看不见（被底图水波纹压住）
+                                      · 中(76)：隐约可见，太含蓄
+                                      · 强(112)：网状清晰，鱼还能看见 ← 选这个
+                                      · 很强(160)：盖住鱼背的细节
+                                    112 → 最亮处提亮约 +62/+46/+44，
+                                    水色中位 158 vs 关 143，P99 228（不会打爆）。
+                                    ⚠️ 真机首要看串口报数（avg/max），
+                                       如果 max 飙到 200ms+ 把这值退回 76 或更小。 */
+#define CAUSTIC_SPD_X    9    /* X 漂移速度：模板像素 / 秒（真机 ~12fps ⇒ 0.75px/帧） */
+#define CAUSTIC_SPD_Y    6    /* Y 漂移速度：模板像素 / 秒 —— 两轴不同速才像"斜着流"不是"平移" */
+#define CAUSTIC_SWAY     3    /* Y 上再叠一个 ±3px 的正弦摆动（周期 ~7s）。
+                                 纯平移看着像"贴图在滑"，加一点来回摆才有水面那种呼吸感 */
 #define LOOK_NIGHT_DEF  1    /* ★ 昼夜量化是纯性能修正（王总要的"不卡"），默认打开 */
 /* ★ 昼夜过渡分成几阶（0 = 不量化 = 逐帧推进 = 改动前的现状）。
    为什么要有这一列档：**这是成本与平滑度的直接兑换**，而"该多滑"是观感刻度。
@@ -447,6 +473,12 @@ static int s_look_bgd   = LOOK_BGD_DEF;
 static int s_look_spark = LOOK_SPARK_DEF;
 static int s_look_tail  = LOOK_TAIL_DEF;
 static int s_look_night = LOOK_NIGHT_DEF;
+static int s_look_caustic = LOOK_CAUSTIC_DEF;   /* ★ 第 63 轮：动态水面光网 */
+/* caustic 的 UV 漂移偏移（模板像素，0..127）与本帧的实际缩放。
+   ★ s_caus_ox 初值取 -1 是**故意的**：第一次 caustic_sync() 一定判成"变了"，
+     于是进池第一帧必然整屏重画一次，不会留下一张没叠光网的旧底图。 */
+static int  s_caus_ox = -1, s_caus_oy = -1;
+static int  s_caus_gain = CAUSTIC_GAIN;
 
 #ifdef KOI_HOST_PROBE
 /* ★ 第 39 轮「叶下鱼台架」专用：这一帧**跳过鱼 0 的绘制**。
@@ -1318,6 +1350,86 @@ static KOI_HOT void water_rect(int x0, int y0, int x1, int y1)
     water_rect_proc(x0, y0, x1, y1);
 }
 
+/* ==========================================================================
+   ★★ 第 63 轮：动态水面光网 caustic
+   --------------------------------------------------------------------------
+   王总：「水面只是图形的形式的动态光影，能不能把这个图里的光影给做成动态的」
+         （附了一张水池俯视图 —— 水面是那种网状 caustic 光斑）。
+   现状：koi_bg 是一张**静态照片**，水面除了 44 个固定波光点（第 41 轮起默认关）
+        一动不动。
+
+   方案（王总选的 B）：**保留 koi_bg 底图，在它上面叠一层程序化 caustic**。
+     · 模板 koi_caustic.h = 128×128 8-bit alpha，由 _tools/gen_caustic.py 烘死，
+       运行时**零三角函数**（只有取模与查表）—— 这是能在 C3 上跑的前提；
+     · 运动 = 整块模板做 UV 平移（X/Y 不同速）+ Y 上一个 ±3px 的慢摆动，
+       一次 render 只算一次偏移，不是逐像素算；
+     · 叠在**底图之上、鱼与荷叶之下**（层序与 spark_overlay 同级）。
+
+   ★★ 为什么要"每帧整池重画"（代价，写在前面）
+      caustic 是**全屏连续**的花纹。若只在脏矩形里更新，脏矩形边界的外侧还留着
+      上一次（旧偏移）画的花纹 ⇒ 会看到"鱼周围在动、别处静止"的接缝在画面上游走。
+      所以开这一档时 render 走整屏（s_full），脏区恒 100%。
+      ⇒ 这是**真金白银的性能开销**，开档前先看台架读数，别只凭"好看"就默认开。
+
+   ⚠️ 别把 caustic 画进 s_asnap（快照 alpha）：它属于"背景"，不参与鱼/叶的
+      贴图合成，画进去只会把覆盖率 A 搅乱。
+   ========================================================================== */
+
+/* 本帧的 UV 偏移。返回 1 = 偏移变了 ⇒ 调用方必须置 s_full 整屏重画。
+   ★ 这个"变了才整屏"的判定是有意义的：真机 ~12fps、X 速度 9px/s ⇒ 0.75px/帧，
+     也就是大约每 4 帧里有 3 帧偏移真的跳一格 —— 能省下四分之一的整屏。 */
+static int caustic_sync(void)
+{
+    if (s_look_caustic <= 0 || s_caus_gain <= 0) {
+        if (s_caus_ox == 0 && s_caus_oy == 0) return 0;
+        s_caus_ox = s_caus_oy = 0;      /* 关掉也要归零，并且整屏一次把光网擦掉 */
+        return 1;
+    }
+    float t   = s_time;
+    int   ox  = (int)(t * (float)CAUSTIC_SPD_X) & 127;
+    int   oy  = (int)(t * (float)CAUSTIC_SPD_Y
+                    + (float)CAUSTIC_SWAY * fsin_t(t * 0.9f)) & 127;
+    if (ox == s_caus_ox && oy == s_caus_oy) return 0;
+    s_caus_ox = ox; s_caus_oy = oy;
+    return 1;
+}
+
+/* 把 caustic 叠到 [x0..x1]×[y0..y1] 这段刚铺好的底图上。
+   ⚠️ 这里是**唯一**写 caustic 的地方，两条水面路径（照片 / 程序化渐变）共用它 ——
+      复制一份必然两边跑偏（铁律 8 那一族：draw 与 dump 必须共用一函数）。
+   ⚠️ 不复用 px_blend：它每个像素要做 6 次裁剪比较 + 归属探针 + 快照分支，
+      而这里整块矩形**必然在 clip 内**（调用方就是按 clip 给的），
+      这些判断全是白花钱 —— 逐像素混合是这一档唯一的成本大头，必须自己写紧循环。 */
+static KOI_HOT void caustic_overlay(int x0, int y0, int x1, int y1)
+{
+    int gain = s_caus_gain;
+    if (s_look_caustic <= 0 || gain <= 0) return;
+    const uint8_t *cc = s_pal[PI_SPARK];      /* 近白偏青，夜间已随调色板一起压暗 */
+    int cr = cc[0], cg = cc[1], cb = cc[2];
+    int ox = s_caus_ox, oy = s_caus_oy;
+    int w  = x1 - x0 + 1;
+    for (int y = y0; y <= y1; y++) {
+        const uint8_t *row = &koi_caustic[((y + oy) & 127) << 7];
+        uint16_t      *o   = &s_fb[y * KW + x0];
+        int tu = (x0 + ox) & 127;
+        for (int i = 0; i < w; i++, tu++) {
+            if (tu >= 128) tu = 0;             /* 模板横向回绕（比 & 127 少一次与运算） */
+            int a0 = row[tu];
+            if (a0 <= CAUSTIC_MIN_A) continue; /* 暗区直接跳过：约 3 成像素走这条路 */
+            int a  = (a0 * gain) >> 8;
+            uint16_t d  = o[i];
+            int dr = s_e5[(d >> 11) & 31];
+            int dg = s_e6[(d >> 5) & 63];
+            int db = s_e5[d & 31];
+            dr += ((cr - dr) * a) >> 8;
+            dg += ((cg - dg) * a) >> 8;
+            db += ((cb - db) * a) >> 8;
+            o[i] = pack565(dr, dg, db);
+            PCNT(caus);
+        }
+    }
+}
+
 /* 程序化水面：每行一个颜色（纵向渐变），第 34 轮起就没有 LUT 了。 */
 static KOI_HOT void water_rect_proc(int x0, int y0, int x1, int y1)
 {
@@ -1332,6 +1444,7 @@ static KOI_HOT void water_rect_proc(int x0, int y0, int x1, int y1)
 #endif
         }
     }
+    caustic_overlay(x0, y0, x1, y1);   /* ★ 63 轮：动态光网叠在水色之上 */
     spark_overlay(x0, y0, x1, y1);
 }
 
@@ -1360,6 +1473,7 @@ static KOI_HOT void bg_rect(int x0, int y0, int x1, int y1)
         for (int x = x0; x <= x1; x++) WHO_PUT(x, y);
 #endif
     }
+    caustic_overlay(x0, y0, x1, y1);   /* ★ 63 轮：动态光网叠在照片之上、鱼与荷叶之下 */
     spark_overlay(x0, y0, x1, y1);
 }
 
@@ -5170,6 +5284,11 @@ static void tick_cb(lv_timer_t *t)
        ⚠️ 别和上面 pal_pre 合并成一个 if —— "调色板重建"与"底图换源"是两件事，
           恰好同时发生只是通常情形，不是必然（day_pal_sync 会强制重建调色板但底图没换）。 */
     bg_sync_full();
+    /* ★★ 第 63 轮：caustic 的 UV 偏移变了 ⇒ 本帧整屏重画。
+       放在这里（紧贴 render、在 bg_sync_full 之后）与"底图换源"是同一个道理：
+       s_full 是**赋值**不是置位（帧首 `s_full = pal_pre` 会冲掉写在前面的东西），
+       所以所有"本帧要不要整屏"的裁决必须在 render 之前这一段里做完。 */
+    if (caustic_sync()) s_full = 1;
     render();                   // 内部自己 PROF_TICK(2)/(3..8)
     s_koi_acc += s_koi_n; s_lily_acc += s_lily_n;
 #ifdef KOI_HOST_PROBE
@@ -5466,6 +5585,17 @@ void demo_koi_set_bgphoto(int on)
 {
     s_bg_photo = on ? 1 : 0;
     s_full = 1;                 /* 换底图必须整屏重画一次，否则半屏照片半屏渐变 */
+    s_first_frame = 1;
+}
+
+/* ★ 第 63 轮：caustic 的运行时入口（只给台架出对比帧用）。
+   on < 0 / gain < 0 = 保持原值。真机没有入口 —— 档位由 LOOK_CAUSTIC_DEF 定死，
+   免得用户误触开出一个"帧率减半"的开关。 */
+void demo_koi_set_caustic(int on, int gain)
+{
+    if (on   >= 0) s_look_caustic = on ? 1 : 0;
+    if (gain >= 0) s_caus_gain    = gain;
+    s_full = 1;
     s_first_frame = 1;
 }
 
