@@ -2574,7 +2574,7 @@ static const float KDEPTH[KSEG + 1] = {KOI_KDEPTH0, 0.90f, 1.00f, 0.78f, 0.55f, 
         没有真实残留（脏矩形合并 + AABB 自带的 −1/+2 余量吃掉了）。
         这是"最坏情况预检"与"真实残留"的差别，别把预检读数当成拖影。 */
 #ifndef KOI_DIRT_MARGIN
-#define KOI_DIRT_MARGIN  7.5f
+#define KOI_DIRT_MARGIN  6.5f
 #endif
 #define KMOUTH  (0.175f * 0.46f * 0.875f)
 #define BITE_T    0.42f
@@ -3620,11 +3620,14 @@ static void koi_draw(koi_t *k)
                  · 凸出硬上限改 1.10（让头部/腹部窄段允许的小尖角保留下来）。
                ⚠️ 这版是回归"分叶团块"的算力版，面积大致回到 v33 量级，
                  形状仍是真不规则（v_mid+v_hi 的非周期相位 + 每顶点独立 hash）。 */
-            /* ★ v37：v_mid 0.30→0.40、v_hi 0.05→0.08 —— 王总"彻底避免圆形和椭圆形"。
-               ⚠️ 只有 v_mid / v_hi 这种**每顶点独立 hash**（与 θ 无关）才真能打破椭圆；
-                  v_low 那种 cos(θ) 是轴对称的，加再大也还是椭圆（v34 已验证）。 */
+            /* ★ v37c：v_mid 0.40→0.30 收回 —— 王总要"不椭圆"靠的是**每顶点独立 hash**
+               打破对称（v34 已验证 cos 类扰动再大也是椭圆），
+               幅度 0.30 已经能让顶点**位置互相独立**（不再围绕椭圆中心）。
+               v37 第一版上到 0.40 实测让斑的极端顶点更靠外 ⇒ AABB 增大 ⇒
+               脏区从 35% 涨到 54% ⇒ 真机 9 鱼帧时间从 116ms 翻到 195ms ⇒ 卡。
+               ⇒ 收回 0.30（保持 v_hi 0.08 加强锯齿够"自然块状感"）。 */
             float v_low = 0.10f * fcos_t(ang * 1.7f + ph * 1.3f);   /* ∈[-0.10,+0.10]，双向保大致椭圆 */
-            float v_mid = 0.40f * (spot_h(fseed, s, v + 17) - 0.5f);       /* ∈[-0.15,+0.15]，双向 hash 不规则 */
+            float v_mid = 0.30f * (spot_h(fseed, s, v + 17) - 0.5f);       /* ∈[-0.15,+0.15]，双向 hash 不规则 */
             float v_hi  = 0.08f * (spot_h(fseed, s, v + 31) * 2.0f - 1.0f);/* ∈[-0.05,+0.05]，高频锯齿 */
             float bite  = v_low + v_mid + v_hi;
             float r     = 1.0f - bite;                              /* 均值 ≈ 1.0（不再单向缩水） */
