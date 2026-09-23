@@ -503,6 +503,10 @@ static void render_panel(void)
        英文长词由 pick_font 选小字号。极端情况仍允许换行兜底。 */
     lv_label_set_long_mode(s_p_word, LV_LABEL_LONG_WRAP);
     lv_obj_set_height(s_p_word, 44);
+    lv_point_t question_size;
+    lv_text_get_size(&question_size, qtext, qf, 0, 0, 232, LV_TEXT_FLAG_NONE);
+    if (question_size.y > 44)
+        lv_label_set_long_mode(s_p_word, LV_LABEL_LONG_SCROLL_CIRCULAR);
     /* 字号变了行高也变，垂直居中才不会忽高忽低 */
     lv_obj_set_pos(s_p_word, 4, 80);
 
@@ -524,6 +528,9 @@ static void render_panel(void)
         /* 文字区高度 = 行高：CLIP 只切到行高之外，不会伤到笔画 */
         lv_obj_set_pos(s_p_txt[i], TXT_X, (ROW_H - (int)f->line_height) / 2);
         lv_obj_set_size(s_p_txt[i], ROW_AVAIL(rw), (int)f->line_height);
+        /* Long textbook meanings stay readable in the selected row. */
+        lv_label_set_long_mode(s_p_txt[i], i == (int)s_opt ?
+                              LV_LABEL_LONG_SCROLL_CIRCULAR : LV_LABEL_LONG_CLIP);
 
         if (i == (int)s_opt) {
             /* 选中：黄底深字，最醒目 */
@@ -780,6 +787,10 @@ static void render_grade_select(void)
         lv_obj_set_style_text_font(s_p_txt[i], CN_FONT, 0);
         lv_obj_set_pos(s_p_txt[i], TXT_X, (ROW_H - (int)CN_FONT->line_height) / 2);
         lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(C_ROWTXT), 0);
+        lv_obj_set_style_bg_color(s_p_opts[i], lv_color_hex(i == s_opt ? 0xFFD928 : C_ROW), 0);
+        lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(i == s_opt ? C_INK : C_ROWTXT), 0);
+        lv_obj_set_style_border_color(s_p_opts[i], lv_color_hex(C_ROWBRD), 0);
+        lv_obj_set_style_outline_width(s_p_opts[i], 0, 0);
         lv_obj_set_style_opa(s_p_cursor[i], i == s_opt ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
     }
 }
@@ -864,6 +875,7 @@ static void answer(int option)
     lv_obj_set_style_bg_color(s_p_opts[s_qCorrect], lv_color_hex(0xB7E4A8), 0);
     lv_obj_set_style_text_color(s_p_txt[s_qCorrect], lv_color_hex(0x102A16), 0);
     lv_obj_set_style_border_color(s_p_opts[s_qCorrect], lv_color_hex(0x237A36), 0);
+    lv_label_set_long_mode(s_p_txt[s_qCorrect], LV_LABEL_LONG_SCROLL_CIRCULAR);
     if (!right) lv_obj_set_style_border_color(s_p_opts[option], lv_color_hex(0xC76A39), 0);
     pet_save_soon();                       /* 掉电保存：答完一题就记一笔（节流 20s） */
 }
