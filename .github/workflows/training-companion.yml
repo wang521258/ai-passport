@@ -1,0 +1,46 @@
+name: Training companion v7
+on:
+  push:
+    branches: [pet-training-companion-v7]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: companion-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Test feedback timing and key handling
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -Imain tests/test_training_feedback.c -o /tmp/test-training-feedback
+          /tmp/test-training-feedback
+      - name: Complete validation and S3 build
+        uses: espressif/esp-idf-ci-action@9d38657f3d789ca759b2b37aaf5ceffbc42c4f0d
+        with:
+          esp_idf_version: v5.5.3
+          target: esp32s3
+          command: ./tools/validate.sh
+      - name: Package app-only upgrade
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          full = Path('build/FoloToy-AI-Passport-full.bin').read_bytes()
+          assert 0x10000 < len(full) <= 0x356000
+          app = full[0x10000:]
+          assert app[0] == 0xe9
+          Path('build/FoloToy-AI-Passport-v7-app.bin').write_bytes(app)
+          PY
+          sha256sum build/*.bin > build/SHA256SUMS.txt
+          printf '%s\n' "$GITHUB_SHA" > build/SOURCE_COMMIT.txt
+      - name: Upload verified firmware
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pet-training-companion-v7
+          path: |
+            build/*.bin
+            build/SHA256SUMS.txt
+            build/SOURCE_COMMIT.txt
+          if-no-files-found: error

@@ -49,3 +49,7 @@
 - Updated software-design and project README references for the new documentation structure.
 - Added the documentation catalog and task-triggered routing based on the earlier repository model.
 - Added bilingual contribution, code-of-conduct, security, and support documents tailored to this ESP-IDF and fork workflow.
+
+## 2026-09-23 — Training companion
+
+Training and review now show the current pet, selection reactions and answer feedback. Correct answers celebrate before advancing; incorrect answers highlight the correct choice and wait for confirmation. Existing vocabulary, save format and board configuration are unchanged.

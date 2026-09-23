@@ -28,6 +28,7 @@
 #include "ui_pixel.h"
 #include "ui_pet.h"
 #include "gif_player.h"
+#include "training_feedback.h"
 #include "ui_sound.h"
 /* Compatibility with the older S3 firmware branch: it only ships the 14/20px Latin fonts and basic UI sound effects. */
 #ifndef lv_font_montserrat_18
@@ -93,7 +94,7 @@ extern lv_font_t cn_18;
 #define ROW_W5      190                 /* 返回行宽（略窄，保留视觉区分） */
 #define TXT_X        20                 /* 行内文字左边界 */
 #define TXT_PAD       6                 /* 行内文字右边距 */
-#define ROW_H        42                 /* 行高 */
+#define ROW_H        32                 /* 行高 */
 #define ROW_AVAIL(w) ((w) - TXT_X - TXT_PAD)   /* 文字区可用宽度 */
 
 typedef enum { MODE_EGG, MODE_HOME, MODE_GRADE_SELECT, MODE_TRAIN, MODE_REVIEW } pet_mode_t;
@@ -155,6 +156,12 @@ static lv_timer_t *s_curtain_t;           /* 黑幕动画定时器（非 NULL �
 static esp_timer_handle_t s_tick_timer;
 static uint32_t s_forget_cnt;
 
+static lv_obj_t *s_companion_text;
+static lv_timer_t *s_companion_timer;
+static training_feedback_t s_reaction;
+static lv_timer_t *s_flash_t;
+static void exit_qa(void);
+static void companion_show(bool training);
 static void try_evolve(void);             /* 前向声明（answer 先于定义调用） */
 
 /* ============================================================
@@ -487,6 +494,7 @@ static const lv_font_t *pick_font(const char *s, bool zh, int avail_px)
 static void render_panel(void)
 {
     /* 题干：e2c 显英文 / c2e 显中文；音标不显示（Montserrat 无 IPA 字形会出方块） */
+    if (s_qWord < 0) return;
     const char *qtext = s_qDir ? word_pool[s_qWord].cn : word_pool[s_qWord].en;
     const lv_font_t *qf = pick_font(qtext, s_qDir != 0, 232);
     lv_label_set_text(s_p_word, qtext);
@@ -494,9 +502,9 @@ static void render_panel(void)
     /* 中文题干最长 11 字（"舞者，舞蹈演员，舞蹈家"）= 198px < 232px 一行放得下；
        英文长词由 pick_font 选小字号。极端情况仍允许换行兜底。 */
     lv_label_set_long_mode(s_p_word, LV_LABEL_LONG_WRAP);
-    lv_obj_set_height(s_p_word, 32);
+    lv_obj_set_height(s_p_word, 44);
     /* 字号变了行高也变，垂直居中才不会忽高忽低 */
-    lv_obj_set_pos(s_p_word, 0, 16 + (32 - (int)qf->line_height) / 2);
+    lv_obj_set_pos(s_p_word, 4, 80);
 
     for (int i = 0; i < 5; i++) {
         int rw = (i < 4) ? ROW_W : ROW_W5;
@@ -510,6 +518,7 @@ static void render_panel(void)
             text = (s_mode == MODE_REVIEW) ? "结束温习，返回" : "结束训练，返回";
             f = CN_FONT;
         }
+        lv_obj_set_pos(s_p_opts[i], (240 - rw) / 2, 132 + i * 36);
         lv_label_set_text(s_p_txt[i], text);
         lv_obj_set_style_text_font(s_p_txt[i], f, 0);
         /* 文字区高度 = 行高：CLIP 只切到行高之外，不会伤到笔画 */
@@ -536,6 +545,10 @@ static void render_panel(void)
         }
     }
     /* 强制让按键后的选框在这一帧更新。 */
+    if (s_companion_text && !s_reaction.active) {
+        lv_label_set_text(s_companion_text, s_opt == 4 ? "一起回家" :
+                          (s_mem[s_qWord] ? "这个见过\n一起想想" : "这个怎么选？"));
+    }
     lv_obj_invalidate(s_panel);
 }
 
@@ -689,16 +702,83 @@ static void pet_gif_hide(bool hide)
     }
 }
 
+/* One decoder is reused between home and the 64px training companion.
+ * All entry points run with the existing LVGL lock; feedback uses LVGL time. */
+static uint16_t training_bg(int x, int y)
+{
+    (void)x; (void)y;
+    return C_BG565;
+}
+
+static void companion_show(bool training)
+{
+    gif_player_set_bg_fn(training ? training_bg : bg_color_at);
+    s_gif = gif_player_create(training ? s_panel : s_scr,
+                              training ? 8 : PET_X, training ? 8 : PET_Y,
+                              training ? 64 : PET_SIZE, training ? 64 : PET_SIZE);
+    if (s_gif) {
+        gif_player_set_bob(s_gif, training);
+        gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data,
+                        pokemon_gifs[s_cur_poke_idx].len);
+    }
+    if (s_companion_text) {
+        if (training) lv_obj_remove_flag(s_companion_text, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(s_companion_text, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void feedback_finish(void)
+{
+    if (!s_reaction.active) return;
+    training_feedback_clear(&s_reaction);
+    if (s_reaction.right) { try_evolve(); pet_save_soon(); }
+    if (s_mode == MODE_REVIEW && s_wrong_n == 0) {
+        exit_qa();
+        return;
+    }
+    build_question();
+    if (s_qWord < 0) { exit_qa(); return; }
+    if (s_gif) gif_player_set_pos(s_gif, 8, 8);
+    render_panel();
+}
+
+static void companion_tick(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!s_active || (s_mode != MODE_TRAIN && s_mode != MODE_REVIEW)) return;
+    uint32_t elapsed = lv_tick_get() - s_reaction.started;
+    if (training_feedback_ready(&s_reaction, lv_tick_get(), false)) {
+        feedback_finish();
+        return;
+    }
+    if (!s_gif) return;
+    int x = 8, y = 8;
+    if (s_reaction.active && elapsed < 1000) {
+        if (s_reaction.right) {
+            static const int jump[] = {0, -3, -6, -3, 0};
+            y += jump[(elapsed / 100) % 5];
+        } else {
+            static const int shake[] = {0, -2, 0, 2, 0};
+            x += shake[(elapsed / 100) % 5];
+        }
+    } else if (!s_reaction.active) {
+        x += (s_opt < 4 ? s_opt : 0); /* acknowledge the selection */
+    }
+    gif_player_set_pos(s_gif, x, y);
+}
+
 static void render_grade_select(void)
 {
     static const char *const labels[5] = { "三年级（200词）", "四年级（191词）", "五年级（198词）", "六年级（196词）", "返回宠物" };
+    lv_obj_add_flag(s_companion_text, LV_OBJ_FLAG_HIDDEN);
     lv_label_set_text(s_p_word, "选择训练年级");
     lv_obj_set_style_text_font(s_p_word, CN_FONT, 0);
     lv_obj_set_pos(s_p_word, 0, 16);
     for (int i = 0; i < 5; i++) {
+        lv_obj_set_pos(s_p_opts[i], (240 - (i < 4 ? ROW_W : ROW_W5)) / 2, 58 + i * 48);
         lv_label_set_text(s_p_txt[i], labels[i]);
         lv_obj_set_style_text_font(s_p_txt[i], CN_FONT, 0);
-        lv_obj_set_pos(s_p_txt[i], TXT_X, 10);
+        lv_obj_set_pos(s_p_txt[i], TXT_X, (ROW_H - (int)CN_FONT->line_height) / 2);
         lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(C_ROWTXT), 0);
         lv_obj_set_style_opa(s_p_cursor[i], i == s_opt ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
     }
@@ -726,8 +806,10 @@ static void start_train_for_grade(uint8_t grade)
     s_grade = grade;
     s_mode = MODE_TRAIN;
     s_opt = 0;
+    training_feedback_clear(&s_reaction);
     build_question();
-    pet_gif_hide(true);
+    if (s_qWord < 0) { exit_qa(); return; }
+    companion_show(true);
     ui_sound_bgm_suspend(true);
     if (s_panel) lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     render_panel();
@@ -738,15 +820,19 @@ static void start_review(void)
     LOGI("review start: 错题 %d 个", s_wrong_n);
     s_mode = MODE_REVIEW;
     s_opt = 0;
+    training_feedback_clear(&s_reaction);
     build_question();
-    pet_gif_hide(true);
+    if (s_qWord < 0) { exit_qa(); return; }
+    companion_show(true);
     ui_sound_bgm_suspend(true);            /* 温习同训练：题板期静音 */
     if (s_panel) lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     render_panel();
 }
 static void exit_qa(void)
 {
+    training_feedback_clear(&s_reaction);
     s_mode = MODE_HOME;
+    companion_show(false);
     if (s_panel) lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     pet_gif_hide(false);                   /* 回主页恢复宠物 */
     ui_sound_bgm_suspend(false);           /* 回到宠物页，音乐从暂停处续播 */
@@ -756,6 +842,7 @@ static void exit_qa(void)
 static void answer(int option)
 {
     bool right = (option == s_qCorrect);
+    if (!training_feedback_begin(&s_reaction, right, lv_tick_get())) return;
     ui_sound_play(right ? UI_SND_CORRECT : UI_SND_WRONG);   /* 答对/答错提示音 */
     if (right) {
         s_mem[s_qWord] = MEM_FULL;            /* 学会 / 记忆刷新到满分 */
@@ -766,19 +853,18 @@ static void answer(int option)
         remove_wrong(s_qWord);
         s_stat.hunger = CLAMP(s_stat.hunger + 25);
         s_stat.happy  = CLAMP(s_stat.happy  + 10);
-        try_evolve();                          /* 词数变了，检查进化 */
-        if (s_mode == MODE_REVIEW && s_wrong_n == 0) {
-            exit_qa();                         /* 错题本清空 → 自动回主页 */
-            return;
-        }
+        /* Evolution and end-of-review wait until the reaction has been shown. */
     } else {
         s_stat.happy = CLAMP((int)s_stat.happy - 3);
         add_wrong(s_qWord);
     }
     s_stat.energy = CLAMP((int)s_stat.energy - 2);
-    build_question();
-    if (s_qWord < 0) { exit_qa(); pet_save_now(); return; }
-    render_panel();
+    lv_label_set_text(s_companion_text, right ? "学会了！" : "一起看看\n按确定继续");
+    /* Keep the question visible and highlight its actual answer, not the next one. */
+    lv_obj_set_style_bg_color(s_p_opts[s_qCorrect], lv_color_hex(0xB7E4A8), 0);
+    lv_obj_set_style_text_color(s_p_txt[s_qCorrect], lv_color_hex(0x102A16), 0);
+    lv_obj_set_style_border_color(s_p_opts[s_qCorrect], lv_color_hex(0x237A36), 0);
+    if (!right) lv_obj_set_style_border_color(s_p_opts[option], lv_color_hex(0xC76A39), 0);
     pet_save_soon();                       /* 掉电保存：答完一题就记一笔（节流 20s） */
 }
 
@@ -787,6 +873,7 @@ static void fade_flash_cb(lv_timer_t *tm)
 {
     if (s_flash) lv_obj_add_flag(s_flash, LV_OBJ_FLAG_HIDDEN);
     lv_timer_delete(tm);
+    s_flash_t = NULL;
 }
 
 /* ============================================================
@@ -815,7 +902,8 @@ static void try_evolve(void)
         lv_obj_move_foreground(s_flash);
         lv_obj_set_style_bg_opa(s_flash, LV_OPA_90, 0);
         lv_obj_remove_flag(s_flash, LV_OBJ_FLAG_HIDDEN);
-        lv_timer_create(fade_flash_cb, 350, NULL);
+        if (s_flash_t) lv_timer_delete(s_flash_t);
+        s_flash_t = lv_timer_create(fade_flash_cb, 350, NULL);
     }
 
     if (s_gif) {
@@ -827,14 +915,7 @@ static void try_evolve(void)
         lv_obj_add_flag(s_gif, LV_OBJ_FLAG_HIDDEN);
         s_gif = NULL;
     }
-    s_gif = gif_player_create(s_scr, PET_X, PET_Y, PET_SIZE, PET_SIZE);
-    if (s_gif) {
-        gif_player_set_bob(s_gif, false);
-        gif_player_play(s_gif, pokemon_gifs[s_cur_poke_idx].data,
-                        pokemon_gifs[s_cur_poke_idx].len);
-        /* 训练/温习答题中触发的进化：题板全屏，新宠物画布保持隐藏 */
-        if (s_mode == MODE_TRAIN || s_mode == MODE_REVIEW) pet_gif_hide(true);
-    }
+    companion_show(s_mode == MODE_TRAIN || s_mode == MODE_REVIEW);
 }
 
 /* ============================================================
@@ -1123,7 +1204,7 @@ void demo_pet_enter(void)
 
     s_p_word = lv_label_create(s_panel);
     lv_obj_set_pos(s_p_word, 0, 16);
-    lv_obj_set_size(s_p_word, 240, 34);
+    lv_obj_set_size(s_p_word, 232, 44);
     lv_obj_set_style_text_color(s_p_word, lv_color_hex(C_INK), 0);
     lv_obj_set_style_text_align(s_p_word, LV_TEXT_ALIGN_CENTER, 0);
 
@@ -1157,12 +1238,22 @@ void demo_pet_enter(void)
         lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(C_INK), 0);
         /* 位置/字号由 render_panel() 每次按内容定（英文长词要缩档），
            这里只给一份初值，保证首帧不出奇怪的样子。 */
-        lv_obj_set_pos(s_p_txt[i], TXT_X, 10);
+        lv_obj_set_pos(s_p_txt[i], TXT_X, (ROW_H - (int)CN_FONT->line_height) / 2);
         lv_obj_set_size(s_p_txt[i], ROW_AVAIL(w), 24);
         /* 锁死单行：行高 42 只放得下一行，换行必然把第二个字切掉 */
         lv_label_set_long_mode(s_p_txt[i], LV_LABEL_LONG_CLIP);
     }
 
+    s_companion_text = lv_label_create(s_panel);
+    lv_obj_set_pos(s_companion_text, 82, 18);
+    lv_obj_set_size(s_companion_text, 152, 52);
+    lv_obj_set_style_text_font(s_companion_text, CN_FONT, 0);
+    lv_obj_set_style_text_color(s_companion_text, lv_color_hex(C_INK), 0);
+    lv_label_set_long_mode(s_companion_text, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(s_companion_text, "一起训练");
+    lv_obj_add_flag(s_companion_text, LV_OBJ_FLAG_HIDDEN);
+    training_feedback_clear(&s_reaction);
+    s_companion_timer = lv_timer_create(companion_tick, 100, NULL);
     lv_screen_load(s_scr);
 
     ui_sound_bgm(true);                       /* 进宠物页就起 8bit 背景乐 */
@@ -1179,6 +1270,10 @@ void demo_pet_exit(void)
     LOGI("exit free=%d", (int)esp_get_free_heap_size());
     pet_save_now();                           /* 离开前把进度落盘（掉电保存） */
     s_active = false;
+    training_feedback_clear(&s_reaction);
+    if (s_companion_timer) { lv_timer_delete(s_companion_timer); s_companion_timer = NULL; }
+    s_companion_text = NULL;
+    if (s_flash_t) { lv_timer_delete(s_flash_t); s_flash_t = NULL; }
     s_sleeping = false;
     ui_sound_bgm(false);                      /* 离开宠物页就停背景乐 */
     if (s_tick_timer) { esp_timer_stop(s_tick_timer); esp_timer_delete(s_tick_timer); s_tick_timer = NULL; }
@@ -1235,6 +1330,11 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
 
     /* 训练 / 温习：上下选项，OK 确认 */
     if (s_mode == MODE_TRAIN || s_mode == MODE_REVIEW) {
+        if (s_reaction.active) {
+            if (ev == BSP_BTN_CLICK && btn == BSP_BTN_OK &&
+                training_feedback_ready(&s_reaction, lv_tick_get(), true)) feedback_finish();
+            return;
+        }
         if (ev == BSP_BTN_CLICK) {
             if (btn == BSP_BTN_UP) {
                 s_opt = (s_opt + 4) % 5;
@@ -1289,5 +1389,3 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
         reset_egg();
     }
 }
-
-
