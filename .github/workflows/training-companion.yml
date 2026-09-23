@@ -31,16 +31,19 @@ jobs:
           assert 0x10000 < len(full) <= 0x356000
           app = full[0x10000:]
           assert app[0] == 0xe9
-          Path('build/FoloToy-AI-Passport-v7-app.bin').write_bytes(app)
+          out = Path('firmware-artifact')
+          out.mkdir(exist_ok=True)
+          (out/'FoloToy-AI-Passport-full.bin').write_bytes(full)
+          (out/'FoloToy-AI-Passport-v7-app.bin').write_bytes(app)
           PY
-          sha256sum build/*.bin > build/SHA256SUMS.txt
-          printf '%s\n' "$GITHUB_SHA" > build/SOURCE_COMMIT.txt
+          sha256sum firmware-artifact/*.bin > firmware-artifact/SHA256SUMS.txt
+          printf '%s\n' "$GITHUB_SHA" > firmware-artifact/SOURCE_COMMIT.txt
       - name: Upload verified firmware
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: pet-training-companion-v7
           path: |
-            build/*.bin
-            build/SHA256SUMS.txt
-            build/SOURCE_COMMIT.txt
+            firmware-artifact/*.bin
+            firmware-artifact/SHA256SUMS.txt
+            firmware-artifact/SOURCE_COMMIT.txt
           if-no-files-found: error
