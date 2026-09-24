@@ -75,8 +75,12 @@ void gif_player_set_bob(lv_obj_t *canvas, bool enable);
  */
 void gif_player_set_pos(lv_obj_t *canvas, int x, int y);
 
+/** Move only the decoded pet inside its fixed canvas; scene pixels stay still. */
+void gif_player_set_motion(lv_obj_t *canvas, int dx, int dy);
+
 #ifdef __cplusplus
 }
 #endif
 
 #endif /* GIF_PLAYER_H */
+
