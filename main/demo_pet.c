@@ -147,7 +147,6 @@ static lv_obj_t *s_atkbox;
 static lv_obj_t *s_atk_num;
 static lv_obj_t *s_care_bar;
 static lv_obj_t *s_care_btns[3];
-static lv_obj_t *s_home_msg;
 static lv_obj_t *s_night;                 /* 睡觉黑幕 */
 static lv_obj_t *s_zzz;
 static lv_obj_t *s_flash;
@@ -357,7 +356,7 @@ static void draw_background(lv_obj_t *parent)
 }
 
 /* ============================================================
- *  顶部按钮栏（4 按钮，主画面不显示数值）
+ *  顶部按钮栏（保留原有「攻」词数，隐藏养成状态数值）
  * ============================================================ */
 static void build_topbar(void)
 {
@@ -375,8 +374,8 @@ static void build_topbar(void)
     for (int i = 0; i < 4; i++) {
         lv_obj_t *b = lv_obj_create(s_topbar_bg);
         lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(b, 1 + i * 60, 1);
-        lv_obj_set_size(b, 58, 26);
+        lv_obj_set_pos(b, 1 + i * 47, 1);
+        lv_obj_set_size(b, 46, 26);
         lv_obj_set_style_bg_color(b, lv_color_hex(0x37474F), 0);
         lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
         lv_obj_set_style_border_color(b, lv_color_hex(0x546E7A), 0);
@@ -391,7 +390,26 @@ static void build_topbar(void)
         lv_obj_center(lb);
         s_menu_btns[i] = b;
     }
-
+    s_atkbox = lv_obj_create(s_topbar_bg);
+    lv_obj_remove_flag(s_atkbox, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(s_atkbox, 189, 1);
+    lv_obj_set_size(s_atkbox, 50, 26);
+    lv_obj_set_style_bg_color(s_atkbox, lv_color_hex(0x17202A), 0);
+    lv_obj_set_style_bg_opa(s_atkbox, LV_OPA_90, 0);
+    lv_obj_set_style_border_color(s_atkbox, lv_color_hex(C_ATK), 0);
+    lv_obj_set_style_border_width(s_atkbox, 1, 0);
+    lv_obj_set_style_radius(s_atkbox, 0, 0);
+    lv_obj_set_style_pad_all(s_atkbox, 0, 0);
+    lv_obj_t *icon = lv_label_create(s_atkbox);
+    lv_label_set_text(icon, "攻");
+    lv_obj_set_style_text_font(icon, CN_FONT, 0);
+    lv_obj_set_style_text_color(icon, lv_color_hex(C_ATK), 0);
+    lv_obj_set_pos(icon, 2, 1);
+    s_atk_num = lv_label_create(s_atkbox);
+    lv_label_set_text(s_atk_num, "0");
+    lv_obj_set_style_text_font(s_atk_num, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_atk_num, lv_color_hex(C_ATKNUM), 0);
+    lv_obj_set_pos(s_atk_num, 20, 6);
 }
 
 static void build_care_bar(void)
@@ -465,7 +483,8 @@ static void blink_timer_cb(lv_timer_t *t)
                                     lv_color_hex(0xFFFFFF), 0);
     }
 
-    /* 养成与学习数值继续内部保存，主画面只给行为提示。 */
+    /* 原有「攻」词数继续显示，养成数值不显示。 */
+    if (s_atk_num) lv_label_set_text_fmt(s_atk_num, "%d", known_count());
     for (int i = 0; i < 3; i++) {
         bool selected = s_menu == (pet_menu_t)(MENU_FEED + i);
         bool hungry = i == 0 && s_stat.hunger < 30 && !selected;
@@ -774,26 +793,18 @@ static void care_action(int action)
         s_stat.hunger = CLAMP((int)s_stat.hunger + 24);
         s_stat.happy = CLAMP((int)s_stat.happy + 3);
         s_stat.bond = CLAMP((int)s_stat.bond + 2);
-        lv_label_set_text(s_home_msg, "好吃！");
-        ui_sound_play(UI_SND_CORRECT);
     } else if (action == 1) {
         s_stat.happy = CLAMP((int)s_stat.happy + 15);
         s_stat.bond = CLAMP((int)s_stat.bond + 5);
-        lv_label_set_text(s_home_msg, "喜欢摸摸！");
-        ui_sound_play(UI_SND_CORRECT);
     } else if (action == 2) {
         bool tired = s_stat.energy < 10;
         s_stat.energy = CLAMP((int)s_stat.energy - 10);
         s_stat.happy = CLAMP((int)s_stat.happy + (tired ? 6 : 18));
         s_stat.hunger = CLAMP((int)s_stat.hunger - 3);
         s_stat.bond = CLAMP((int)s_stat.bond + 4);
-        lv_label_set_text(s_home_msg, tired ? "先睡觉" :
-                          (rand() % 4 == 0 ? "玩得真开心！" : "再玩一次！"));
-        ui_sound_play(UI_SND_CORRECT);
     }
     s_interact_action = action;
     s_interact_started = lv_tick_get();
-    lv_obj_remove_flag(s_home_msg, LV_OBJ_FLAG_HIDDEN);
     blink_timer_cb(NULL);
     pet_save_soon();
 }
@@ -809,7 +820,7 @@ static void feedback_finish(void)
     }
     build_question();
     if (s_qWord < 0) { exit_qa(); return; }
-    if (s_gif) gif_player_set_pos(s_gif, 8, 8);
+    if (s_gif) gif_player_set_motion(s_gif, 0, 0);
     render_panel();
 }
 
@@ -817,19 +828,19 @@ static void companion_tick(lv_timer_t *timer)
 {
     (void)timer;
     if (s_active && s_mode == MODE_HOME && s_gif) {
-        int x = PET_X, y = PET_Y;
+        int x = 0, y = 0;
         uint32_t elapsed = lv_tick_get() - s_interact_started;
         if (s_interact_action >= 0 && elapsed < 900) {
-            static const int hop[] = {0, -3, -7, -3, 0};
+            static const int food_hop[] = {0, -2, -4, -2, 0};
+            static const int play_hop[] = {0, -3, -6, -3, 0};
             static const int sway[] = {0, -2, 0, 2, 0};
             int phase = (elapsed / 100) % 5;
             if (s_interact_action == 1) x += sway[phase];
-            else y += hop[phase] * (s_interact_action == 2 ? 2 : 1);
+            else y += s_interact_action == 2 ? play_hop[phase] : food_hop[phase];
         } else if (elapsed >= 2200) {
             s_interact_action = -1;
-            if (s_home_msg) lv_obj_add_flag(s_home_msg, LV_OBJ_FLAG_HIDDEN);
         }
-        gif_player_set_pos(s_gif, x, y);
+        gif_player_set_motion(s_gif, x, y);
         return;
     }
     if (!s_active || (s_mode != MODE_TRAIN && s_mode != MODE_REVIEW)) return;
@@ -839,7 +850,7 @@ static void companion_tick(lv_timer_t *timer)
         return;
     }
     if (!s_gif) return;
-    int x = 8, y = 8;
+    int x = 0, y = 0;
     if (s_reaction.active && elapsed < 1000) {
         if (s_reaction.right) {
             static const int jump[] = {0, -3, -6, -3, 0};
@@ -851,7 +862,7 @@ static void companion_tick(lv_timer_t *timer)
     } else if (!s_reaction.active) {
         x += (s_opt < 4 ? s_opt : 0); /* acknowledge the selection */
     }
-    gif_player_set_pos(s_gif, x, y);
+    gif_player_set_motion(s_gif, x, y);
 }
 
 static void render_grade_select(void)
@@ -1059,7 +1070,6 @@ static void reset_egg(void)
     if (s_panel) lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     if (s_topbar_bg) lv_obj_add_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
     if (s_care_bar) lv_obj_add_flag(s_care_bar, LV_OBJ_FLAG_HIDDEN);
-    if (s_home_msg) lv_obj_add_flag(s_home_msg, LV_OBJ_FLAG_HIDDEN);
     pet_gif_hide(false);
     s_egg = ui_pixel_egg_create(s_scr, EGG_X, EGG_Y);
     pet_save_now();                        /* 重修=回蛋：学习记录保留，只是宠物重来 */
@@ -1217,7 +1227,7 @@ void demo_pet_enter(void)
     /* 对象清零（防止上次退出残留） */
     s_scr = NULL; s_egg = NULL; s_gif = NULL;
     s_topbar_bg = NULL; s_atkbox = NULL; s_atk_num = NULL;
-    s_care_bar = NULL; s_home_msg = NULL;
+    s_care_bar = NULL;
     for (int i = 0; i < 3; i++) s_care_btns[i] = NULL;
     s_night = NULL; s_zzz = NULL; s_flash = NULL;
     s_panel = NULL; s_p_word = NULL;
@@ -1249,13 +1259,6 @@ void demo_pet_enter(void)
     lv_obj_add_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
     build_care_bar();
     lv_obj_add_flag(s_care_bar, LV_OBJ_FLAG_HIDDEN);
-    s_home_msg = lv_label_create(s_scr);
-    lv_obj_set_pos(s_home_msg, 20, 76);
-    lv_obj_set_size(s_home_msg, 200, 38);
-    lv_obj_set_style_text_font(s_home_msg, CN_FONT, 0);
-    lv_obj_set_style_text_color(s_home_msg, lv_color_hex(0x17341D), 0);
-    lv_obj_set_style_text_align(s_home_msg, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_add_flag(s_home_msg, LV_OBJ_FLAG_HIDDEN);
 
     if (s_restored) {
         /* 有存档：直接回到宠物身边，跳过一次破壳（王总 0911 关机不丢进度） */
@@ -1402,7 +1405,7 @@ void demo_pet_exit(void)
     s_topbar_bg = NULL; s_atkbox = NULL; s_atk_num = NULL;
     s_night = NULL; s_zzz = NULL; s_flash = NULL;
     s_panel = NULL; s_p_word = NULL;
-    s_care_bar = NULL; s_home_msg = NULL;
+    s_care_bar = NULL;
     for (int i = 0; i < 3; i++) s_care_btns[i] = NULL;
     for (int i = 0; i < 4; i++) s_menu_btns[i] = NULL;
     for (int i = 0; i < 5; i++) { s_p_opts[i] = NULL; s_p_txt[i] = NULL; s_p_cursor[i] = NULL; }
