@@ -97,12 +97,12 @@ extern lv_font_t cn_18;
 #define ROW_H        32                 /* 行高 */
 #define ROW_AVAIL(w) ((w) - TXT_X - TXT_PAD)   /* 文字区可用宽度 */
 
-typedef enum { MODE_EGG, MODE_HOME, MODE_GRADE_SELECT, MODE_TRAIN, MODE_REVIEW } pet_mode_t;
-typedef enum { MENU_TRAIN = 0, MENU_SLEEP, MENU_REVIEW, MENU_RESET } pet_menu_t;
+typedef enum { MODE_EGG, MODE_HOME, MODE_INTERACT, MODE_GRADE_SELECT, MODE_TRAIN, MODE_REVIEW } pet_mode_t;
+typedef enum { MENU_TRAIN = 0, MENU_SLEEP, MENU_REVIEW, MENU_INTERACT } pet_menu_t;
 
 static struct {
-    uint8_t hunger, happy, energy;
-} s_stat = { 80, 80, 80 };
+    uint8_t hunger, happy, energy, bond;
+} s_stat = { 80, 80, 80, 50 };
 
 static pet_mode_t s_mode = MODE_EGG;
 static pet_menu_t s_menu = MENU_TRAIN;
@@ -142,6 +142,7 @@ static lv_obj_t *s_topbar_bg;
 static lv_obj_t *s_menu_btns[4];
 static lv_obj_t *s_atkbox;
 static lv_obj_t *s_atk_num;
+static lv_obj_t *s_home_stat;
 static lv_obj_t *s_night;                 /* 睡觉黑幕 */
 static lv_obj_t *s_zzz;
 static lv_obj_t *s_flash;
@@ -159,6 +160,8 @@ static uint32_t s_forget_cnt;
 static lv_obj_t *s_companion_text;
 static lv_timer_t *s_companion_timer;
 static training_feedback_t s_reaction;
+static uint32_t s_interact_started;
+static int8_t s_interact_action;
 static lv_timer_t *s_flash_t;
 static void exit_qa(void);
 static void companion_show(bool training);
@@ -183,6 +186,7 @@ static void try_evolve(void);             /* 前向声明（answer 先于定义�
 #define PS_KEY_HDR   "hdr"
 #define PS_KEY_MEM   "mem"
 #define PS_KEY_WRONG "wrong"
+#define PS_KEY_BOND  "bond"
 #define PS_SAVE_GAP_US  (20LL * 1000 * 1000)   /* 最快 20 秒写一次 flash */
 #define PS_WORDSET_MARK  0x2026u /* 新小学词库标识：首次升级时只清学习记录，保留宠物 */
 
@@ -241,6 +245,7 @@ static void pet_save(void)
     esp_err_t e = nvs_set_blob(h, PS_KEY_HDR, &hdr, sizeof(hdr));
     if (e == ESP_OK) e = nvs_set_blob(h, PS_KEY_MEM, s_mem, sizeof(s_mem));
     if (e == ESP_OK) e = nvs_set_blob(h, PS_KEY_WRONG, s_wrong_book, sizeof(s_wrong_book));
+    if (e == ESP_OK) e = nvs_set_u8(h, PS_KEY_BOND, s_stat.bond);
     if (e == ESP_OK) e = nvs_commit(h);
     nvs_close(h);
     if (e != ESP_OK) LOGW("存档失败: %s", esp_err_to_name(e));
@@ -292,6 +297,8 @@ static bool pet_load(void)
             s_stat.hunger = CLAMP(s_stat.hunger);
             s_stat.happy  = CLAMP(s_stat.happy);
             s_stat.energy = CLAMP(s_stat.energy);
+            uint8_t bond;
+            if (nvs_get_u8(h, PS_KEY_BOND, &bond) == ESP_OK) s_stat.bond = CLAMP(bond);
             s_wrong_n = (hdr.wrong_n <= MAX_WRONG) ? (int)hdr.wrong_n : 0;
             /* 旧词库按下标保存过进度，不能套到新课本词表；只清学习/错题，宠物继续保留。 */
             if (hdr.reserved != PS_WORDSET_MARK) {
@@ -359,7 +366,7 @@ static void build_topbar(void)
     lv_obj_set_style_pad_all(s_topbar_bg, 0, 0);
     lv_obj_set_style_radius(s_topbar_bg, 0, 0);
 
-    static const char *LBL[4] = { "训练", "睡觉", "温习", "重修" };
+    static const char *LBL[4] = { "训练", "睡觉", "温习", "互动" };
     for (int i = 0; i < 4; i++) {
         lv_obj_t *b = lv_obj_create(s_topbar_bg);
         lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
@@ -426,7 +433,7 @@ static void blink_timer_cb(lv_timer_t *t)
 
     int warn_idx = -1;
     if      (s_wrong_n > 0)       warn_idx = MENU_REVIEW;   /* 温习优先 */
-    else if (s_stat.hunger < 30)  warn_idx = MENU_TRAIN;
+    else if (s_stat.hunger < 30)  warn_idx = MENU_INTERACT;
 
     for (int i = 0; i < 4; i++) {
         lv_obj_set_style_bg_color(s_menu_btns[i], lv_color_hex(0x37474F), 0);
@@ -445,6 +452,9 @@ static void blink_timer_cb(lv_timer_t *t)
 
     /* 攻数值；掉词时攻框**常红**数秒（不闪烁） */
     if (s_atk_num) lv_label_set_text_fmt(s_atk_num, "%d", known_count());
+    if (s_home_stat) lv_label_set_text_fmt(s_home_stat, "饱%u  乐%u\n力%u  亲%u",
+                                            s_stat.hunger, s_stat.happy,
+                                            s_stat.energy, s_stat.bond);
     if (s_atkbox) {
         if (s_atk_alert_blinks > 0) {
             s_atk_alert_blinks--;
@@ -734,6 +744,94 @@ static void companion_show(bool training)
     }
 }
 
+/* The three hardware keys also provide daily care, without entering lessons.
+ * Keep the same animated pet decoder on screen while the care menu is open. */
+static void render_interact(void)
+{
+    static const char *const choices[4] = { "吃饭", "摸摸", "玩耍", "返回" };
+    lv_label_set_text_fmt(s_p_word, "饱%u 乐%u 力%u 亲%u",
+                          s_stat.hunger, s_stat.happy, s_stat.energy, s_stat.bond);
+    lv_obj_set_style_text_font(s_p_word, CN_FONT, 0);
+    lv_obj_set_pos(s_p_word, 3, 87);
+    lv_obj_set_size(s_p_word, 234, 36);
+    lv_label_set_long_mode(s_p_word, LV_LABEL_LONG_CLIP);
+    for (int i = 0; i < 4; i++) {
+        lv_obj_remove_flag(s_p_opts[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_pos(s_p_opts[i], 7, 132 + i * 42);
+        lv_obj_set_size(s_p_opts[i], 226, ROW_H);
+        lv_label_set_text(s_p_txt[i], choices[i]);
+        lv_obj_set_style_text_font(s_p_txt[i], CN_FONT, 0);
+        lv_obj_set_pos(s_p_txt[i], TXT_X, (ROW_H - (int)CN_FONT->line_height) / 2);
+        lv_obj_set_size(s_p_txt[i], ROW_AVAIL(226), (int)CN_FONT->line_height);
+        lv_label_set_long_mode(s_p_txt[i], LV_LABEL_LONG_CLIP);
+        bool selected = (s_opt == i);
+        lv_obj_set_style_bg_color(s_p_opts[i], lv_color_hex(selected ? 0xFFD928 : C_ROW), 0);
+        lv_obj_set_style_border_color(s_p_opts[i], lv_color_hex(selected ? C_SELBRD : C_ROWBRD), 0);
+        lv_obj_set_style_border_width(s_p_opts[i], selected ? 3 : 2, 0);
+        lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(selected ? 0x1B3A0F : C_ROWTXT), 0);
+        if (selected) lv_obj_remove_flag(s_p_cursor[i], LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(s_p_cursor[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_add_flag(s_p_opts[4], LV_OBJ_FLAG_HIDDEN);
+}
+
+static void start_interact(void)
+{
+    s_mode = MODE_INTERACT;
+    s_opt = 0;
+    s_interact_action = -1;
+    lv_obj_add_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
+    companion_show(true);
+    lv_label_set_text(s_companion_text, "一起玩");
+    render_interact();
+}
+
+static void exit_interact(void)
+{
+    s_mode = MODE_HOME;
+    s_interact_action = -1;
+    lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_p_opts[4], LV_OBJ_FLAG_HIDDEN);
+    companion_show(false);
+    blink_timer_cb(NULL);
+    pet_save_soon();
+}
+
+static void interact_action(int action)
+{
+    if (action == 0) {
+        s_stat.hunger = CLAMP((int)s_stat.hunger + 24);
+        s_stat.happy = CLAMP((int)s_stat.happy + 3);
+        s_stat.bond = CLAMP((int)s_stat.bond + 2);
+        lv_label_set_text(s_companion_text, "好吃！");
+        ui_sound_play(UI_SND_CORRECT);
+    } else if (action == 1) {
+        s_stat.happy = CLAMP((int)s_stat.happy + 15);
+        s_stat.bond = CLAMP((int)s_stat.bond + 5);
+        lv_label_set_text(s_companion_text, "喜欢摸摸！");
+        ui_sound_play(UI_SND_CORRECT);
+    } else if (action == 2) {
+        if (s_stat.energy < 10) {
+            lv_label_set_text(s_companion_text, "先睡觉");
+            ui_sound_play(UI_SND_WRONG);
+            s_interact_action = -1;
+            return;
+        }
+        s_stat.energy = CLAMP((int)s_stat.energy - 10);
+        s_stat.happy = CLAMP((int)s_stat.happy + 18);
+        s_stat.hunger = CLAMP((int)s_stat.hunger - 3);
+        s_stat.bond = CLAMP((int)s_stat.bond + 4);
+        lv_label_set_text(s_companion_text, rand() % 4 == 0 ? "玩得真开心！" : "再玩一次！");
+        ui_sound_play(UI_SND_CORRECT);
+    }
+    s_interact_action = action;
+    s_interact_started = lv_tick_get();
+    render_interact();
+    pet_save_soon();
+}
+
 static void feedback_finish(void)
 {
     if (!s_reaction.active) return;
@@ -752,6 +850,19 @@ static void feedback_finish(void)
 static void companion_tick(lv_timer_t *timer)
 {
     (void)timer;
+    if (s_active && s_mode == MODE_INTERACT && s_gif) {
+        int x = 8, y = 8;
+        uint32_t elapsed = lv_tick_get() - s_interact_started;
+        if (s_interact_action >= 0 && elapsed < 900) {
+            static const int hop[] = {0, -3, -7, -3, 0};
+            static const int sway[] = {0, -2, 0, 2, 0};
+            int phase = (elapsed / 100) % 5;
+            if (s_interact_action == 1) x += sway[phase];
+            else y += hop[phase] * (s_interact_action == 2 ? 2 : 1);
+        } else s_interact_action = -1;
+        gif_player_set_pos(s_gif, x, y);
+        return;
+    }
     if (!s_active || (s_mode != MODE_TRAIN && s_mode != MODE_REVIEW)) return;
     uint32_t elapsed = lv_tick_get() - s_reaction.started;
     if (training_feedback_ready(&s_reaction, lv_tick_get(), false)) {
@@ -964,7 +1075,7 @@ static void reset_egg(void)
         ui_pixel_egg_destroy(s_egg);
         s_egg = NULL;
     }
-    s_stat.hunger = 80; s_stat.happy = 80; s_stat.energy = 80;
+    s_stat.hunger = 80; s_stat.happy = 80; s_stat.energy = 80; s_stat.bond = 50;
     s_hatch_clicks = 0;
     s_sleeping = false;
     ui_sound_bgm(true);                   /* 重修回到蛋期，音乐照放 */
@@ -1075,7 +1186,7 @@ static void tick_cb(void *arg)
     (void)arg;
     if (!s_active || s_mode == MODE_EGG) return;
 
-    if (++s_tick_div >= 3) {               /* 每 3 秒掉 1 点 */
+    if (++s_tick_div >= 60) {              /* 每分钟轻微变化，留给孩子互动的时间 */
         s_tick_div = 0;
         s_stat.hunger = CLAMP((int)s_stat.hunger - 1);
         s_stat.happy  = CLAMP((int)s_stat.happy  - 1);
@@ -1107,7 +1218,7 @@ void demo_pet_enter(void)
     LOGI("enter free=%d", (int)esp_get_free_heap_size());
     srand(esp_random());
     /* 先按"新档"铺默认值，再用 NVS 存档覆盖 —— 有档就接着上次练 */
-    s_stat.hunger = 80; s_stat.happy = 80; s_stat.energy = 80;
+    s_stat.hunger = 80; s_stat.happy = 80; s_stat.energy = 80; s_stat.bond = 50;
     s_hatch_clicks = 0;
     s_sleeping = false;
     s_tick_div = 0;
@@ -1117,6 +1228,7 @@ void demo_pet_enter(void)
     s_cur_poke_idx = 0;
     s_wrong_n = 0;
     s_atk_alert_blinks = 0;
+    s_interact_action = -1;
     s_active = true;
     s_save_dirty = false;
     s_last_save_us = esp_timer_get_time();
@@ -1131,7 +1243,7 @@ void demo_pet_enter(void)
 
     /* 对象清零（防止上次退出残留） */
     s_scr = NULL; s_egg = NULL; s_gif = NULL;
-    s_topbar_bg = NULL; s_atkbox = NULL; s_atk_num = NULL;
+    s_topbar_bg = NULL; s_atkbox = NULL; s_atk_num = NULL; s_home_stat = NULL;
     s_night = NULL; s_zzz = NULL; s_flash = NULL;
     s_panel = NULL; s_p_word = NULL;
     for (int i = 0; i < 4; i++) s_menu_btns[i] = NULL;
@@ -1160,6 +1272,15 @@ void demo_pet_enter(void)
 
     build_topbar();
     lv_obj_add_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
+
+    s_home_stat = lv_label_create(s_scr);
+    lv_obj_set_pos(s_home_stat, 14, 247);
+    lv_obj_set_size(s_home_stat, 212, 57);
+    lv_obj_set_style_text_font(s_home_stat, CN_FONT, 0);
+    lv_obj_set_style_text_color(s_home_stat, lv_color_hex(0x17341D), 0);
+    lv_obj_set_style_text_align(s_home_stat, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text_fmt(s_home_stat, "饱%u  乐%u\n力%u  亲%u",
+                          s_stat.hunger, s_stat.happy, s_stat.energy, s_stat.bond);
 
     if (s_restored) {
         /* 有存档：直接回到宠物身边，跳过一次破壳（王总 0911 关机不丢进度） */
@@ -1305,6 +1426,7 @@ void demo_pet_exit(void)
     s_topbar_bg = NULL; s_atkbox = NULL; s_atk_num = NULL;
     s_night = NULL; s_zzz = NULL; s_flash = NULL;
     s_panel = NULL; s_p_word = NULL;
+    s_home_stat = NULL;
     for (int i = 0; i < 4; i++) s_menu_btns[i] = NULL;
     for (int i = 0; i < 5; i++) { s_p_opts[i] = NULL; s_p_txt[i] = NULL; s_p_cursor[i] = NULL; }
     LOGI("exit done free=%d", (int)esp_get_free_heap_size());
@@ -1317,6 +1439,25 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
         if (ev == BSP_BTN_CLICK && btn == BSP_BTN_OK && s_curtain_t == NULL) {
             ui_sound_play(UI_SND_SWITCH);
             start_wake();
+        }
+        return;
+    }
+
+    /* 日常互动：上下选择，OK 让宠物回应并改变状态。 */
+    if (s_mode == MODE_INTERACT) {
+        if (ev == BSP_BTN_CLICK) {
+            if (btn == BSP_BTN_UP) {
+                s_opt = (s_opt + 3) % 4;
+                ui_sound_play(UI_SND_SWITCH);
+                render_interact();
+            } else if (btn == BSP_BTN_DOWN) {
+                s_opt = (s_opt + 1) % 4;
+                ui_sound_play(UI_SND_SWITCH);
+                render_interact();
+            } else if (btn == BSP_BTN_OK) {
+                if (s_opt == 3) exit_interact();
+                else interact_action(s_opt);
+            }
         }
         return;
     }
@@ -1394,10 +1535,13 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
                 case MENU_TRAIN:  start_grade_select(); break;
                 case MENU_SLEEP:  start_sleep(); break;
                 case MENU_REVIEW: start_review(); break;   /* 错题空时内部直接返回 */
-                case MENU_RESET:  reset_egg(); break;
+                case MENU_INTERACT: start_interact(); break;
             }
         }
     } else if (ev == BSP_BTN_LONG && btn == BSP_BTN_UP) {
         reset_egg();
     }
 }
+
+
+
