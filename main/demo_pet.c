@@ -435,7 +435,8 @@ static void blink_timer_cb(lv_timer_t *t)
         for (int i = 0; i < 4; i++) {
             lv_obj_set_style_bg_color(s_menu_btns[i], lv_color_hex(0x37474F), 0);
             lv_obj_set_style_border_color(s_menu_btns[i], lv_color_hex(0x546E7A), 0);
-            lv_obj_set_style_text_color(s_menu_btns[i], lv_color_hex(0xECEFF1), 0);
+            lv_obj_set_style_text_color(lv_obj_get_child(s_menu_btns[i], 0),
+                                        lv_color_hex(0xECEFF1), 0);
         }
         return;
     }
@@ -447,18 +448,21 @@ static void blink_timer_cb(lv_timer_t *t)
     for (int i = 0; i < 4; i++) {
         lv_obj_set_style_bg_color(s_menu_btns[i], lv_color_hex(0x37474F), 0);
         lv_obj_set_style_border_color(s_menu_btns[i], lv_color_hex(0x546E7A), 0);
-        lv_obj_set_style_text_color(s_menu_btns[i], lv_color_hex(0xECEFF1), 0);
+        lv_obj_set_style_text_color(lv_obj_get_child(s_menu_btns[i], 0),
+                                    lv_color_hex(0xECEFF1), 0);
     }
     if (s_menu < MENU_FEED) {
         lv_obj_set_style_bg_color(s_menu_btns[s_menu], lv_color_hex(0xFFD928), 0);
         lv_obj_set_style_border_color(s_menu_btns[s_menu], lv_color_hex(0x17202A), 0);
-        lv_obj_set_style_text_color(s_menu_btns[s_menu], lv_color_hex(0x17202A), 0);
+        lv_obj_set_style_text_color(lv_obj_get_child(s_menu_btns[s_menu], 0),
+                                    lv_color_hex(0x17202A), 0);
     }
 
     if (warn_idx >= 0 && warn_idx < 4 && warn_idx != (int)s_menu) {
         lv_obj_set_style_bg_color(s_menu_btns[warn_idx], lv_color_hex(0xE53935), 0);
         lv_obj_set_style_border_color(s_menu_btns[warn_idx], lv_color_hex(0xB71C1C), 0);
-        lv_obj_set_style_text_color(s_menu_btns[warn_idx], lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_color(lv_obj_get_child(s_menu_btns[warn_idx], 0),
+                                    lv_color_hex(0xFFFFFF), 0);
     }
 
     /* 养成与学习数值继续内部保存，主画面只给行为提示。 */
