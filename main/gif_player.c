@@ -38,6 +38,7 @@ typedef struct {
     int cw, ch;          /* canvas 尺寸 */
     int gw, gh;          /* GIF 画布尺寸 */
     int ox, oy;          /* canvas 在屏幕上的左上角（背景取色用） */
+    int motion_x, motion_y; /* 宠物在固定画布内部移动，背景保持原位 */
     int bob;             /* 当前上下浮动偏移 */
     int frame_no;        /* 已播帧数（驱动 bob） */
     bool bob_on;         /* 是否启用浮动 */
@@ -81,6 +82,15 @@ void gif_player_set_pos(lv_obj_t *canvas, int x, int y)
     if (!p) return;
     p->ox = x; p->oy = y;
     lv_obj_set_pos(canvas, x, y);
+}
+
+void gif_player_set_motion(lv_obj_t *canvas, int dx, int dy)
+{
+    if (!canvas) return;
+    gif_player_t *p = lv_obj_get_user_data(canvas);
+    if (!p) return;
+    p->motion_x = dx < -6 ? -6 : (dx > 6 ? 6 : dx);
+    p->motion_y = dy < -6 ? -6 : (dy > 6 ? 6 : dy);
 }
 
 /* 用场景背景色铺满画布：无 alpha 通道时消除白方块的唯一办法 */
@@ -146,9 +156,9 @@ static void gif_draw_cb(GIFDRAW *pDraw)
     /* --- 记录本帧矩形(canvas 坐标)：disposal=2 要按此区域清背景。
      *     用帧矩形 iX/iY/iWidth/iHeight —— 这是 GIF 规范里处置的作用域。 --- */
     {
-        int oyf = p->off_y + p->bob;
-        int fx0 = p->off_x + pDraw->iX * p->sc_w / gw;
-        int fx1 = p->off_x + (pDraw->iX + pDraw->iWidth)  * p->sc_w / gw;
+        int oyf = p->off_y + p->bob + p->motion_y;
+        int fx0 = p->off_x + p->motion_x + pDraw->iX * p->sc_w / gw;
+        int fx1 = p->off_x + p->motion_x + (pDraw->iX + pDraw->iWidth)  * p->sc_w / gw;
         int fy0 = oyf      + pDraw->iY * p->sc_h / gh;
         int fy1 = oyf      + (pDraw->iY + pDraw->iHeight) * p->sc_h / gh;
         if (fx1 <= fx0) fx1 = fx0 + 1;
@@ -164,7 +174,7 @@ static void gif_draw_cb(GIFDRAW *pDraw)
      * 注意：若按单点映射（cy = gy*sc_h/gh），放大后会有空行 → 满屏横向条纹；
      * 列方向同理。所以按 [cy0, cy1) / [cx0, cx1) 区间填充，放大后是干净色块。 */
     int gy = pDraw->iY + pDraw->y;
-    int oy = p->off_y + p->bob;         /* 待机上下浮动：只偏移宠物本体 */
+    int oy = p->off_y + p->bob + p->motion_y;
     int cy0 = oy + gy * p->sc_h / gh;
     int cy1 = oy + (gy + 1) * p->sc_h / gh;
     if (cy1 <= cy0) cy1 = cy0 + 1;
@@ -179,8 +189,8 @@ static void gif_draw_cb(GIFDRAW *pDraw)
             uint8_t c = src[x];
             if (c == trans) continue;           /* 透明像素：保留背景/历史帧 */
             int gx = x0 + x;
-            int cx0 = p->off_x + gx * p->sc_w / gw;
-            int cx1 = p->off_x + (gx + 1) * p->sc_w / gw;
+            int cx0 = p->off_x + p->motion_x + gx * p->sc_w / gw;
+            int cx1 = p->off_x + p->motion_x + (gx + 1) * p->sc_w / gw;
             if (cx1 <= cx0) cx1 = cx0 + 1;
             if (cx0 < 0)  cx0 = 0;
             if (cx1 > cw) cx1 = cw;
@@ -193,8 +203,8 @@ static void gif_draw_cb(GIFDRAW *pDraw)
     } else {
         for (int x = 0; x < w; x++) {
             int gx = x0 + x;
-            int cx0 = p->off_x + gx * p->sc_w / gw;
-            int cx1 = p->off_x + (gx + 1) * p->sc_w / gw;
+            int cx0 = p->off_x + p->motion_x + gx * p->sc_w / gw;
+            int cx1 = p->off_x + p->motion_x + (gx + 1) * p->sc_w / gw;
             if (cx1 <= cx0) cx1 = cx0 + 1;
             if (cx0 < 0)  cx0 = 0;
             if (cx1 > cw) cx1 = cw;
@@ -293,6 +303,7 @@ lv_obj_t *gif_player_create(lv_obj_t *parent, int x, int y, int w, int h)
     p->ch = h;
     p->ox = x;
     p->oy = y;
+    p->motion_x = p->motion_y = 0;
     p->bob = 0;
     p->frame_no = 0;
     p->bob_on = true;
@@ -448,4 +459,5 @@ void gif_player_stop(lv_obj_t *canvas)
     p->playing = false;
     if (p->opened) { GIF_close(&p->gif); p->opened = false; }
 }
+
 
