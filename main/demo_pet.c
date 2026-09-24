@@ -97,8 +97,11 @@ extern lv_font_t cn_18;
 #define ROW_H        32                 /* 行高 */
 #define ROW_AVAIL(w) ((w) - TXT_X - TXT_PAD)   /* 文字区可用宽度 */
 
-typedef enum { MODE_EGG, MODE_HOME, MODE_INTERACT, MODE_GRADE_SELECT, MODE_TRAIN, MODE_REVIEW } pet_mode_t;
-typedef enum { MENU_TRAIN = 0, MENU_SLEEP, MENU_REVIEW, MENU_INTERACT } pet_menu_t;
+typedef enum { MODE_EGG, MODE_HOME, MODE_GRADE_SELECT, MODE_TRAIN, MODE_REVIEW } pet_mode_t;
+typedef enum {
+    MENU_TRAIN = 0, MENU_SLEEP, MENU_REVIEW, MENU_RESET,
+    MENU_FEED, MENU_TOUCH, MENU_PLAY, MENU_COUNT
+} pet_menu_t;
 
 static struct {
     uint8_t hunger, happy, energy, bond;
@@ -142,7 +145,9 @@ static lv_obj_t *s_topbar_bg;
 static lv_obj_t *s_menu_btns[4];
 static lv_obj_t *s_atkbox;
 static lv_obj_t *s_atk_num;
-static lv_obj_t *s_home_stat;
+static lv_obj_t *s_care_bar;
+static lv_obj_t *s_care_btns[3];
+static lv_obj_t *s_home_msg;
 static lv_obj_t *s_night;                 /* 睡觉黑幕 */
 static lv_obj_t *s_zzz;
 static lv_obj_t *s_flash;
@@ -352,7 +357,7 @@ static void draw_background(lv_obj_t *parent)
 }
 
 /* ============================================================
- *  顶部按钮栏（4 按钮 + 攻+词数框）
+ *  顶部按钮栏（4 按钮，主画面不显示数值）
  * ============================================================ */
 static void build_topbar(void)
 {
@@ -366,12 +371,12 @@ static void build_topbar(void)
     lv_obj_set_style_pad_all(s_topbar_bg, 0, 0);
     lv_obj_set_style_radius(s_topbar_bg, 0, 0);
 
-    static const char *LBL[4] = { "训练", "睡觉", "温习", "互动" };
+    static const char *LBL[4] = { "训练", "睡觉", "温习", "重修" };
     for (int i = 0; i < 4; i++) {
         lv_obj_t *b = lv_obj_create(s_topbar_bg);
         lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(b, 1 + i * 47, 1);
-        lv_obj_set_size(b, 46, 26);
+        lv_obj_set_pos(b, 1 + i * 60, 1);
+        lv_obj_set_size(b, 58, 26);
         lv_obj_set_style_bg_color(b, lv_color_hex(0x37474F), 0);
         lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
         lv_obj_set_style_border_color(b, lv_color_hex(0x546E7A), 0);
@@ -387,32 +392,36 @@ static void build_topbar(void)
         s_menu_btns[i] = b;
     }
 
-    /* 温习按钮只显示"温习"，不挂数量角标（角标会把按钮撑变形） */
+}
 
-    /* 攻框：攻 图标 + 学会词数（右半部分） */
-    s_atkbox = lv_obj_create(s_topbar_bg);
-    lv_obj_remove_flag(s_atkbox, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(s_atkbox, 189, 1);
-    lv_obj_set_size(s_atkbox, 50, 26);
-    lv_obj_set_style_bg_color(s_atkbox, lv_color_hex(0x17202A), 0);
-    lv_obj_set_style_bg_opa(s_atkbox, LV_OPA_90, 0);
-    lv_obj_set_style_border_color(s_atkbox, lv_color_hex(C_ATK), 0);
-    lv_obj_set_style_border_width(s_atkbox, 1, 0);
-    lv_obj_set_style_radius(s_atkbox, 0, 0);
-    lv_obj_set_style_pad_all(s_atkbox, 0, 0);
-
-    lv_obj_t *ic = lv_label_create(s_atkbox);
-    lv_label_set_text(ic, "攻");
-    lv_obj_set_style_text_font(ic, CN_FONT, 0);
-    lv_obj_set_style_text_color(ic, lv_color_hex(C_ATK), 0);
-    /* 18px 字行高约 22~24px,框高 26 → y 取 1 才不会把底部笔画切掉 */
-    lv_obj_set_pos(ic, 2, 1);
-
-    s_atk_num = lv_label_create(s_atkbox);
-    lv_label_set_text(s_atk_num, "0");
-    lv_obj_set_style_text_font(s_atk_num, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_atk_num, lv_color_hex(C_ATKNUM), 0);
-    lv_obj_set_pos(s_atk_num, 20, 6);
+static void build_care_bar(void)
+{
+    static const char *const labels[3] = { "吃饭", "摸摸", "玩耍" };
+    s_care_bar = lv_obj_create(s_scr);
+    lv_obj_remove_flag(s_care_bar, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_pos(s_care_bar, 0, 258);
+    lv_obj_set_size(s_care_bar, 240, 62);
+    lv_obj_set_style_bg_opa(s_care_bar, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_care_bar, 0, 0);
+    lv_obj_set_style_pad_all(s_care_bar, 0, 0);
+    lv_obj_set_style_radius(s_care_bar, 0, 0);
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *button = lv_obj_create(s_care_bar);
+        lv_obj_remove_flag(button, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_pos(button, 5 + 78 * i, 12);
+        lv_obj_set_size(button, 74, 37);
+        lv_obj_set_style_bg_color(button, lv_color_hex(C_ROW), 0);
+        lv_obj_set_style_border_color(button, lv_color_hex(C_ROWBRD), 0);
+        lv_obj_set_style_border_width(button, 2, 0);
+        lv_obj_set_style_radius(button, 0, 0);
+        lv_obj_set_style_pad_all(button, 0, 0);
+        lv_obj_t *label = lv_label_create(button);
+        lv_label_set_text(label, labels[i]);
+        lv_obj_set_style_text_font(label, CN_FONT, 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(C_ROWTXT), 0);
+        lv_obj_center(label);
+        s_care_btns[i] = button;
+    }
 }
 
 /* 顶栏刷新定时器：当前菜单黄高亮 + 告警**常红不闪**（闪太快反而看不清）。
@@ -433,28 +442,38 @@ static void blink_timer_cb(lv_timer_t *t)
 
     int warn_idx = -1;
     if      (s_wrong_n > 0)       warn_idx = MENU_REVIEW;   /* 温习优先 */
-    else if (s_stat.hunger < 30)  warn_idx = MENU_INTERACT;
+    else if (s_stat.hunger < 30)  warn_idx = MENU_FEED;
 
     for (int i = 0; i < 4; i++) {
         lv_obj_set_style_bg_color(s_menu_btns[i], lv_color_hex(0x37474F), 0);
         lv_obj_set_style_border_color(s_menu_btns[i], lv_color_hex(0x546E7A), 0);
         lv_obj_set_style_text_color(s_menu_btns[i], lv_color_hex(0xECEFF1), 0);
     }
-    lv_obj_set_style_bg_color(s_menu_btns[s_menu], lv_color_hex(0xFFD928), 0);
-    lv_obj_set_style_border_color(s_menu_btns[s_menu], lv_color_hex(0x17202A), 0);
-    lv_obj_set_style_text_color(s_menu_btns[s_menu], lv_color_hex(0x17202A), 0);
+    if (s_menu < MENU_FEED) {
+        lv_obj_set_style_bg_color(s_menu_btns[s_menu], lv_color_hex(0xFFD928), 0);
+        lv_obj_set_style_border_color(s_menu_btns[s_menu], lv_color_hex(0x17202A), 0);
+        lv_obj_set_style_text_color(s_menu_btns[s_menu], lv_color_hex(0x17202A), 0);
+    }
 
-    if (warn_idx >= 0 && warn_idx != (int)s_menu) {
+    if (warn_idx >= 0 && warn_idx < 4 && warn_idx != (int)s_menu) {
         lv_obj_set_style_bg_color(s_menu_btns[warn_idx], lv_color_hex(0xE53935), 0);
         lv_obj_set_style_border_color(s_menu_btns[warn_idx], lv_color_hex(0xB71C1C), 0);
         lv_obj_set_style_text_color(s_menu_btns[warn_idx], lv_color_hex(0xFFFFFF), 0);
     }
 
-    /* 攻数值；掉词时攻框**常红**数秒（不闪烁） */
-    if (s_atk_num) lv_label_set_text_fmt(s_atk_num, "%d", known_count());
-    if (s_home_stat) lv_label_set_text_fmt(s_home_stat, "饱%u  乐%u\n力%u  亲%u",
-                                            s_stat.hunger, s_stat.happy,
-                                            s_stat.energy, s_stat.bond);
+    /* 养成与学习数值继续内部保存，主画面只给行为提示。 */
+    for (int i = 0; i < 3; i++) {
+        bool selected = s_menu == (pet_menu_t)(MENU_FEED + i);
+        bool hungry = i == 0 && s_stat.hunger < 30 && !selected;
+        if (!s_care_btns[i]) continue;
+        lv_obj_set_style_bg_color(s_care_btns[i],
+            lv_color_hex(selected ? 0xFFD928 : (hungry ? 0xB71C1C : C_ROW)), 0);
+        lv_obj_set_style_border_color(s_care_btns[i],
+            lv_color_hex(selected ? C_SELBRD : C_ROWBRD), 0);
+        lv_obj_t *label = lv_obj_get_child(s_care_btns[i], 0);
+        if (label) lv_obj_set_style_text_color(label,
+            lv_color_hex(selected ? 0x1B3A0F : C_ROWTXT), 0);
+    }
     if (s_atkbox) {
         if (s_atk_alert_blinks > 0) {
             s_atk_alert_blinks--;
@@ -744,73 +763,19 @@ static void companion_show(bool training)
     }
 }
 
-/* The three hardware keys also provide daily care, without entering lessons.
- * Keep the same animated pet decoder on screen while the care menu is open. */
-static void render_interact(void)
-{
-    static const char *const choices[4] = { "吃饭", "摸摸", "玩耍", "返回" };
-    lv_label_set_text_fmt(s_p_word, "饱%u 乐%u 力%u 亲%u",
-                          s_stat.hunger, s_stat.happy, s_stat.energy, s_stat.bond);
-    lv_obj_set_style_text_font(s_p_word, CN_FONT, 0);
-    lv_obj_set_pos(s_p_word, 3, 87);
-    lv_obj_set_size(s_p_word, 234, 36);
-    lv_label_set_long_mode(s_p_word, LV_LABEL_LONG_CLIP);
-    for (int i = 0; i < 4; i++) {
-        lv_obj_remove_flag(s_p_opts[i], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_pos(s_p_opts[i], 7, 132 + i * 42);
-        lv_obj_set_size(s_p_opts[i], 226, ROW_H);
-        lv_label_set_text(s_p_txt[i], choices[i]);
-        lv_obj_set_style_text_font(s_p_txt[i], CN_FONT, 0);
-        lv_obj_set_pos(s_p_txt[i], TXT_X, (ROW_H - (int)CN_FONT->line_height) / 2);
-        lv_obj_set_size(s_p_txt[i], ROW_AVAIL(226), (int)CN_FONT->line_height);
-        lv_label_set_long_mode(s_p_txt[i], LV_LABEL_LONG_CLIP);
-        bool selected = (s_opt == i);
-        lv_obj_set_style_bg_color(s_p_opts[i], lv_color_hex(selected ? 0xFFD928 : C_ROW), 0);
-        lv_obj_set_style_border_color(s_p_opts[i], lv_color_hex(selected ? C_SELBRD : C_ROWBRD), 0);
-        lv_obj_set_style_border_width(s_p_opts[i], selected ? 3 : 2, 0);
-        lv_obj_set_style_text_color(s_p_txt[i], lv_color_hex(selected ? 0x1B3A0F : C_ROWTXT), 0);
-        if (selected) lv_obj_remove_flag(s_p_cursor[i], LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_add_flag(s_p_cursor[i], LV_OBJ_FLAG_HIDDEN);
-    }
-    lv_obj_add_flag(s_p_opts[4], LV_OBJ_FLAG_HIDDEN);
-}
-
-static void start_interact(void)
-{
-    s_mode = MODE_INTERACT;
-    s_opt = 0;
-    s_interact_action = -1;
-    lv_obj_add_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
-    companion_show(true);
-    lv_label_set_text(s_companion_text, "一起玩");
-    render_interact();
-}
-
-static void exit_interact(void)
-{
-    s_mode = MODE_HOME;
-    s_interact_action = -1;
-    lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_remove_flag(s_p_opts[4], LV_OBJ_FLAG_HIDDEN);
-    companion_show(false);
-    blink_timer_cb(NULL);
-    pet_save_soon();
-}
-
-static void interact_action(int action)
+/* Care happens on the home scene, with the full-size pet still visible. */
+static void care_action(int action)
 {
     if (action == 0) {
         s_stat.hunger = CLAMP((int)s_stat.hunger + 24);
         s_stat.happy = CLAMP((int)s_stat.happy + 3);
         s_stat.bond = CLAMP((int)s_stat.bond + 2);
-        lv_label_set_text(s_companion_text, "好吃！");
+        lv_label_set_text(s_home_msg, "好吃！");
         ui_sound_play(UI_SND_CORRECT);
     } else if (action == 1) {
         s_stat.happy = CLAMP((int)s_stat.happy + 15);
         s_stat.bond = CLAMP((int)s_stat.bond + 5);
-        lv_label_set_text(s_companion_text, "喜欢摸摸！");
+        lv_label_set_text(s_home_msg, "喜欢摸摸！");
         ui_sound_play(UI_SND_CORRECT);
     } else if (action == 2) {
         bool tired = s_stat.energy < 10;
@@ -818,13 +783,14 @@ static void interact_action(int action)
         s_stat.happy = CLAMP((int)s_stat.happy + (tired ? 6 : 18));
         s_stat.hunger = CLAMP((int)s_stat.hunger - 3);
         s_stat.bond = CLAMP((int)s_stat.bond + 4);
-        lv_label_set_text(s_companion_text, tired ? "先睡觉" :
+        lv_label_set_text(s_home_msg, tired ? "先睡觉" :
                           (rand() % 4 == 0 ? "玩得真开心！" : "再玩一次！"));
         ui_sound_play(UI_SND_CORRECT);
     }
     s_interact_action = action;
     s_interact_started = lv_tick_get();
-    render_interact();
+    lv_obj_remove_flag(s_home_msg, LV_OBJ_FLAG_HIDDEN);
+    blink_timer_cb(NULL);
     pet_save_soon();
 }
 
@@ -846,8 +812,8 @@ static void feedback_finish(void)
 static void companion_tick(lv_timer_t *timer)
 {
     (void)timer;
-    if (s_active && s_mode == MODE_INTERACT && s_gif) {
-        int x = 8, y = 8;
+    if (s_active && s_mode == MODE_HOME && s_gif) {
+        int x = PET_X, y = PET_Y;
         uint32_t elapsed = lv_tick_get() - s_interact_started;
         if (s_interact_action >= 0 && elapsed < 900) {
             static const int hop[] = {0, -3, -7, -3, 0};
@@ -855,7 +821,10 @@ static void companion_tick(lv_timer_t *timer)
             int phase = (elapsed / 100) % 5;
             if (s_interact_action == 1) x += sway[phase];
             else y += hop[phase] * (s_interact_action == 2 ? 2 : 1);
-        } else s_interact_action = -1;
+        } else if (elapsed >= 2200) {
+            s_interact_action = -1;
+            if (s_home_msg) lv_obj_add_flag(s_home_msg, LV_OBJ_FLAG_HIDDEN);
+        }
         gif_player_set_pos(s_gif, x, y);
         return;
     }
@@ -950,6 +919,7 @@ static void exit_qa(void)
 {
     training_feedback_clear(&s_reaction);
     s_mode = MODE_HOME;
+    if (s_care_bar) lv_obj_remove_flag(s_care_bar, LV_OBJ_FLAG_HIDDEN);
     companion_show(false);
     if (s_panel) lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     pet_gif_hide(false);                   /* 回主页恢复宠物 */
@@ -1049,6 +1019,7 @@ static void do_hatch(void)
     s_cur_poke_idx = (uint8_t)s_bases[rand() % s_base_n];   /* 只出有进化链的基础形态 */
     LOGI("hatch -> %s", pokemon_gifs[s_cur_poke_idx].name);
     s_mode = MODE_HOME;
+    if (s_care_bar) lv_obj_remove_flag(s_care_bar, LV_OBJ_FLAG_HIDDEN);
     s_gif = gif_player_create(s_scr, PET_X, PET_Y, PET_SIZE, PET_SIZE);
     if (s_gif) {
         gif_player_set_bob(s_gif, false);
@@ -1083,6 +1054,8 @@ static void reset_egg(void)
     if (s_night) lv_obj_add_flag(s_night, LV_OBJ_FLAG_HIDDEN);
     if (s_panel) lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     if (s_topbar_bg) lv_obj_add_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
+    if (s_care_bar) lv_obj_add_flag(s_care_bar, LV_OBJ_FLAG_HIDDEN);
+    if (s_home_msg) lv_obj_add_flag(s_home_msg, LV_OBJ_FLAG_HIDDEN);
     pet_gif_hide(false);
     s_egg = ui_pixel_egg_create(s_scr, EGG_X, EGG_Y);
     pet_save_now();                        /* 重修=回蛋：学习记录保留，只是宠物重来 */
@@ -1239,7 +1212,9 @@ void demo_pet_enter(void)
 
     /* 对象清零（防止上次退出残留） */
     s_scr = NULL; s_egg = NULL; s_gif = NULL;
-    s_topbar_bg = NULL; s_atkbox = NULL; s_atk_num = NULL; s_home_stat = NULL;
+    s_topbar_bg = NULL; s_atkbox = NULL; s_atk_num = NULL;
+    s_care_bar = NULL; s_home_msg = NULL;
+    for (int i = 0; i < 3; i++) s_care_btns[i] = NULL;
     s_night = NULL; s_zzz = NULL; s_flash = NULL;
     s_panel = NULL; s_p_word = NULL;
     for (int i = 0; i < 4; i++) s_menu_btns[i] = NULL;
@@ -1268,15 +1243,15 @@ void demo_pet_enter(void)
 
     build_topbar();
     lv_obj_add_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
-
-    s_home_stat = lv_label_create(s_scr);
-    lv_obj_set_pos(s_home_stat, 14, 247);
-    lv_obj_set_size(s_home_stat, 212, 57);
-    lv_obj_set_style_text_font(s_home_stat, CN_FONT, 0);
-    lv_obj_set_style_text_color(s_home_stat, lv_color_hex(0x17341D), 0);
-    lv_obj_set_style_text_align(s_home_stat, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_text_fmt(s_home_stat, "饱%u  乐%u\n力%u  亲%u",
-                          s_stat.hunger, s_stat.happy, s_stat.energy, s_stat.bond);
+    build_care_bar();
+    lv_obj_add_flag(s_care_bar, LV_OBJ_FLAG_HIDDEN);
+    s_home_msg = lv_label_create(s_scr);
+    lv_obj_set_pos(s_home_msg, 20, 76);
+    lv_obj_set_size(s_home_msg, 200, 38);
+    lv_obj_set_style_text_font(s_home_msg, CN_FONT, 0);
+    lv_obj_set_style_text_color(s_home_msg, lv_color_hex(0x17341D), 0);
+    lv_obj_set_style_text_align(s_home_msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(s_home_msg, LV_OBJ_FLAG_HIDDEN);
 
     if (s_restored) {
         /* 有存档：直接回到宠物身边，跳过一次破壳（王总 0911 关机不丢进度） */
@@ -1288,6 +1263,7 @@ void demo_pet_enter(void)
                             pokemon_gifs[s_cur_poke_idx].len);
         }
         lv_obj_remove_flag(s_topbar_bg, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_care_bar, LV_OBJ_FLAG_HIDDEN);
     } else {
         s_egg = ui_pixel_egg_create(s_scr, EGG_X, EGG_Y);
     }
@@ -1422,7 +1398,8 @@ void demo_pet_exit(void)
     s_topbar_bg = NULL; s_atkbox = NULL; s_atk_num = NULL;
     s_night = NULL; s_zzz = NULL; s_flash = NULL;
     s_panel = NULL; s_p_word = NULL;
-    s_home_stat = NULL;
+    s_care_bar = NULL; s_home_msg = NULL;
+    for (int i = 0; i < 3; i++) s_care_btns[i] = NULL;
     for (int i = 0; i < 4; i++) s_menu_btns[i] = NULL;
     for (int i = 0; i < 5; i++) { s_p_opts[i] = NULL; s_p_txt[i] = NULL; s_p_cursor[i] = NULL; }
     LOGI("exit done free=%d", (int)esp_get_free_heap_size());
@@ -1435,25 +1412,6 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
         if (ev == BSP_BTN_CLICK && btn == BSP_BTN_OK && s_curtain_t == NULL) {
             ui_sound_play(UI_SND_SWITCH);
             start_wake();
-        }
-        return;
-    }
-
-    /* 日常互动：上下选择，OK 让宠物回应并改变状态。 */
-    if (s_mode == MODE_INTERACT) {
-        if (ev == BSP_BTN_CLICK) {
-            if (btn == BSP_BTN_UP) {
-                s_opt = (s_opt + 3) % 4;
-                ui_sound_play(UI_SND_SWITCH);
-                render_interact();
-            } else if (btn == BSP_BTN_DOWN) {
-                s_opt = (s_opt + 1) % 4;
-                ui_sound_play(UI_SND_SWITCH);
-                render_interact();
-            } else if (btn == BSP_BTN_OK) {
-                if (s_opt == 3) exit_interact();
-                else interact_action(s_opt);
-            }
         }
         return;
     }
@@ -1518,20 +1476,23 @@ void demo_pet_key(bsp_btn_t btn, bsp_btn_ev_t ev)
     /* HOME */
     if (ev == BSP_BTN_CLICK) {
         if (btn == BSP_BTN_UP) {
-            s_menu = (s_menu + 3) % 4;
+            s_menu = (s_menu + MENU_COUNT - 1) % MENU_COUNT;
             ui_sound_play(UI_SND_SWITCH);
             blink_timer_cb(NULL);
         } else if (btn == BSP_BTN_DOWN) {
-            s_menu = (s_menu + 1) % 4;
+            s_menu = (s_menu + 1) % MENU_COUNT;
             ui_sound_play(UI_SND_SWITCH);
             blink_timer_cb(NULL);
         } else if (btn == BSP_BTN_OK) {
-            ui_sound_play(UI_SND_SWITCH);
             switch ((int)s_menu) {
-                case MENU_TRAIN:  start_grade_select(); break;
-                case MENU_SLEEP:  start_sleep(); break;
-                case MENU_REVIEW: start_review(); break;   /* 错题空时内部直接返回 */
-                case MENU_INTERACT: start_interact(); break;
+                case MENU_TRAIN:  ui_sound_play(UI_SND_SWITCH); start_grade_select(); break;
+                case MENU_SLEEP:  ui_sound_play(UI_SND_SWITCH); start_sleep(); break;
+                case MENU_REVIEW: ui_sound_play(UI_SND_SWITCH); start_review(); break;
+                case MENU_RESET:  ui_sound_play(UI_SND_SWITCH); reset_egg(); break;
+                case MENU_FEED:   care_action(0); break;
+                case MENU_TOUCH:  care_action(1); break;
+                case MENU_PLAY:   care_action(2); break;
+                default: break;
             }
         }
     } else if (ev == BSP_BTN_LONG && btn == BSP_BTN_UP) {
