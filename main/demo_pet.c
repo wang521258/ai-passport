@@ -813,17 +813,13 @@ static void interact_action(int action)
         lv_label_set_text(s_companion_text, "喜欢摸摸！");
         ui_sound_play(UI_SND_CORRECT);
     } else if (action == 2) {
-        if (s_stat.energy < 10) {
-            lv_label_set_text(s_companion_text, "先睡觉");
-            ui_sound_play(UI_SND_WRONG);
-            s_interact_action = -1;
-            return;
-        }
+        bool tired = s_stat.energy < 10;
         s_stat.energy = CLAMP((int)s_stat.energy - 10);
-        s_stat.happy = CLAMP((int)s_stat.happy + 18);
+        s_stat.happy = CLAMP((int)s_stat.happy + (tired ? 6 : 18));
         s_stat.hunger = CLAMP((int)s_stat.hunger - 3);
         s_stat.bond = CLAMP((int)s_stat.bond + 4);
-        lv_label_set_text(s_companion_text, rand() % 4 == 0 ? "玩得真开心！" : "再玩一次！");
+        lv_label_set_text(s_companion_text, tired ? "先睡觉" :
+                          (rand() % 4 == 0 ? "玩得真开心！" : "再玩一次！"));
         ui_sound_play(UI_SND_CORRECT);
     }
     s_interact_action = action;
